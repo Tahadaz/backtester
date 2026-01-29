@@ -109,7 +109,7 @@ def plot_price_indicators_trades_plotly(
                     y=buys["y_plot"],
                     mode="markers",
                     name="BUY",
-                    marker=dict(symbol="triangle-up", size=10, color ="blue"),
+                    marker=dict(symbol="triangle-up", size=7, color ="#2AE91C"),
                 )
             )
         if not sells.empty:
@@ -119,7 +119,7 @@ def plot_price_indicators_trades_plotly(
                     y=sells["y_plot"],
                     mode="markers",
                     name="SELL",
-                    marker=dict(symbol="triangle-down", size=10, color="orange"),
+                    marker=dict(symbol="triangle-down", size=7, color="#F73434"),
                 )
             )
 
