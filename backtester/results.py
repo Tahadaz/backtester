@@ -57,6 +57,8 @@ class ResultsAnalyzer:
         # --- core strategy series ---
         equity = portfolio_result.equity_curve.astype(float).sort_index()
         rets = portfolio_result.returns.astype(float).reindex(equity.index).fillna(0.0)
+        bars0 = market_data.bars[sym0].reindex(equity.index)
+        plots["price_panel"] = {"bars": bars0, "indicators": ind_df, "trades": trades}
 
         cum = (1.0 + rets).cumprod() - 1.0
         dd = self._drawdown_from_equity(equity)

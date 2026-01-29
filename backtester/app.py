@@ -36,47 +36,105 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import plotly.graph_objects as go
 
-def plot_price_indicators_trades(price: pd.Series,
-                                 indicators: pd.DataFrame | None,
-                                 trades: pd.DataFrame) -> plt.Figure:
-    fig = plt.figure(figsize=(14, 5))
-    ax = plt.gca()
 
-    # Price
-    price = price.dropna()
-    ax.plot(price.index, price.values, label="Close", linewidth=1.6)
+def plot_price_indicators_trades_plotly(
+    bars: pd.DataFrame,                    # expects Open/High/Low/Close with DatetimeIndex
+    indicators: pd.DataFrame | None,        # SMA cols etc, same index or reindexable
+    trades: pd.DataFrame | None,            # timestamp, qty, price (optional)
+    indicator_cols: list[str] | None = None,
+    title: str = "Price + Indicators + Trades",
+) -> go.Figure:
+    df = bars.copy()
+    df = df.sort_index()
+    # Ensure datetime index
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
 
-    # SMA lines
+    fig = go.Figure()
+
+    # Candles
+    fig.add_trace(
+        go.Candlestick(
+            x=df.index,
+            open=df["Open"],
+            high=df["High"],
+            low=df["Low"],
+            close=df["Close"],
+            name="Price",
+        )
+    )
+
+    # Indicators
     if indicators is not None and not indicators.empty:
-        indicators = indicators.reindex(price.index)
-        for c in indicators.columns:
-            s = indicators[c].dropna()
-            if not s.empty:
-                ax.plot(s.index, s.values, label=c, linewidth=1.3)
+        ind = indicators.copy()
+        if not isinstance(ind.index, pd.DatetimeIndex):
+            ind.index = pd.to_datetime(ind.index)
+        ind = ind.reindex(df.index)
 
-    # Trade markers
+        if indicator_cols is not None:
+            cols = [c for c in indicator_cols if c in ind.columns]
+        else:
+            cols = list(ind.columns)
+
+        for c in cols:
+            s = ind[c].astype(float)
+            if s.notna().any():
+                fig.add_trace(go.Scatter(x=df.index, y=s, mode="lines", name=c))
+
+    # Trades
     if trades is not None and not trades.empty:
         t = trades.copy()
-        t["timestamp"] = pd.to_datetime(t["timestamp"])
+        t["timestamp"] = pd.to_datetime(t["timestamp"], errors="coerce")
+        t = t.dropna(subset=["timestamp"]).sort_values("timestamp")
+
         if "side" not in t.columns:
             t["side"] = np.where(t["qty"].astype(float) > 0, "BUY", "SELL")
+
+        # Use trade price if present else close at that timestamp (ffill on index alignment)
+        if "price" in t.columns:
+            y = pd.to_numeric(t["price"], errors="coerce")
+        else:
+            y = pd.Series(np.nan, index=t.index)
+
+        close_map = df["Close"].reindex(t["timestamp"]).ffill()
+        t["y_plot"] = np.where(np.isfinite(y.values), y.values, close_map.values)
 
         buys = t[t["side"] == "BUY"]
         sells = t[t["side"] == "SELL"]
 
-        # Use trade price if present; otherwise use close at timestamp
         if not buys.empty:
-            ax.scatter(buys["timestamp"], buys["price"], marker="^", s=60, label="BUY")
+            fig.add_trace(
+                go.Scatter(
+                    x=buys["timestamp"],
+                    y=buys["y_plot"],
+                    mode="markers",
+                    name="BUY",
+                    marker=dict(symbol="triangle-up", size=10),
+                )
+            )
         if not sells.empty:
-            ax.scatter(sells["timestamp"], sells["price"], marker="v", s=60, label="SELL")
+            fig.add_trace(
+                go.Scatter(
+                    x=sells["timestamp"],
+                    y=sells["y_plot"],
+                    mode="markers",
+                    name="SELL",
+                    marker=dict(symbol="triangle-down", size=10),
+                )
+            )
 
-    ax.set_title("Price + SMA + Trades")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Price")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
+    fig.update_layout(
+        title=title,
+        xaxis_title="Date",
+        yaxis_title="Price",
+        xaxis_rangeslider_visible=True,   # range slider
+        legend=dict(orientation="h"),
+        margin=dict(l=40, r=20, t=60, b=40),
+    )
     return fig
+
 
 
 def plot_cum_vs_bench(cum: pd.Series, bench_cum: pd.Series | None) -> plt.Figure:
@@ -484,8 +542,17 @@ try:
     tables = bundle.report.tables
 
     st.subheader("Price + Indicators + Trades")
-    pp = plots["price_panel"]
-    st.pyplot(plot_price_indicators_trades(pp["price"], pp["indicators"], pp["trades"]))
+    pp = bundle.report.plots["price_panel"]
+    sym = bundle.md.symbols()[0]
+    bars = bundle.md.bars[sym]  # full OHLCV bars (better than using Close only)
+
+    fig = plot_price_indicators_trades_plotly(
+        bars=bars,
+        indicators=pp["indicators"],
+        trades=pp["trades"],
+        indicator_cols=getattr(bundle.meta, "plot_indicators", None),  # or spec.plot_indicators
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Cumulative Returns vs Benchmark")
     cvb = plots["cum_vs_bench"]
