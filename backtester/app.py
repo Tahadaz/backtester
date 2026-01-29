@@ -7,7 +7,8 @@ import os
 import tempfile
 from pathlib import Path
 from typing import Optional, List
-
+import numpy as np
+import plotly.graph_objects as go
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
@@ -32,11 +33,6 @@ def plot_line(series: pd.Series, title: str, ylabel: str):
     plt.ylabel(ylabel)
     plt.grid(True)
     return fig
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-import plotly.graph_objects as go
 
 
 def plot_price_indicators_trades_plotly(
@@ -44,7 +40,6 @@ def plot_price_indicators_trades_plotly(
     indicators: pd.DataFrame | None,        # SMA cols etc, same index or reindexable
     trades: pd.DataFrame | None,            # timestamp, qty, price (optional)
     indicator_cols: list[str] | None = None,
-    title: str = "Price + Indicators + Trades",
 ) -> go.Figure:
     df = bars.copy()
     df = df.sort_index()
@@ -77,11 +72,14 @@ def plot_price_indicators_trades_plotly(
             cols = [c for c in indicator_cols if c in ind.columns]
         else:
             cols = list(ind.columns)
-
+        indicator_colors = {
+            "sma_20": "#1F77B4",   # blue
+            "sma_50": "#FF7F0E",   # orange
+        }
         for c in cols:
             s = ind[c].astype(float)
             if s.notna().any():
-                fig.add_trace(go.Scatter(x=df.index, y=s, mode="lines", name=c))
+                fig.add_trace(go.Scatter(x=df.index, y=s, mode="lines", name=c,line=dict(width=2, color=indicator_colors.get(c, None)),))
 
     # Trades
     if trades is not None and not trades.empty:
@@ -111,7 +109,7 @@ def plot_price_indicators_trades_plotly(
                     y=buys["y_plot"],
                     mode="markers",
                     name="BUY",
-                    marker=dict(symbol="triangle-up", size=10),
+                    marker=dict(symbol="triangle-up", size=10, color ="blue"),
                 )
             )
         if not sells.empty:
@@ -121,12 +119,11 @@ def plot_price_indicators_trades_plotly(
                     y=sells["y_plot"],
                     mode="markers",
                     name="SELL",
-                    marker=dict(symbol="triangle-down", size=10),
+                    marker=dict(symbol="triangle-down", size=10, color="orange"),
                 )
             )
 
     fig.update_layout(
-        title=title,
         xaxis_title="Date",
         yaxis_title="Price",
         xaxis_rangeslider_visible=True,   # range slider
