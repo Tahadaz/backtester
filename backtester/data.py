@@ -39,7 +39,7 @@ class MarketData:
     """
     bars: Dict[str, pd.DataFrame]
     source: str
-    timezone: str = "UTC"
+    timezone: str = "GMT"
     interval: str = "1d"
     meta: Dict[str, object] = field(default_factory=dict)
 
@@ -55,7 +55,7 @@ class MarketData:
 # ----------------------------
 def _ensure_datetime_index(
     df: pd.DataFrame,
-    tz: str = "UTC",
+    tz: str = "GMT",
 ) -> pd.DataFrame:
     if not isinstance(df.index, pd.DatetimeIndex):
         raise ValueError("DataFrame index must be a DatetimeIndex after parsing.")
@@ -81,7 +81,7 @@ def _coerce_numeric(df: pd.DataFrame, cols: Sequence[str]) -> pd.DataFrame:
 
 def _standardize_ohlcv(
     df: pd.DataFrame,
-    tz: str = "UTC",
+    tz: str = "GMT",
     require_ohlc: bool = True,
     fill_adj_close: bool = True,
 ) -> pd.DataFrame:
@@ -178,7 +178,7 @@ class BaseDataSource:
 
     def __init__(
         self,
-        timezone: str = "UTC",
+        timezone: str = "GMT",
         cache_dir: Optional[Union[str, Path]] = None,
         use_cache: bool = True,
     ) -> None:
@@ -339,7 +339,7 @@ class YahooFinanceDataSource(BaseDataSource):
             sym = symbols[0] if symbols else "UNKNOWN"
             out[sym] = df.copy()
 
-        # Index is usually naive UTC; normalization will localize to self.timezone
+        # Index is usually naive GMT; normalization will localize to self.timezone
         return out
 
 
@@ -397,7 +397,7 @@ class BMCEDataSource(BaseDataSource):
 
     def __init__(
         self,
-        timezone: str = "UTC",
+        timezone: str = "GMT",
         cache_dir: Optional[Union[str, Path]] = None,
         use_cache: bool = True,
         dayfirst: bool = False,
@@ -418,8 +418,8 @@ class BMCEDataSource(BaseDataSource):
     ) -> Dict[str, pd.DataFrame]:
         """
         paths:
-          - if single symbol: a single path
-          - if multiple symbols: dict {symbol: path}
+        - if single symbol: a single path
+        - if multiple symbols: dict {symbol: path}
         """
         if interval != "1d":
             # You can extend later; keep explicit now

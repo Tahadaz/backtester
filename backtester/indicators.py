@@ -42,35 +42,32 @@ class FeatureSpec:
 
     # indicators.py (inside FeatureSpec)
 
+    # inside FeatureSpec
     def canonical_name(self) -> str:
         """
-        Return a stable, human-readable name for the feature.
-        Goal for SMA: sma_15 instead of sma__window15.
-
-        Rules:
-        - Base name is `self.name` if provided, else `self.indicator`.
-        - If params contain 'window', append as _{window}.
-        - Otherwise append params as _k{v} (sorted by key) to stay deterministic.
+        Naming contract:
+        - if spec.name is provided, it is authoritative (do NOT append params again)
+        - otherwise, auto-generate a stable name from indicator + key params
         """
-        base = self.name or self.indicator
+        if self.name:  # authoritative override
+            return self.name
 
-        if not self.params:
-            return base
+        # fallback auto-name (keep stable)
+        p = self.params or {}
 
-        # Special-case: common rolling window param
-        if "window" in self.params and len(self.params) == 1:
-            return f"{base}_{self.params['window']}"
+        # common patterns
+        if self.indicator == "sma":
+            w = p.get("window", p.get("period", p.get("n")))
+            return f"sma_{w}" if w is not None else "sma"
 
-        # General deterministic formatting (no "window=" text, no "__")
-        parts = []
-        for k in sorted(self.params.keys()):
-            v = self.params[k]
-            # Compact: if key is also semantically "period", treat like window
-            if k in ("window", "period", "length"):
-                parts.append(str(v))
-            else:
-                parts.append(f"{k}{v}")
-        return base + "_" + "_".join(parts)
+        # generic fallback
+        # you can expand this per-indicator later for nicer naming
+        if p:
+            # stable, sorted param encoding
+            suffix = "_".join(f"{k}={p[k]}" for k in sorted(p.keys()))
+            return f"{self.indicator}_{suffix}"
+        return self.indicator
+
 
 
     def spec_hash(self, version: str = "v1") -> str:
