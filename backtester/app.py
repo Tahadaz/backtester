@@ -33,6 +33,30 @@ def plot_line(series: pd.Series, title: str, ylabel: str):
     plt.ylabel(ylabel)
     plt.grid(True)
     return fig
+def plot_pnl_series(pnl: pd.Series) -> plt.Figure:
+    fig = plt.figure(figsize=(14, 3))
+    ax = plt.gca()
+    ax.plot(pnl.index, pnl.values, label="PnL")
+    ax.axhline(0.0, linewidth=1.0)
+    ax.set_title("PnL (per bar)")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("PnL")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    return fig
+
+
+def plot_cum_pnl_series(cum_pnl: pd.Series) -> plt.Figure:
+    fig = plt.figure(figsize=(14, 3))
+    ax = plt.gca()
+    ax.plot(cum_pnl.index, cum_pnl.values, label="Cumulative PnL")
+    ax.axhline(0.0, linewidth=1.0)
+    ax.set_title("Cumulative PnL")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Cum PnL")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    return fig
 
 
 def plot_price_indicators_trades_plotly(
@@ -607,6 +631,7 @@ try:
     # --- Outputs ---
     plots = bundle.report.plots
     tables = bundle.report.tables
+    series = bundle.report.series
 
     st.subheader("Price + Indicators + Trades")
     pp = bundle.report.plots["price_panel"]
@@ -628,12 +653,59 @@ try:
     st.subheader("Drawdown")
     st.pyplot(plot_drawdown_red(plots["drawdown"]))
 
+    st.subheader("PnL")
+    if "pnl" in series:
+        st.pyplot(plot_pnl_series(series["pnl"]))
+    else:
+        st.info("PnL series not found in report.series (did you add it in ResultsAnalyzer?)")
+
+    st.subheader("Cumulative PnL")
+    if "cum_pnl" in series:
+        st.pyplot(plot_cum_pnl_series(series["cum_pnl"]))
+    else:
+        st.info("cum_pnl series not found in report.series (did you add it in ResultsAnalyzer?)")
+
     st.subheader("Monthly Returns Heatmap")
     st.pyplot(plot_monthly_heatmap_with_values(plots["monthly_heatmap"]))
 
     st.subheader("Yearly Returns")
     st.pyplot(plot_yearly_returns_bar(plots["yearly_bar"]))
 
+    st.subheader("Trade Performance (summary)")
+    if "trade_performance" in tables:
+        st.dataframe(tables["trade_performance"], use_container_width=True)
+    else:
+        st.info("trade_performance not found in report.tables")
+
+    st.subheader("Trades Ledger (PnL per trade)")
+    if "trade_ledger" in tables:
+        ledger = tables["trade_ledger"].copy()
+
+        # Optional: nicer formatting
+        pct_cols = [c for c in ["return_pct"] if c in ledger.columns]
+        money_cols = [c for c in ["gross_pnl", "net_pnl", "entry_cost", "exit_cost"] if c in ledger.columns]
+        price_cols = [c for c in ["entry_price", "exit_price"] if c in ledger.columns]
+
+        for c in pct_cols:
+            ledger[c] = pd.to_numeric(ledger[c], errors="coerce") * 100.0
+        for c in money_cols + price_cols:
+            ledger[c] = pd.to_numeric(ledger[c], errors="coerce")
+
+        # Reorder columns if present
+        preferred = [
+            "entry_time","exit_time","symbol","side","qty",
+            "entry_price","exit_price",
+            "gross_pnl","entry_cost","exit_cost","net_pnl",
+            "return_pct","hold_days"
+        ]
+        cols = [c for c in preferred if c in ledger.columns] + [c for c in ledger.columns if c not in preferred]
+        ledger = ledger[cols]
+
+        st.dataframe(ledger, use_container_width=True)
+    else:
+        st.info("trade_ledger not found in report.tables")
+
+    
     t_curve = bundle.report.tables["curve_vs_benchmark"]
     t_trade = bundle.report.tables["trade_summary"]
     t_time  = bundle.report.tables["time_summary"]

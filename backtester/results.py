@@ -61,6 +61,9 @@ class ResultsAnalyzer:
 
         cum = (1.0 + rets).cumprod() - 1.0
         dd = self._drawdown_from_equity(equity)
+        pnl = equity.diff().fillna(0.0)              # currency PnL per bar
+        cum_pnl = pnl.cumsum()
+
 
         # --- price + indicators payload (single asset for now) ---
         sym0 = symbols[0]
@@ -81,7 +84,8 @@ class ResultsAnalyzer:
         
         # trades payload (fills)
         trades = self._prepare_trades_table(portfolio_result.trades)
-        
+        trade_ledger = self._trade_ledger_from_fills(trades)
+        trade_perf = self._trade_performance_summary(trade_ledger)
         # --- benchmark series (optional) ---
         bench_rets = None
         bench_cum = None
@@ -146,6 +150,8 @@ class ResultsAnalyzer:
             "time_summary": time_tbl,
             "monthly_returns": monthly_mat,
             "yearly_returns": yearly.to_frame("year_return"),
+            "trade_ledger":trade_ledger,
+            "trade_performance":trade_perf,
         }
 
         plots: Dict[str, Any] = {
@@ -168,6 +174,8 @@ class ResultsAnalyzer:
             "returns": rets,
             "cum_returns": cum,
             "drawdown": dd,
+            "pnl":pnl,
+            "cum_pnl":cum_pnl,
         }
         if bench_cum is not None:
             series.update(
@@ -569,3 +577,191 @@ class ResultsAnalyzer:
         y_win, _, _, y_best, y_worst = stats(y)
 
         return pd.DataFrame({"Value": [m_win, m_avgw, m_avgl, m_best, m_worst, y_win, y_best, y_worst]}, index=idx)
+    def _trade_ledger_from_fills(self, fills: pd.DataFrame) -> pd.DataFrame:
+        """
+        Build closed-trade ledger (round trips) from fills using FIFO lot matching.
+
+        Expected fills columns:
+        timestamp (datetime), symbol (str), qty (signed), price (float), cost (float)
+
+        Output columns:
+        entry_time, exit_time, symbol, side, qty,
+        entry_price, exit_price,
+        gross_pnl, entry_cost, exit_cost, net_pnl,
+        return_pct, hold_days
+        """
+        if fills is None or fills.empty:
+            return pd.DataFrame(
+                columns=[
+                    "entry_time", "exit_time", "symbol", "side", "qty",
+                    "entry_price", "exit_price",
+                    "gross_pnl", "entry_cost", "exit_cost", "net_pnl",
+                    "return_pct", "hold_days",
+                ]
+            )
+
+        f = fills.copy()
+
+        # Normalize
+        f["timestamp"] = pd.to_datetime(f["timestamp"], errors="coerce")
+        f = f.dropna(subset=["timestamp"]).sort_values(["timestamp", "symbol"]).reset_index(drop=True)
+
+        for c in ["qty", "price", "cost"]:
+            if c in f.columns:
+                f[c] = pd.to_numeric(f[c], errors="coerce")
+        f = f.dropna(subset=["qty", "price"])
+        if "cost" not in f.columns:
+            f["cost"] = 0.0
+        f["cost"] = f["cost"].fillna(0.0)
+
+        # FIFO lots per symbol
+        # lot: qty_signed, price, time, entry_cost_total
+        lots: dict[str, list[dict]] = {}
+        out_rows: list[dict] = []
+
+        for _, row in f.iterrows():
+            ts = row["timestamp"]
+            sym = str(row["symbol"])
+            qty = int(row["qty"])
+            price = float(row["price"])
+            cost_total = float(row["cost"])
+
+            if qty == 0:
+                continue
+
+            if sym not in lots:
+                lots[sym] = []
+
+            # Allocate exit/entry cost pro-rata if a fill both closes and opens (flip)
+            fill_abs = abs(qty)
+            fill_cost_total = cost_total
+
+            # Helper: allocate cost proportional to a used quantity from this fill
+            def alloc_fill_cost(used_abs_qty: int) -> float:
+                if fill_abs == 0:
+                    return 0.0
+                return fill_cost_total * (float(used_abs_qty) / float(fill_abs))
+
+            remaining_qty = qty  # signed
+
+            # If there are open lots with opposite sign, we are closing them
+            while remaining_qty != 0 and lots[sym]:
+                lot = lots[sym][0]
+                lot_qty = int(lot["qty"])
+                if lot_qty == 0:
+                    lots[sym].pop(0)
+                    continue
+
+                # Same direction -> stop closing; this fill is opening/increasing
+                if np.sign(lot_qty) == np.sign(remaining_qty):
+                    break
+
+                # Opposite direction -> close
+                close_abs = min(abs(remaining_qty), abs(lot_qty))
+
+                side = "LONG" if lot_qty > 0 else "SHORT"
+                entry_price = float(lot["price"])
+                exit_price = price
+
+                # Gross PnL
+                if side == "LONG":
+                    gross = close_abs * (exit_price - entry_price)
+                else:
+                    gross = close_abs * (entry_price - exit_price)
+
+                # Allocate entry cost from lot pro-rata
+                lot_abs_before = abs(lot_qty)
+                entry_cost_part = float(lot["entry_cost"]) * (float(close_abs) / float(lot_abs_before))
+
+                # Allocate exit cost from this fill pro-rata
+                exit_cost_part = alloc_fill_cost(close_abs)
+
+                net = gross - entry_cost_part - exit_cost_part
+                notional_entry = close_abs * entry_price
+                ret_pct = (net / notional_entry) if notional_entry != 0 else np.nan
+
+                hold_days = (pd.Timestamp(ts) - pd.Timestamp(lot["timestamp"])).days
+
+                out_rows.append(
+                    {
+                        "entry_time": lot["timestamp"],
+                        "exit_time": ts,
+                        "symbol": sym,
+                        "side": side,
+                        "qty": int(close_abs),
+                        "entry_price": entry_price,
+                        "exit_price": exit_price,
+                        "gross_pnl": float(gross),
+                        "entry_cost": float(entry_cost_part),
+                        "exit_cost": float(exit_cost_part),
+                        "net_pnl": float(net),
+                        "return_pct": float(ret_pct),
+                        "hold_days": int(hold_days),
+                    }
+                )
+
+                # Reduce lot and remaining fill qty
+                # Update lot qty toward zero
+                if lot_qty > 0:
+                    lot["qty"] = lot_qty - close_abs
+                else:
+                    lot["qty"] = lot_qty + close_abs
+
+                # Reduce lot entry cost proportionally
+                lot["entry_cost"] = float(lot["entry_cost"]) - float(entry_cost_part)
+
+                # Reduce remaining fill qty toward zero
+                if remaining_qty > 0:
+                    remaining_qty -= close_abs
+                else:
+                    remaining_qty += close_abs
+
+                # Remove depleted lots
+                if int(lot["qty"]) == 0:
+                    lots[sym].pop(0)
+
+            # Any remaining_qty opens a new lot (or increases same direction)
+            if remaining_qty != 0:
+                open_abs = abs(remaining_qty)
+                entry_cost_for_open = alloc_fill_cost(open_abs)
+
+                lots[sym].append(
+                    {
+                        "timestamp": ts,
+                        "qty": int(remaining_qty),
+                        "price": float(price),
+                        "entry_cost": float(entry_cost_for_open),
+                    }
+                )
+
+        ledger = pd.DataFrame(out_rows)
+        if ledger.empty:
+            return ledger
+
+        ledger = ledger.sort_values(["exit_time", "symbol"]).reset_index(drop=True)
+        return ledger
+    def _trade_performance_summary(self, ledger: pd.DataFrame) -> pd.DataFrame:
+        if ledger is None or ledger.empty:
+            return pd.DataFrame(index=[
+                "Trades", "Win Rate", "Avg Net PnL", "Total Net PnL",
+                "Avg Return %", "Profit Factor", "Avg Hold Days"
+            ], data={"Value": [0, np.nan, np.nan, 0.0, np.nan, np.nan, np.nan]})
+
+        net = ledger["net_pnl"].astype(float)
+        wins = net[net > 0]
+        losses = net[net < 0]
+
+        trades = int(len(net))
+        win_rate = float((net > 0).mean())
+        avg_net = float(net.mean())
+        total_net = float(net.sum())
+        avg_ret = float(ledger["return_pct"].astype(float).mean())
+        profit_factor = float(wins.sum() / abs(losses.sum())) if len(losses) and abs(losses.sum()) > 0 else np.inf
+        avg_hold = float(ledger["hold_days"].astype(float).mean())
+
+        return pd.DataFrame(
+            {"Value": [trades, win_rate, avg_net, total_net, avg_ret, profit_factor, avg_hold]},
+            index=["Trades", "Win Rate", "Avg Net PnL", "Total Net PnL",
+                "Avg Return %", "Profit Factor", "Avg Hold Days"],
+        )
+
