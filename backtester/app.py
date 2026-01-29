@@ -32,6 +32,126 @@ def plot_line(series: pd.Series, title: str, ylabel: str):
     plt.ylabel(ylabel)
     plt.grid(True)
     return fig
+import matplotlib.colors as mcolors
+
+def plot_price_indicators_trades(price: pd.Series, indicators: Optional[pd.DataFrame], trades: pd.DataFrame):
+    fig = plt.figure(figsize=(12, 5))
+    plt.plot(price.index, price.values, label="Close")
+
+    if indicators is not None and not indicators.empty:
+        for c in indicators.columns:
+            plt.plot(indicators.index, indicators[c].values, label=c)
+
+    if trades is not None and not trades.empty:
+        t = trades.copy()
+        t["timestamp"] = pd.to_datetime(t["timestamp"])
+        buys = t[t["side"] == "BUY"]
+        sells = t[t["side"] == "SELL"]
+        if not buys.empty:
+            plt.scatter(buys["timestamp"], buys["price"], marker="^", label="BUY")
+        if not sells.empty:
+            plt.scatter(sells["timestamp"], sells["price"], marker="v", label="SELL")
+
+    plt.title("Price + Indicators + Trades")
+    plt.xlabel("Date")
+    plt.ylabel("Price")
+    plt.legend()
+    plt.grid(True)
+    return fig
+
+
+def plot_cum_vs_bench(cum: pd.Series, bench: Optional[pd.Series]):
+    fig = plt.figure(figsize=(12, 4))
+    plt.plot(cum.index, cum.values, label="Strategy")
+    if bench is not None:
+        plt.plot(bench.index, bench.values, label="Benchmark")
+    plt.title("Cumulative Returns vs Benchmark")
+    plt.xlabel("Date")
+    plt.ylabel("Cumulative return")
+    plt.legend()
+    plt.grid(True)
+    return fig
+
+
+def plot_drawdown_red(dd: pd.Series):
+    fig = plt.figure(figsize=(12, 3))
+    plt.plot(dd.index, dd.values)
+    # fill where drawdown < 0
+    plt.fill_between(dd.index, dd.values, 0.0, where=(dd.values < 0.0), alpha=0.35, color="red")
+    plt.title("Drawdown")
+    plt.xlabel("Date")
+    plt.ylabel("Drawdown")
+    plt.grid(True)
+    return fig
+
+
+def plot_monthly_heatmap(monthly: pd.DataFrame):
+    # monthly: index=year, columns=1..12, values=returns
+    fig = plt.figure(figsize=(12, 5))
+    ax = plt.gca()
+
+    if monthly is None or monthly.empty:
+        ax.set_title("Monthly returns heatmap (no data)")
+        return fig
+
+    data = monthly.values.astype(float)
+
+    vmin = np.nanmin(data)
+    vmax = np.nanmax(data)
+
+    # Robust normalization around 0
+    if np.isnan(vmin) or np.isnan(vmax):
+        ax.set_title("Monthly returns heatmap (no data)")
+        return fig
+
+    if vmin < 0 < vmax:
+        norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
+    else:
+        # all positive or all negative: simple norm
+        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+
+    im = ax.imshow(data, aspect="auto", norm=norm, cmap="RdYlGn")  # red->yellow->green
+    ax.set_title("Monthly Returns Heatmap")
+    ax.set_yticks(range(len(monthly.index)))
+    ax.set_yticklabels(monthly.index.astype(str).tolist())
+    ax.set_xticks(range(12))
+    ax.set_xticklabels(["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"])
+
+    plt.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
+    return fig
+
+
+def plot_yearly_bar(yearly: pd.Series):
+    fig = plt.figure(figsize=(12, 3))
+    ax = plt.gca()
+    if yearly is None or yearly.empty:
+        ax.set_title("Yearly returns (no data)")
+        return fig
+
+    years = yearly.index.astype(str).tolist()
+    vals = yearly.values.astype(float)
+
+    # color by sign
+    colors = ["green" if v >= 0 else "red" for v in vals]
+    ax.bar(years, vals, color=colors)
+    ax.set_title("Yearly Returns")
+    ax.set_xlabel("Year")
+    ax.set_ylabel("Return")
+    ax.grid(True, axis="y")
+    return fig
+
+
+def style_good_bad(df: pd.DataFrame, good_high: bool = True):
+    # Simple generic styler: green for good, red for bad, per-cell numeric
+    def color(v):
+        if pd.isna(v) or not isinstance(v, (int, float, np.floating)):
+            return ""
+        if good_high:
+            return "color: green;" if v > 0 else ("color: red;" if v < 0 else "")
+        else:
+            return "color: green;" if v < 0 else ("color: red;" if v > 0 else "")
+
+    return df.style.applymap(color)
 
 
 # --------------------------
@@ -242,6 +362,37 @@ try:
     rep = bundle.report
 
     # --- Outputs ---
+    plots = bundle.report.plots
+    tables = bundle.report.tables
+    series = bundle.report.series
+
+    st.subheader("Price + Indicators + Trades")
+    pp = plots["price_panel"]
+    st.pyplot(plot_price_indicators_trades(pp["price"], pp["indicators"], pp["trades"]))
+
+    st.subheader("Cumulative Returns vs Benchmark")
+    cvb = plots["cum_vs_bench"]
+    st.pyplot(plot_cum_vs_bench(cvb["strategy"], cvb["benchmark"]))
+
+    st.subheader("Drawdown")
+    st.pyplot(plot_drawdown_red(plots["drawdown"]))
+
+    st.subheader("Monthly Returns Heatmap")
+    st.pyplot(plot_monthly_heatmap(plots["monthly_heatmap"]))
+
+    st.subheader("Yearly Returns")
+    st.pyplot(plot_yearly_bar(plots["yearly_bar"]))
+
+    st.subheader("Trades table")
+    st.dataframe(tables["trades"], use_container_width=True)
+
+    st.subheader("Time series table")
+    st.dataframe(tables["timeseries"].tail(300), use_container_width=True)
+
+    if "strategy_vs_benchmark" in tables:
+        st.subheader("Strategy vs Benchmark")
+        st.dataframe(tables["strategy_vs_benchmark"], use_container_width=True)
+
     st.subheader("Headline metrics")
     st.json(rep.metrics)
 

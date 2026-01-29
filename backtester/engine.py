@@ -1,6 +1,8 @@
 # engine.py
 from __future__ import annotations
 
+from data import YahooFinanceDataSource   # your class
+from data import MarketData
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Callable, Literal, Union
 
@@ -70,6 +72,18 @@ class StrategyConfig:
     kind: StrategyKind
     params: Dict[str, Any] = field(default_factory=dict)
 
+BenchmarkSource = Literal["yahoo"]
+
+@dataclass(frozen=True)
+class BenchmarkConfig:
+    enabled: bool = False
+    symbol: str = "SPY"
+    source: BenchmarkSource = "yahoo"
+    start: Optional[str] = None
+    end: Optional[str] = None
+    interval: str = "1d"
+    auto_adjust: bool = False
+
 
 @dataclass(frozen=True)
 class EngineSpec:
@@ -77,9 +91,11 @@ class EngineSpec:
     indicators: IndicatorsConfig
     strategy: StrategyConfig
     portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
-
+    benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
+    plot_indicators: List[str] = field(default_factory=list)
     periods_per_year: int = 252
     rf_annual: float = 0.0
+
 
 
 @dataclass(frozen=True)
@@ -255,7 +271,7 @@ class BacktestEngine:
         # 1) Data
         md = load_marketdata(self.spec.data)
         symbols = self.spec.data.symbols
-
+        
         # 2) Indicators
         specs = resolve_specs(self.spec.indicators, self.spec.strategy)
         ind = IndicatorEngine(
@@ -265,7 +281,6 @@ class BacktestEngine:
             engine_version=self.spec.indicators.engine_version,
         )
         feats = ind.compute(md, specs=specs, symbols=symbols)
-        print("FEATURE COLUMNS:", feats.features[symbols[0]].columns.tolist()[:50])
 
         # 3) Strategy
         strat = build_strategy(self.spec.strategy)
@@ -275,10 +290,36 @@ class BacktestEngine:
         port = PortfolioEngine(self.spec.portfolio)
         pres = port.run(md, sf, symbols=symbols)
 
+        # inside BacktestEngine.run(), before calling ResultsAnalyzer.analyze(...)
+        bmd = None
+        bsym = None
+        if getattr(self.spec, "benchmark", None) and self.spec.benchmark.enabled:
+            bcfg = self.spec.benchmark
+            yds = YahooFinanceDataSource(timezone=self.spec.data.timezone)
+            bmd = yds.load(
+                symbols=[bcfg.symbol],
+                start=bcfg.start,
+                end=bcfg.end,
+                interval=bcfg.interval,
+                auto_adjust=bcfg.auto_adjust,
+                progress=False,
+            )
+            bsym = bcfg.symbol
+
+        report = analyzer.analyze(
+            pres,
+            market_data=md,
+            symbols=symbols,
+            features_data=feats,
+            plot_indicators=getattr(self.spec, "plot_indicators", None),
+            benchmark_market_data=bmd,
+            benchmark_symbol=bsym,
+        )
+
         # 5) Results
         analyzer = ResultsAnalyzer(periods_per_year=self.spec.periods_per_year, rf_annual=self.spec.rf_annual)
         report = analyzer.analyze(pres, market_data=md, symbols=symbols)
-
+        
         meta = {
             "symbols": symbols,
             "data_source": self.spec.data.source,
