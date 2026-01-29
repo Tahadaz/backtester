@@ -72,11 +72,11 @@ class ResultsAnalyzer:
             cols = [c for c in plot_indicators if c in feats_sym.columns]
             if cols:
                 ind_df = feats_sym[cols].reindex(equity.index)
-        bars0 = market_data.bars[sym0].reindex(equity.index)
-        plots["price_panel"] = {"bars": bars0, "indicators": ind_df, "trades": trades}
+        
         # trades payload (fills)
         trades = self._prepare_trades_table(portfolio_result.trades)
-
+        bars0 = market_data.bars[sym0].reindex(equity.index)
+        plots["price_panel"] = {"bars": bars0, "indicators": ind_df, "trades": trades}
         # --- benchmark series (optional) ---
         bench_rets = None
         bench_cum = None
