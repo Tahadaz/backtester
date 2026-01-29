@@ -65,18 +65,23 @@ class ResultsAnalyzer:
         # --- price + indicators payload (single asset for now) ---
         sym0 = symbols[0]
         px = market_data.bars[sym0]["Close"].reindex(equity.index).astype(float)
+        bars0 = market_data.bars[sym0].reindex(equity.index).copy()
+
+        # ensure float for plot libs
+        for c in ["Open", "High", "Low", "Close"]:
+            if c in bars0.columns:
+                bars0[c] = bars0[c].astype(float)
 
         ind_df = None
         if features_data is not None and plot_indicators:
             feats_sym = features_data.features[sym0]
             cols = [c for c in plot_indicators if c in feats_sym.columns]
             if cols:
-                ind_df = feats_sym[cols].reindex(equity.index)
+                ind_df = feats_sym[cols].reindex(bars0.index)
         
         # trades payload (fills)
         trades = self._prepare_trades_table(portfolio_result.trades)
-        bars0 = market_data.bars[sym0].reindex(equity.index)
-        plots["price_panel"] = {"bars": bars0, "indicators": ind_df, "trades": trades}
+        
         # --- benchmark series (optional) ---
         bench_rets = None
         bench_cum = None
@@ -144,7 +149,14 @@ class ResultsAnalyzer:
         }
 
         plots: Dict[str, Any] = {
-            "price_panel": {"price": px, "indicators": ind_df, "trades": trades},
+            "price_panel": {
+                "symbol": sym0,
+                "bars": bars0,            # <-- NEW: full OHLC
+                "price": bars0["Close"],  # optional convenience
+                "indicators": ind_df,
+                "trades": trades,
+                "indicator_cols": plot_indicators,
+            },
             "cum_vs_bench": {"strategy": cum, "benchmark": bench_cum},
             "drawdown": dd,
             "monthly_heatmap": monthly_mat,  # app will render + annotate
