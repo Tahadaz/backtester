@@ -26,7 +26,6 @@ from strategy import default_plot_indicators  # add import
 
 
 DataSourceKind = Literal["bmce", "yfinance"]
-StrategyKind = Literal["ma_cross"]  # extend later
 
 
 # -----------------------------
@@ -241,7 +240,8 @@ def load_marketdata_yfinance(cfg: DataConfig) -> MarketData:
     for sym in cfg.symbols:
         df = yf.download(
             tickers=sym,
-            period=cfg.yf_period,
+            start=cfg.start,
+            end=cfg.end,
             interval=cfg.yf_interval,
             auto_adjust=cfg.yf_auto_adjust,
             progress=False,

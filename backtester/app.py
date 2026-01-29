@@ -340,6 +340,26 @@ else:
     yf_interval = st.sidebar.selectbox("yfinance interval", ["1d"], index=0)
     yf_auto_adjust = st.sidebar.checkbox("auto_adjust", value=False)
 
+
+st.sidebar.header("Backtest period")
+
+use_date_range = st.sidebar.checkbox("Use date range", value=False)
+
+start_date = None
+end_date = None
+if use_date_range:
+    start_date = st.sidebar.date_input("Start date", value=None)
+    end_date = st.sidebar.date_input("End date", value=None)
+
+    # basic validation
+    if start_date and end_date and start_date > end_date:
+        st.sidebar.error("Start date must be <= End date.")
+        st.stop()
+
+# Convert to ISO strings (what your DataConfig expects)
+start_str = start_date.isoformat() if start_date else None
+end_str = end_date.isoformat() if end_date else None
+
 with st.sidebar:
     st.header("Strategy")
 
@@ -420,6 +440,8 @@ def run_engine_cached(
     interval: str,
     # BMCE
     bmce_tmp_path: Optional[str],
+    start: Optional[str],   # <-- add
+    end: Optional[str],     # <-- add
     # yfinance
     yf_period: Optional[str],
     yf_interval: Optional[str],
@@ -446,6 +468,8 @@ def run_engine_cached(
             symbols=[symbol],
             timezone=timezone,
             interval=interval,
+            start=start,   # <-- add
+            end=end, 
             bmce_paths=bmce_tmp_path,  # engine will pass this into BMCEDataSource.load(... paths=...)
         )
     else:
@@ -454,6 +478,8 @@ def run_engine_cached(
             symbols=[symbol],
             timezone=timezone,
             interval=interval,
+            start=start,   # <-- add
+            end=end, 
             yf_period=yf_period or "max",
             yf_interval=yf_interval or "1d",
             yf_auto_adjust=bool(yf_auto_adjust),
@@ -547,6 +573,8 @@ try:
             symbol=symbol,
             timezone=timezone,
             interval=interval,
+            start=start_str,   # <-- add
+            end=end_str,       # <-- add
             bmce_tmp_path=tmp_path,
             yf_period=(yf_period if not source.startswith("bmce") else None),
             yf_interval=(yf_interval if not source.startswith("bmce") else None),
