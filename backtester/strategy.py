@@ -1,0 +1,332 @@
+# strategy.py
+from __future__ import annotations
+
+from dataclasses import dataclass, field, asdict
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
+from abc import ABC, abstractmethod
+
+import pandas as pd
+import numpy as np
+
+# Import your FeatureSpec from the indicator layer.
+# (Keep strategy -> indicators dependency; indicators should NOT depend on strategy.)
+from indicators import FeatureSpec
+
+
+# =============================================================================
+# Protocols (duck-typing) to avoid tight coupling between layers
+# =============================================================================
+
+class MarketDataLike(Protocol):
+    """
+    Minimal interface expected from the data layer.
+    """
+    bars: Dict[str, pd.DataFrame]
+    source: str
+    timezone: str
+    interval: str
+    meta: Dict[str, Any]
+
+
+class FeaturesDataLike(Protocol):
+    """
+    Minimal interface expected from the indicator layer.
+    """
+    features: Dict[str, pd.DataFrame]
+    source: str
+    timezone: str
+    interval: str
+    meta: Dict[str, Any]
+
+
+# =============================================================================
+# Strategy outputs (what Strategy layer returns downstream)
+# =============================================================================
+
+@dataclass
+class SignalFrame:
+    """
+    Canonical output of a Strategy: "intent" at time t.
+
+    signals:
+        DataFrame indexed by timestamps, columns = symbols.
+        Values represent desired exposure/intention at time t:
+            - for long/flat strategies: {0, +1}
+            - if allow_short: {-1, 0, +1}
+        IMPORTANT: execution semantics (fill at t+1, costs, slippage) are NOT here.
+        Those belong to portfolio/execution layers.
+
+    validity:
+        Optional DataFrame of same shape as signals, True where signal is valid
+        (e.g., after warmup), False otherwise. Useful for debugging/reporting.
+
+    meta:
+        Strategy signature and any diagnostics.
+    """
+    signals: pd.DataFrame
+    validity: Optional[pd.DataFrame] = None
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+    def assert_well_formed(self, symbols: Sequence[str]) -> None:
+        if not isinstance(self.signals.index, pd.DatetimeIndex):
+            raise TypeError("SignalFrame.signals must be indexed by a DatetimeIndex")
+        missing_cols = [s for s in symbols if s not in self.signals.columns]
+        if missing_cols:
+            raise ValueError(f"SignalFrame missing symbols: {missing_cols}")
+
+        if self.validity is not None:
+            if not self.validity.index.equals(self.signals.index):
+                raise ValueError("SignalFrame.validity index must match signals index")
+            if list(self.validity.columns) != list(self.signals.columns):
+                raise ValueError("SignalFrame.validity columns must match signals columns")
+
+
+# =============================================================================
+# Strategy base class (contracts)
+# =============================================================================
+
+@dataclass(frozen=True)
+class StrategySpec:
+    """
+    A stable, serializable description of a strategy configuration.
+    Useful for logging, caching, and optimizer bookkeeping.
+    """
+    name: str
+    params: Dict[str, Any]
+
+    def signature(self) -> str:
+        # Deterministic signature (stable key order)
+        items = [(k, self.params[k]) for k in sorted(self.params)]
+        return f"{self.name}|" + "|".join([f"{k}={v}" for k, v in items])
+
+
+class BaseStrategy(ABC):
+    """
+    Strategy layer responsibility:
+        - declare which features are required (FeatureSpec list)
+        - generate "signals/intent" from MarketData + FeaturesData
+
+    Strategy layer DOES NOT:
+        - size positions in shares/weights
+        - apply transaction costs/slippage
+        - implement fill semantics (t vs t+1)
+        - maintain trade ledger
+    """
+
+    @property
+    @abstractmethod
+    def spec(self) -> StrategySpec:
+        """Stable description of the strategy (name + params)."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def required_features(self) -> List[FeatureSpec]:
+        """
+        Return the list of FeatureSpec needed by this strategy.
+
+        This allows the engine (or research runner) to compute indicators
+        upstream in a consistent way.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def generate_signals(
+        self,
+        market_data: MarketDataLike,
+        features_data: FeaturesDataLike,
+        symbols: Optional[Sequence[str]] = None,
+    ) -> SignalFrame:
+        """
+        Vectorized/batch implementation (research-first).
+        Returns desired exposures at time t.
+        """
+        raise NotImplementedError
+
+    # Optional extension point for future event-driven parity
+    def on_bar(
+        self,
+        t: pd.Timestamp,
+        symbol: str,
+        bar_t: pd.Series,
+        features_t: pd.Series,
+        state: Optional[Dict[str, Any]] = None,
+    ) -> float:
+        """
+        Optional incremental interface (not required for your current research-first engine).
+        Returns desired exposure at time t for one symbol.
+        """
+        raise NotImplementedError("on_bar not implemented for this strategy.")
+
+
+# =============================================================================
+# Concrete strategy: Moving Average Crossover (MA crossover)
+# =============================================================================
+
+@dataclass(frozen=True)
+class MovingAverageCrossParams:
+    """
+    Parameters for MA crossover.
+
+    fast_window, slow_window:
+        SMA windows in bars.
+
+    allow_short:
+        If True, emit -1 when fast < slow.
+        If False, emit 0 when fast < slow (long/flat).
+
+    nan_policy:
+        How to treat periods where the MAs are undefined (warmup).
+        - "flat": output 0
+        - "nan": output NaN (downstream must decide)
+    """
+    fast_window: int = 15
+    slow_window: int = 50
+    allow_short: bool = False
+    nan_policy: str = "flat"  # "flat" or "nan"
+
+    def __post_init__(self) -> None:
+        if self.fast_window <= 0 or self.slow_window <= 0:
+            raise ValueError("fast_window and slow_window must be positive")
+        if self.fast_window >= self.slow_window:
+            raise ValueError("Require fast_window < slow_window for crossover")
+        if self.nan_policy not in ("flat", "nan"):
+            raise ValueError("nan_policy must be 'flat' or 'nan'")
+
+
+class MovingAverageCrossStrategy(BaseStrategy):
+    """
+    MA crossover strategy producing desired exposure at time t.
+
+    Signal rule:
+        long if SMA_fast[t] > SMA_slow[t]
+        else flat (0) or short (-1) depending on allow_short
+
+    Note: this strategy only generates intent; execution semantics are downstream.
+    """
+
+    def __init__(self, params: MovingAverageCrossParams) -> None:
+        self.params = params
+
+        # We choose deterministic feature names so the strategy can locate columns reliably.
+        self._fast_name = f"sma_{params.fast_window}"
+        self._slow_name = f"sma_{params.slow_window}"
+
+    @property
+    def spec(self) -> StrategySpec:
+        return StrategySpec(
+            name="MovingAverageCrossStrategy",
+            params=asdict(self.params),
+        )
+
+    def required_features(self) -> List[FeatureSpec]:
+        # Warmup is set to the window length; conservative and explicit.
+        # Strategy will treat pre-warmup according to nan_policy.
+        return [
+            FeatureSpec(
+                indicator="sma",
+                params={"window": self.params.fast_window},
+                inputs=("Close",),
+                warmup=self.params.fast_window,
+                
+            ),
+            FeatureSpec(
+                indicator="sma",
+                params={"window": self.params.slow_window},
+                inputs=("Close",),
+                warmup=self.params.slow_window,
+                
+            ),
+        ]
+
+    def generate_signals(
+        self,
+        market_data: MarketDataLike,
+        features_data: FeaturesDataLike,
+        symbols: Optional[Sequence[str]] = None,
+    ) -> SignalFrame:
+
+        symbols = list(symbols) if symbols is not None else list(market_data.bars.keys())
+
+        # Validate presence of features for requested symbols
+        for s in symbols:
+            if s not in features_data.features:
+                raise KeyError(f"FeaturesData missing symbol '{s}'. Computed: {list(features_data.features.keys())}")
+            if s not in market_data.bars:
+                raise KeyError(f"MarketData missing symbol '{s}'. Available: {list(market_data.bars.keys())}")
+
+        # Build a common index per symbol (we keep per-symbol for now; later you can align multi-asset)
+        # Output as a single DataFrame: index is the union of indexes, reindexed per symbol.
+        # For single-asset this is trivial.
+        all_indexes = [market_data.bars[s].index for s in symbols]
+        common_index = all_indexes[0]
+        for idx in all_indexes[1:]:
+            common_index = common_index.union(idx)
+        common_index = common_index.sort_values()
+
+        sig_df = pd.DataFrame(index=common_index, columns=symbols, dtype="float64")
+        valid_df = pd.DataFrame(index=common_index, columns=symbols, dtype="bool")
+
+        for s in symbols:
+            bars = market_data.bars[s]
+            feats = features_data.features[s]
+
+            # Reindex features to the common index
+            fast = feats[self._fast_name].reindex(common_index)
+            slow = feats[self._slow_name].reindex(common_index)
+
+            # Valid when both are not NaN
+            valid = fast.notna() & slow.notna()
+
+            # Core crossover logic
+            long_mask = fast > slow
+            if self.params.allow_short:
+                short_mask = fast < slow
+                signal = pd.Series(0.0, index=common_index)
+                signal[long_mask] = 1.0
+                signal[short_mask] = -1.0
+            else:
+                signal = long_mask.astype("float64")  # 1.0 if long else 0.0
+
+            # Apply NaN/warmup policy
+            if self.params.nan_policy == "flat":
+                # Before validity, stay flat (0) to avoid accidental early exposure
+                signal = signal.where(valid, 0.0)
+            else:  # "nan"
+                signal = signal.where(valid, np.nan)
+
+            sig_df[s] = signal
+            valid_df[s] = valid
+
+        meta = {
+            "strategy_signature": self.spec.signature(),
+            "strategy_name": self.spec.name,
+            "strategy_params": self.spec.params,
+            "required_features": [fs.canonical_name() for fs in self.required_features()],
+            "note": "signals are intent at time t; fills/costs handled downstream",
+        }
+
+        sf = SignalFrame(signals=sig_df, validity=valid_df, meta=meta)
+        sf.assert_well_formed(symbols)
+        return sf
+
+
+# =============================================================================
+# Convenience: simple factory (optional)
+# =============================================================================
+
+def make_ma_cross_strategy(
+    fast_window: int = 15,
+    slow_window: int = 50,
+    allow_short: bool = False,
+    nan_policy: str = "flat",
+) -> MovingAverageCrossStrategy:
+    """
+    Small helper for quick experiments.
+    """
+    params = MovingAverageCrossParams(
+        fast_window=fast_window,
+        slow_window=slow_window,
+        allow_short=allow_short,
+        nan_policy=nan_policy,
+    )
+    return MovingAverageCrossStrategy(params)
