@@ -400,11 +400,13 @@ def run_engine_cached(
         # fill/marking semantics are inside your portfolio.py (you said mark to close(t+1))
     )
 
+    plot_inds = [f"sma_{int(fast)}", f"sma_{int(slow)}"]
     spec = EngineSpec(
         data=data_cfg,
         indicators=ind_cfg,
         strategy=strat_cfg,
         portfolio=port_cfg,
+        plot_indicators=plot_inds,
         periods_per_year=252,
         rf_annual=0.0,
     )

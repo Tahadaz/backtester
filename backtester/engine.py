@@ -95,6 +95,7 @@ class EngineSpec:
     plot_indicators: List[str] = field(default_factory=list)
     periods_per_year: int = 252
     rf_annual: float = 0.0
+    
 
 
 
