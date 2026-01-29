@@ -7,7 +7,7 @@ import os
 import tempfile
 from pathlib import Path
 from typing import Optional, List
-import numpy as np
+
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
@@ -32,126 +32,97 @@ def plot_line(series: pd.Series, title: str, ylabel: str):
     plt.ylabel(ylabel)
     plt.grid(True)
     return fig
-import matplotlib.colors as mcolors
 
-def plot_price_indicators_trades(price: pd.Series, indicators: Optional[pd.DataFrame], trades: pd.DataFrame):
-    fig = plt.figure(figsize=(12, 5))
-    plt.plot(price.index, price.values, label="Close")
+import numpy as np
+import pandas as pd
 
-    if indicators is not None and not indicators.empty:
-        for c in indicators.columns:
-            plt.plot(indicators.index, indicators[c].values, label=c)
+def _fmt_pct(x):
+    if pd.isna(x): return ""
+    return f"{100*x:.2f}%" if abs(x) < 2 and abs(x) < 1 else f"{x:.2f}%"  # we store many already in %
 
-    if trades is not None and not trades.empty:
-        t = trades.copy()
-        t["timestamp"] = pd.to_datetime(t["timestamp"])
-        buys = t[t["side"] == "BUY"]
-        sells = t[t["side"] == "SELL"]
-        if not buys.empty:
-            plt.scatter(buys["timestamp"], buys["price"], marker="^", label="BUY")
-        if not sells.empty:
-            plt.scatter(sells["timestamp"], sells["price"], marker="v", label="SELL")
+def style_curve_vs_bench(df: pd.DataFrame):
+    # metrics where higher is better
+    good_high = {"Total Return", "CAGR", "Sharpe Ratio", "Sortino Ratio", "R-Squared"}
+    # metrics where lower is better
+    good_low  = {"Annual Volatility", "Max Daily Drawdown", "Max Drawdown Duration"}
 
-    plt.title("Price + Indicators + Trades")
-    plt.xlabel("Date")
-    plt.ylabel("Price")
-    plt.legend()
-    plt.grid(True)
-    return fig
-
-
-def plot_cum_vs_bench(cum: pd.Series, bench: Optional[pd.Series]):
-    fig = plt.figure(figsize=(12, 4))
-    plt.plot(cum.index, cum.values, label="Strategy")
-    if bench is not None:
-        plt.plot(bench.index, bench.values, label="Benchmark")
-    plt.title("Cumulative Returns vs Benchmark")
-    plt.xlabel("Date")
-    plt.ylabel("Cumulative return")
-    plt.legend()
-    plt.grid(True)
-    return fig
-
-
-def plot_drawdown_red(dd: pd.Series):
-    fig = plt.figure(figsize=(12, 3))
-    plt.plot(dd.index, dd.values)
-    # fill where drawdown < 0
-    plt.fill_between(dd.index, dd.values, 0.0, where=(dd.values < 0.0), alpha=0.35, color="red")
-    plt.title("Drawdown")
-    plt.xlabel("Date")
-    plt.ylabel("Drawdown")
-    plt.grid(True)
-    return fig
-
-
-def plot_monthly_heatmap(monthly: pd.DataFrame):
-    # monthly: index=year, columns=1..12, values=returns
-    fig = plt.figure(figsize=(12, 5))
-    ax = plt.gca()
-
-    if monthly is None or monthly.empty:
-        ax.set_title("Monthly returns heatmap (no data)")
-        return fig
-
-    data = monthly.values.astype(float)
-
-    vmin = np.nanmin(data)
-    vmax = np.nanmax(data)
-
-    # Robust normalization around 0
-    if np.isnan(vmin) or np.isnan(vmax):
-        ax.set_title("Monthly returns heatmap (no data)")
-        return fig
-
-    if vmin < 0 < vmax:
-        norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
-    else:
-        # all positive or all negative: simple norm
-        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-
-    im = ax.imshow(data, aspect="auto", norm=norm, cmap="RdYlGn")  # red->yellow->green
-    ax.set_title("Monthly Returns Heatmap")
-    ax.set_yticks(range(len(monthly.index)))
-    ax.set_yticklabels(monthly.index.astype(str).tolist())
-    ax.set_xticks(range(12))
-    ax.set_xticklabels(["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"])
-
-    plt.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
-    return fig
-
-
-def plot_yearly_bar(yearly: pd.Series):
-    fig = plt.figure(figsize=(12, 3))
-    ax = plt.gca()
-    if yearly is None or yearly.empty:
-        ax.set_title("Yearly returns (no data)")
-        return fig
-
-    years = yearly.index.astype(str).tolist()
-    vals = yearly.values.astype(float)
-
-    # color by sign
-    colors = ["green" if v >= 0 else "red" for v in vals]
-    ax.bar(years, vals, color=colors)
-    ax.set_title("Yearly Returns")
-    ax.set_xlabel("Year")
-    ax.set_ylabel("Return")
-    ax.grid(True, axis="y")
-    return fig
-
-
-def style_good_bad(df: pd.DataFrame, good_high: bool = True):
-    # Simple generic styler: green for good, red for bad, per-cell numeric
-    def color(v):
-        if pd.isna(v) or not isinstance(v, (int, float, np.floating)):
+    def color_cell(val, metric, col):
+        if not isinstance(val, (int, float, np.floating)) or pd.isna(val):
             return ""
-        if good_high:
-            return "color: green;" if v > 0 else ("color: red;" if v < 0 else "")
-        else:
-            return "color: green;" if v < 0 else ("color: red;" if v > 0 else "")
+        # if benchmark exists, compare Strategy vs Benchmark
+        if "Benchmark" in df.columns and col in ("Strategy", "Benchmark"):
+            s = df.loc[metric, "Strategy"]
+            b = df.loc[metric, "Benchmark"]
+            if pd.isna(b) or metric == "R-Squared":
+                # no compare for R2 / missing
+                pass
+            else:
+                if metric in good_high:
+                    return "color: green;" if s > b and col == "Strategy" else ("color: red;" if s < b and col == "Strategy" else "")
+                if metric in good_low:
+                    return "color: green;" if s < b and col == "Strategy" else ("color: red;" if s > b and col == "Strategy" else "")
 
-    return df.style.applymap(color)
+        # single-column fallback
+        if metric in good_high:
+            return "color: green;" if val > 0 else ("color: red;" if val < 0 else "")
+        if metric in good_low:
+            # for drawdown/vol lower is better => if negative drawdown, closer to 0 is better; keep red if very negative
+            return "color: green;" if val >= 0 else ""
+        return ""
+
+    def apply_style(s: pd.Series):
+        metric = s.name
+        out = []
+        for col, val in s.items():
+            out.append(color_cell(val, metric, col))
+        return out
+
+    return df.style.apply(apply_style, axis=1).format({
+        "Strategy": lambda v: f"{v*100:.2f}%" if df.index.isin(["Total Return","CAGR","Annual Volatility","Max Daily Drawdown"]).any() and isinstance(v,(int,float,np.floating)) else f"{v:.2f}",
+        "Benchmark": lambda v: f"{v*100:.2f}%" if isinstance(v,(int,float,np.floating)) and df.index.isin(["Total Return","CAGR","Annual Volatility","Max Daily Drawdown"]).any() else f"{v:.2f}",
+    }, na_rep="")
+
+def style_trade_table(df: pd.DataFrame):
+    good_high = {"Trade Winning %", "Average Trade %", "Average Win %", "Best Trade %"}
+    good_low  = {"Average Loss %", "Worst Trade %", "Avg Days in Trade"}  # avg days not always "bad", but you can keep neutral
+
+    def color(v, metric):
+        if metric in ("Worst Trade Date", "Trades"):
+            return ""
+        if not isinstance(v, (int,float,np.floating)) or pd.isna(v):
+            return ""
+        if metric in good_high:
+            return "color: green;" if v > 0 else ("color: red;" if v < 0 else "")
+        if metric in good_low:
+            return "color: red;" if v < 0 else ""  # losses are negative => red
+        return ""
+
+    def apply(s: pd.Series):
+        metric = s.name
+        v = s.iloc[0]
+        return [color(v, metric)]
+
+    return df.style.apply(apply, axis=1).format(na_rep="", precision=2)
+
+def style_time_table(df: pd.DataFrame):
+    good_high = {"Winning Months %", "Average Winning Month %", "Best Month %", "Winning Years %", "Best Year %"}
+    good_low  = {"Average Losing Month %", "Worst Month %", "Worst Year %"}
+
+    def color(v, metric):
+        if not isinstance(v, (int,float,np.floating)) or pd.isna(v):
+            return ""
+        if metric in good_high:
+            return "color: green;" if v > 0 else ("color: red;" if v < 0 else "")
+        if metric in good_low:
+            return "color: red;" if v < 0 else ""
+        return ""
+
+    def apply(s: pd.Series):
+        metric = s.name
+        v = s.iloc[0]
+        return [color(v, metric)]
+
+    return df.style.apply(apply, axis=1).format(na_rep="", precision=2)
 
 
 # --------------------------
@@ -362,53 +333,21 @@ try:
     rep = bundle.report
 
     # --- Outputs ---
-    plots = bundle.report.plots
-    tables = bundle.report.tables
-    series = bundle.report.series
+    t_curve = bundle.report.tables["curve_vs_benchmark"]
+    t_trade = bundle.report.tables["trade_summary"]
+    t_time  = bundle.report.tables["time_summary"]
 
-    st.subheader("Price + Indicators + Trades")
-    pp = plots["price_panel"]
-    st.pyplot(plot_price_indicators_trades(pp["price"], pp["indicators"], pp["trades"]))
-
-    st.subheader("Cumulative Returns vs Benchmark")
-    cvb = plots["cum_vs_bench"]
-    st.pyplot(plot_cum_vs_bench(cvb["strategy"], cvb["benchmark"]))
-
-    st.subheader("Drawdown")
-    st.pyplot(plot_drawdown_red(plots["drawdown"]))
-
-    st.subheader("Monthly Returns Heatmap")
-    st.pyplot(plot_monthly_heatmap(plots["monthly_heatmap"]))
-
-    st.subheader("Yearly Returns")
-    st.pyplot(plot_yearly_bar(plots["yearly_bar"]))
-
-    st.subheader("Trades table")
-    st.dataframe(tables["trades"], use_container_width=True)
-
-    st.subheader("Time series table")
-    st.dataframe(tables["timeseries"].tail(300), use_container_width=True)
-
-    if "strategy_vs_benchmark" in tables:
-        st.subheader("Strategy vs Benchmark")
-        st.dataframe(tables["strategy_vs_benchmark"], use_container_width=True)
-
-    st.subheader("Headline metrics")
-    st.json(rep.metrics)
-
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     with c1:
-        st.subheader("Cumulative returns")
-        st.pyplot(plot_line(rep.series["cum_returns"].dropna(), "Cumulative Returns", "Cum return"))
+        st.markdown("### Curve vs. Benchmark")
+        st.dataframe(style_curve_vs_bench(t_curve), use_container_width=True)
     with c2:
-        st.subheader("Drawdown")
-        st.pyplot(plot_line(rep.series["drawdown"].dropna(), "Drawdown", "Drawdown"))
+        st.markdown("### Trade")
+        st.dataframe(style_trade_table(t_trade), use_container_width=True)
+    with c3:
+        st.markdown("### Time")
+        st.dataframe(style_time_table(t_time), use_container_width=True)
 
-    st.subheader("Trades")
-    st.dataframe(rep.tables["trades"], use_container_width=True)
-
-    st.subheader("Monthly returns")
-    st.dataframe(rep.tables["monthly_returns"], use_container_width=True)
 
     with st.expander("Debug: feature columns / signals head", expanded=False):
         sym = bundle.md.symbols()[0]
