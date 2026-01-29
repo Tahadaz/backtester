@@ -73,13 +73,13 @@ def plot_price_indicators_trades_plotly(
         else:
             cols = list(ind.columns)
         indicator_colors = {
-            "sma_20": "#1F77B4",   # blue
-            "sma_50": "#FF7F0E",   # orange
+             "#38F10A",   # blue
+             "#FF0E0E",   # orange
         }
         for c in cols:
             s = ind[c].astype(float)
             if s.notna().any():
-                fig.add_trace(go.Scatter(x=df.index, y=s, mode="lines", name=c,line=dict(width=2, color=indicator_colors.get(c, None)),))
+                fig.add_trace(go.Scatter(x=df.index, y=s, mode="lines", name=c,line=dict(width=0.5, color=indicator_colors.get(c, None)),))
 
     # Trades
     if trades is not None and not trades.empty:
