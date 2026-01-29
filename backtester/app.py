@@ -11,7 +11,7 @@ from typing import Optional, List
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-
+import matplotlib.colors as mcolors
 # ---- your project imports (adjust if your modules are inside a package folder) ----
 from engine import BacktestEngine, EngineSpec, DataConfig, IndicatorsConfig, StrategyConfig
 from portfolio import PortfolioConfig, CostModel
@@ -31,6 +31,143 @@ def plot_line(series: pd.Series, title: str, ylabel: str):
     plt.xlabel("Date")
     plt.ylabel(ylabel)
     plt.grid(True)
+    return fig
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+
+def plot_price_indicators_trades(price: pd.Series,
+                                 indicators: pd.DataFrame | None,
+                                 trades: pd.DataFrame) -> plt.Figure:
+    fig = plt.figure(figsize=(14, 5))
+    ax = plt.gca()
+
+    ax.plot(price.index, price.values, label="Close")
+
+    if indicators is not None and not indicators.empty:
+        for c in indicators.columns:
+            ax.plot(indicators.index, indicators[c].values, label=c)
+
+    if trades is not None and not trades.empty:
+        t = trades.copy()
+        t["timestamp"] = pd.to_datetime(t["timestamp"])
+        if "side" not in t.columns:
+            t["side"] = np.where(t["qty"].astype(float) > 0, "BUY", "SELL")
+
+        buys = t[t["side"] == "BUY"]
+        sells = t[t["side"] == "SELL"]
+
+        if not buys.empty:
+            ax.scatter(buys["timestamp"], buys["price"], marker="^", label="BUY")
+        if not sells.empty:
+            ax.scatter(sells["timestamp"], sells["price"], marker="v", label="SELL")
+
+    ax.set_title("Price + Indicators + Trades")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price")
+    ax.grid(True)
+    ax.legend()
+    return fig
+
+
+def plot_cum_vs_bench(cum: pd.Series, bench_cum: pd.Series | None) -> plt.Figure:
+    fig = plt.figure(figsize=(14, 4))
+    ax = plt.gca()
+
+    ax.plot(cum.index, cum.values, label="Strategy")
+    if bench_cum is not None:
+        ax.plot(bench_cum.index, bench_cum.values, label="Benchmark")
+
+    ax.set_title("Cumulative Returns vs Benchmark")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Cumulative return")
+    ax.grid(True)
+    ax.legend()
+    return fig
+
+
+def plot_drawdown_red(dd: pd.Series) -> plt.Figure:
+    fig = plt.figure(figsize=(14, 3))
+    ax = plt.gca()
+
+    ax.plot(dd.index, dd.values, label="Drawdown")
+    ax.fill_between(dd.index, dd.values, 0.0, where=(dd.values < 0.0), alpha=0.35, color="red")
+
+    ax.set_title("Drawdown")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Drawdown")
+    ax.grid(True)
+    ax.legend()
+    return fig
+
+
+def plot_monthly_heatmap_with_values(monthly: pd.DataFrame) -> plt.Figure:
+    """
+    monthly: DataFrame index=year, columns=1..12, values=monthly return (decimal)
+    """
+    fig = plt.figure(figsize=(14, 5))
+    ax = plt.gca()
+
+    if monthly is None or monthly.empty:
+        ax.set_title("Monthly returns heatmap (no data)")
+        return fig
+
+    data = monthly.values.astype(float)
+    if np.isnan(data).all():
+        ax.set_title("Monthly returns heatmap (no data)")
+        return fig
+
+    vmin = np.nanmin(data)
+    vmax = np.nanmax(data)
+
+    if vmin < 0 < vmax:
+        norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
+    else:
+        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+
+    im = ax.imshow(data, aspect="auto", norm=norm, cmap="RdYlGn")
+
+    ax.set_title("Monthly Returns Heatmap")
+    ax.set_yticks(range(len(monthly.index)))
+    ax.set_yticklabels(monthly.index.astype(str).tolist())
+
+    ax.set_xticks(range(12))
+    ax.set_xticklabels(["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"])
+
+    # values in cells
+    for i in range(data.shape[0]):
+        for j in range(data.shape[1]):
+            val = data[i, j]
+            if np.isnan(val):
+                continue
+            ax.text(j, i, f"{val*100:.1f}%", ha="center", va="center", fontsize=8)
+
+    plt.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
+    return fig
+
+
+def plot_yearly_returns_bar(yearly: pd.Series) -> plt.Figure:
+    """
+    yearly: Series index=year, values=year return (decimal)
+    """
+    fig = plt.figure(figsize=(14, 3))
+    ax = plt.gca()
+
+    if yearly is None or yearly.empty:
+        ax.set_title("Yearly returns (no data)")
+        return fig
+
+    years = yearly.index.astype(str).tolist()
+    vals = yearly.values.astype(float)
+
+    colors = ["green" if v >= 0 else "red" for v in vals]
+    ax.bar(years, vals, color=colors)
+
+    ax.set_title("Yearly Returns")
+    ax.set_xlabel("Year")
+    ax.set_ylabel("Return")
+    ax.grid(True, axis="y")
     return fig
 
 import numpy as np
@@ -333,6 +470,26 @@ try:
     rep = bundle.report
 
     # --- Outputs ---
+    plots = bundle.report.plots
+    tables = bundle.report.tables
+
+    st.subheader("Price + Indicators + Trades")
+    pp = plots["price_panel"]
+    st.pyplot(plot_price_indicators_trades(pp["price"], pp["indicators"], pp["trades"]))
+
+    st.subheader("Cumulative Returns vs Benchmark")
+    cvb = plots["cum_vs_bench"]
+    st.pyplot(plot_cum_vs_bench(cvb["strategy"], cvb["benchmark"]))
+
+    st.subheader("Drawdown")
+    st.pyplot(plot_drawdown_red(plots["drawdown"]))
+
+    st.subheader("Monthly Returns Heatmap")
+    st.pyplot(plot_monthly_heatmap_with_values(plots["monthly_heatmap"]))
+
+    st.subheader("Yearly Returns")
+    st.pyplot(plot_yearly_returns_bar(plots["yearly_bar"]))
+
     t_curve = bundle.report.tables["curve_vs_benchmark"]
     t_trade = bundle.report.tables["trade_summary"]
     t_time  = bundle.report.tables["time_summary"]
