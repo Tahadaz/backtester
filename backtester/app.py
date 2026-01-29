@@ -536,8 +536,6 @@ try:
             yf_period=(yf_period if not source.startswith("bmce") else None),
             yf_interval=(yf_interval if not source.startswith("bmce") else None),
             yf_auto_adjust=(yf_auto_adjust if not source.startswith("bmce") else None),
-            fast=int(fast),
-            slow=int(slow),
             allow_short=bool(allow_short),
             initial_cash=float(initial_cash),
             rebalance_policy=str(rebalance_policy),
