@@ -25,6 +25,63 @@ st.title("Backtester (TA) — Data → Indicators → Strategy → Portfolio →
 # --------------------------
 # Small plotting helpers
 # --------------------------
+def score_report(report, metric: str) -> float:
+    """
+    metric options:
+      - total_net_pnl
+      - total_return
+      - sharpe
+      - max_drawdown (we minimize, so score will be negative of drawdown)
+    """
+    # 1) Prefer explicit metrics if you added them in results.py
+    m = getattr(report, "metrics", {}) or {}
+    if metric in m and m[metric] is not None:
+        return float(m[metric])
+
+    # 2) Otherwise compute from series/tables defensively
+    series = report.series
+    tables = report.tables
+
+    if metric == "total_net_pnl":
+        if "trade_ledger" in tables and not tables["trade_ledger"].empty and "net_pnl" in tables["trade_ledger"].columns:
+            return float(pd.to_numeric(tables["trade_ledger"]["net_pnl"], errors="coerce").fillna(0.0).sum())
+        # fallback: equity end - start
+        eq = series.get("equity")
+        if eq is not None and len(eq) > 1:
+            return float(eq.iloc[-1] - eq.iloc[0])
+        return np.nan
+
+    if metric == "total_return":
+        cum = series.get("cum_returns")
+        if cum is not None and len(cum) > 0:
+            return float(cum.iloc[-1])
+        # fallback
+        eq = series.get("equity")
+        if eq is not None and len(eq) > 1:
+            return float(eq.iloc[-1] / eq.iloc[0] - 1.0)
+        return np.nan
+
+    if metric == "sharpe":
+        # if you didn't store sharpe in report.metrics yet, approximate from returns
+        rets = series.get("returns")
+        if rets is None or len(rets) < 5:
+            return np.nan
+        mu = float(rets.mean())
+        sd = float(rets.std(ddof=1))
+        if sd == 0:
+            return np.nan
+        return mu / sd * np.sqrt(252)
+
+    if metric == "max_drawdown":
+        dd = series.get("drawdown")
+        if dd is None or dd.empty:
+            return np.nan
+        # dd is negative; bigger drawdown magnitude is worse
+        # we return NEGATIVE of min(dd) so "higher is better"
+        return float(-dd.min())
+
+    return np.nan
+
 def plot_line(series: pd.Series, title: str, ylabel: str):
     fig = plt.figure(figsize=(12, 4))
     plt.plot(series.index, series.values)
@@ -348,6 +405,9 @@ def style_time_table(df: pd.DataFrame):
 # --------------------------
 # Sidebar inputs
 # --------------------------
+st.sidebar.header("Mode")
+mode = st.sidebar.radio("Choose mode", ["Backtest", "Optimization"], index=0)
+
 st.sidebar.header("Data source")
 source = st.sidebar.selectbox("Source", ["bmce (upload)", "yfinance"], index=0)
 
@@ -561,10 +621,302 @@ def run_engine_cached(
     bundle = BacktestEngine(spec).run()
     return bundle
 
+@st.cache_data(show_spinner=False)
+def run_one_backtest(spec_dict: dict) -> dict:
+    """
+    Cache-friendly wrapper: we pass a serializable dict,
+    reconstruct EngineSpec inside, run, return lightweight outputs.
+    """
+    # Reconstruct configs
+    data_cfg = DataConfig(**spec_dict["data"])
+    ind_cfg = IndicatorsConfig(**spec_dict["indicators"])
+    strat_cfg = StrategyConfig(**spec_dict["strategy"])
+    port_cfg = PortfolioConfig(**spec_dict["portfolio"])
+
+    spec = EngineSpec(
+        data=data_cfg,
+        indicators=ind_cfg,
+        strategy=strat_cfg,
+        portfolio=port_cfg,
+        periods_per_year=spec_dict.get("periods_per_year", 252),
+        rf_annual=spec_dict.get("rf_annual", 0.0),
+        plot_indicators=spec_dict.get("plot_indicators", []),
+        benchmark=spec_dict.get("benchmark", None) or None,
+    )
+
+    bundle = BacktestEngine(spec).run()
+
+    # Return only what optimizer needs (avoid caching huge objects if possible)
+    return {
+        "metrics": bundle.report.metrics,
+        "series_tail": {
+            "equity_last": float(bundle.report.series["equity"].iloc[-1]) if "equity" in bundle.report.series else np.nan
+        },
+        "tables_meta": {
+            "has_trade_ledger": "trade_ledger" in bundle.report.tables,
+            "n_trades": int(len(bundle.report.tables["trade_ledger"])) if "trade_ledger" in bundle.report.tables else 0,
+        },
+        # IMPORTANT: still return report if you want full display for best run (optional)
+        "report": bundle.report,
+        "bundle_meta": bundle.meta,
+    }
 
 # --------------------------
 # Main page
 # --------------------------
+if mode == "Optimization":
+    st.title("Optimization")
+
+    st.info("Grid-search runs many backtests. Start small (e.g., 20–100 runs).")
+
+    # --- choose what to optimize ---
+    opt_strategy = st.selectbox("Strategy to optimize", ["sma_price", "ma_cross"], index=0)
+
+    metric = st.selectbox(
+        "Objective (maximize)",
+        ["total_net_pnl", "total_return", "sharpe", "max_drawdown"],
+        index=0,
+        help="max_drawdown here is scored as (-min drawdown) so higher is better.",
+    )
+
+    # --- date range / lookback optimization approach ---
+    # simplest: optimize on last N years ending at last available date
+    lookbacks = st.multiselect("Lookback windows (years)", [1, 2, 3, 5, 10], default=[1, 2, 3])
+
+    # --- parameter grids ---
+    allow_short_opt = st.checkbox("Allow short", value=allow_short)
+
+    if opt_strategy == "sma_price":
+        w_min = st.number_input("SMA window min", 2, 500, 10)
+        w_max = st.number_input("SMA window max", 2, 500, 200)
+        w_step = st.number_input("SMA window step", 1, 50, 5)
+        windows = list(range(int(w_min), int(w_max) + 1, int(w_step)))
+        grid_size = len(windows) * max(1, len(lookbacks))
+        st.caption(f"Grid size: {grid_size} runs")
+
+    else:  # ma_cross
+        fast_list = st.multiselect("Fast windows", [5, 10, 15, 20, 30, 40, 50], default=[10, 20])
+        slow_list = st.multiselect("Slow windows", [30, 50, 80, 100, 150, 200], default=[50, 100])
+        pairs = [(int(f), int(s)) for f in fast_list for s in slow_list if int(f) < int(s)]
+        grid_size = len(pairs) * max(1, len(lookbacks))
+        st.caption(f"Grid size: {grid_size} runs")
+
+    run_opt = st.button("Run optimization")
+
+    if not run_opt:
+        st.stop()
+
+    # --- load your underlying data once so we know the last date ---
+    # We’ll reuse your existing single-run logic minimally: call BacktestEngine once with current settings to get last timestamp.
+    with st.spinner("Preparing data..."):
+        # Use a minimal spec to fetch data and establish last timestamp
+        # (We reuse current UI selections; for BMCE this uses uploaded tmp_path already prepared in your backtest flow.
+        # If you're in optimization mode, ensure BMCE file is uploaded and tmp_path is created similarly.)
+        if source.startswith("bmce"):
+            if bmce_file is None:
+                st.error("Upload a BMCE file first (sidebar).")
+                st.stop()
+
+            # create temp path like in your backtest flow
+            suffix = Path(bmce_file.name).suffix.lower()
+            tmp_dir = tempfile.mkdtemp(prefix="bmce_upload_")
+            tmp_path = str(Path(tmp_dir) / f"{symbol}{suffix}")
+            with open(tmp_path, "wb") as f:
+                f.write(bmce_file.getbuffer())
+
+            data_cfg_base = {
+                "source": "bmce",
+                "symbols": [symbol],
+                "timezone": timezone,
+                "interval": interval,
+                "start": None,
+                "end": None,
+                "bmce_paths": tmp_path,
+                "yf_period": "max",
+                "yf_interval": "1d",
+                "yf_auto_adjust": False,
+            }
+        else:
+            data_cfg_base = {
+                "source": "yfinance",
+                "symbols": [symbol],
+                "timezone": timezone,
+                "interval": yf_interval,
+                "start": None,
+                "end": None,
+                "bmce_paths": None,
+                "yf_period": yf_period or "max",
+                "yf_interval": yf_interval or "1d",
+                "yf_auto_adjust": bool(yf_auto_adjust),
+            }
+
+        # Quick probe run (cheap) just to get last date from MarketData
+        probe_spec = EngineSpec(
+            data=DataConfig(**data_cfg_base),
+            indicators=IndicatorsConfig(specs=None),
+            strategy=StrategyConfig(kind="sma_price", params={"window": 20, "allow_short": allow_short_opt, "nan_policy": "flat"}),
+            portfolio=PortfolioConfig(allow_short=allow_short_opt, initial_cash=float(initial_cash), rebalance_policy=str(rebalance_policy),
+                                     max_gross=float(max_gross), cash_buffer=float(cash_buffer),
+                                     cost_model=CostModel(brokerage_bps=float(brokerage_bps), exchange_bps=float(exchange_bps),
+                                                         settlement_bps=float(settlement_bps), slippage_bps=float(slippage_bps), vat_rate=float(vat_rate))),
+            periods_per_year=252,
+            rf_annual=0.0,
+        )
+        probe_bundle = BacktestEngine(probe_spec).run()
+        sym0 = probe_bundle.md.symbols()[0]
+        last_dt = probe_bundle.md.bars[sym0].index.max()
+
+    st.write(f"Last available date in data: **{last_dt.date()}**")
+
+    # --- run grid ---
+    results_rows = []
+    progress = st.progress(0)
+    total = int(grid_size) if grid_size else 1
+    k = 0
+
+    def make_start_end_for_lookback(years: int):
+        end_dt = last_dt
+        start_dt = (end_dt - pd.DateOffset(years=int(years))).to_pydatetime()
+        return pd.Timestamp(start_dt).strftime("%Y-%m-%d"), pd.Timestamp(end_dt).strftime("%Y-%m-%d")
+
+    for lb in (lookbacks if lookbacks else [None]):
+        if lb is None:
+            start_s, end_s = None, None
+        else:
+            start_s, end_s = make_start_end_for_lookback(int(lb))
+
+        if opt_strategy == "sma_price":
+            for w in windows:
+                strat_cfg = {"kind": "sma_price", "params": {"window": int(w), "allow_short": bool(allow_short_opt), "nan_policy": "flat"}}
+                plot_inds = [f"sma_{int(w)}"]
+
+                spec_dict = {
+                    "data": {**data_cfg_base, "start": start_s, "end": end_s},
+                    "indicators": {"specs": None, "spec_builder": None, "cache_dir": ".cache/features",
+                                   "enable_disk_cache": True, "enable_memory_cache": True, "engine_version": "v1"},
+                    "strategy": strat_cfg,
+                    "portfolio": {
+                        "allow_short": bool(allow_short_opt),
+                        "initial_cash": float(initial_cash),
+                        "max_gross": float(max_gross),
+                        "max_weight_per_asset": None,
+                        "cash_buffer": float(cash_buffer),
+                        "rebalance_policy": str(rebalance_policy),
+                        "fill_price_model": "next_open",
+                        "mtm_model": "close_t1",
+                        "open_col": "Open",
+                        "close_col": "Close",
+                        "cost_model": {
+                            "brokerage_bps": float(brokerage_bps),
+                            "exchange_bps": float(exchange_bps),
+                            "settlement_bps": float(settlement_bps),
+                            "slippage_bps": float(slippage_bps),
+                            "vat_rate": float(vat_rate),
+                        },
+                        "allow_fractional_shares": False,
+                    },
+                    "plot_indicators": plot_inds,
+                    "periods_per_year": 252,
+                    "rf_annual": 0.0,
+                }
+
+                out = run_one_backtest(spec_dict)
+                rep = out["report"]
+                score = score_report(rep, metric)
+
+                results_rows.append({
+                    "strategy": "sma_price",
+                    "window": int(w),
+                    "lookback_years": lb,
+                    "start": start_s,
+                    "end": end_s,
+                    "score": float(score),
+                    "total_net_pnl": score_report(rep, "total_net_pnl"),
+                    "total_return": score_report(rep, "total_return"),
+                    "sharpe": score_report(rep, "sharpe"),
+                    "max_drawdown_score": score_report(rep, "max_drawdown"),
+                })
+
+                k += 1
+                progress.progress(min(1.0, k / total))
+
+        else:
+            for fast_w, slow_w in pairs:
+                strat_cfg = {"kind": "ma_cross", "params": {"fast_window": int(fast_w), "slow_window": int(slow_w),
+                                                           "allow_short": bool(allow_short_opt), "nan_policy": "flat"}}
+                plot_inds = [f"sma_{int(fast_w)}", f"sma_{int(slow_w)}"]
+
+                spec_dict = {
+                    "data": {**data_cfg_base, "start": start_s, "end": end_s},
+                    "indicators": {"specs": None, "spec_builder": None, "cache_dir": ".cache/features",
+                                   "enable_disk_cache": True, "enable_memory_cache": True, "engine_version": "v1"},
+                    "strategy": strat_cfg,
+                    "portfolio": {
+                        "allow_short": bool(allow_short_opt),
+                        "initial_cash": float(initial_cash),
+                        "max_gross": float(max_gross),
+                        "max_weight_per_asset": None,
+                        "cash_buffer": float(cash_buffer),
+                        "rebalance_policy": str(rebalance_policy),
+                        "fill_price_model": "next_open",
+                        "mtm_model": "close_t1",
+                        "open_col": "Open",
+                        "close_col": "Close",
+                        "cost_model": {
+                            "brokerage_bps": float(brokerage_bps),
+                            "exchange_bps": float(exchange_bps),
+                            "settlement_bps": float(settlement_bps),
+                            "slippage_bps": float(slippage_bps),
+                            "vat_rate": float(vat_rate),
+                        },
+                        "allow_fractional_shares": False,
+                    },
+                    "plot_indicators": plot_inds,
+                    "periods_per_year": 252,
+                    "rf_annual": 0.0,
+                }
+
+                out = run_one_backtest(spec_dict)
+                rep = out["report"]
+                score = score_report(rep, metric)
+
+                results_rows.append({
+                    "strategy": "ma_cross",
+                    "fast": int(fast_w),
+                    "slow": int(slow_w),
+                    "lookback_years": lb,
+                    "start": start_s,
+                    "end": end_s,
+                    "score": float(score),
+                    "total_net_pnl": score_report(rep, "total_net_pnl"),
+                    "total_return": score_report(rep, "total_return"),
+                    "sharpe": score_report(rep, "sharpe"),
+                    "max_drawdown_score": score_report(rep, "max_drawdown"),
+                })
+
+                k += 1
+                progress.progress(min(1.0, k / total))
+
+    res_df = pd.DataFrame(results_rows).sort_values("score", ascending=False).reset_index(drop=True)
+    st.subheader("Optimization Results (ranked)")
+    st.dataframe(res_df.head(50), use_container_width=True)
+
+    best = res_df.iloc[0].to_dict() if len(res_df) else None
+    if best:
+        st.success(f"Best score = {best['score']:.4f} | params = {best}")
+
+    # Cleanup BMCE temp dir if created in optimization mode
+    if source.startswith("bmce"):
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            if tmp_dir and os.path.isdir(tmp_dir):
+                os.rmdir(tmp_dir)
+        except OSError:
+            pass
+
+    st.stop()
+
 if source.startswith("bmce"):
     st.subheader("BMCE upload")
     if bmce_file is None:
