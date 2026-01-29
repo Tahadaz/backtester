@@ -412,6 +412,12 @@ initial_cash = st.sidebar.number_input("Initial cash", min_value=1_000.0, value=
 rebalance_policy = st.sidebar.selectbox("Rebalance policy", ["on_change", "every_bar"], index=0)
 max_gross = st.sidebar.number_input("Max gross exposure", min_value=0.1, value=1.0, step=0.1)
 cash_buffer = st.sidebar.number_input("Cash buffer", min_value=0.0, max_value=0.5, value=0.0, step=0.01)
+st.sidebar.header("Sizing")
+sizing_mode = st.sidebar.selectbox("Sizing mode", ["target_weight", "pct_cash_shares"], index=0)
+
+buy_pct_cash = st.sidebar.slider("Buy % of cash per entry", 0.01, 1.00, 0.25, 0.01)
+sell_pct_shares = st.sidebar.slider("Sell % of shares per exit", 0.01, 1.00, 1.00, 0.01)
+
 
 st.sidebar.header("Costs")
 apply_costs = st.sidebar.checkbox("Apply costs", value=False)
@@ -513,8 +519,11 @@ def run_engine_cached(
         max_gross=float(max_gross),
         cash_buffer=float(cash_buffer),
         cost_model=cost_model,
-        # fill/marking semantics are inside your portfolio.py (you said mark to close(t+1))
+        sizing_mode=str(sizing_mode),
+        buy_pct_cash=float(buy_pct_cash),
+        sell_pct_shares=float(sell_pct_shares),
     )
+
     
     spec = EngineSpec(
         data=data_cfg,
