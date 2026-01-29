@@ -88,10 +88,6 @@ class ResultsAnalyzer:
         trade_tbl = self._trade_table(round_trips)
         time_tbl = self._time_table(rets)
 
-        tables["curve_vs_benchmark"] = curve_vs_bench
-        tables["trade_summary"] = trade_tbl
-        tables["time_summary"] = time_tbl
-
         # --- monthly & yearly returns ---
         monthly = self.plot_monthly_heatmap(rets)
         yearly = self._yearly_returns(rets)
@@ -120,6 +116,9 @@ class ResultsAnalyzer:
             "monthly_returns": monthly,
             "yearly_returns": yearly.to_frame("year_return"),
         }
+        tables["curve_vs_benchmark"] = curve_vs_bench
+        tables["trade_summary"] = trade_tbl
+        tables["time_summary"] = time_tbl
         if strat_vs_bench is not None:
             tables["strategy_vs_benchmark"] = strat_vs_bench
 
