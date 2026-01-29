@@ -411,3 +411,24 @@ class PriceAboveSMAStrategy(BaseStrategy):
         sf = SignalFrame(signals=sig_df, validity=valid_df, meta=meta)
         sf.assert_well_formed(symbols)
         return sf
+
+
+# =============================================================================
+# Helpers for engine/UI: plot overlay indicators per strategy
+# =============================================================================
+
+def default_plot_indicators(cfg_kind: str, cfg_params: Dict[str, Any]) -> List[str]:
+    k = cfg_kind.lower()
+    p = cfg_params or {}
+
+    if k == "ma_cross":
+        fast = int(p.get("fast_window", 20))
+        slow = int(p.get("slow_window", 50))
+        return [f"sma_{fast}", f"sma_{slow}"]
+
+    if k in ("sma_price", "price_sma", "price_above_sma"):
+        w = int(p.get("window", 50))
+        return [f"sma_{w}"]
+
+    # fallback: nothing to overlay
+    return []
