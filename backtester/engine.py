@@ -306,6 +306,9 @@ class BacktestEngine:
             )
             bsym = bcfg.symbol
 
+        
+        # 5) Results
+        analyzer = ResultsAnalyzer(periods_per_year=self.spec.periods_per_year, rf_annual=self.spec.rf_annual)
         report = analyzer.analyze(
             pres,
             market_data=md,
@@ -316,9 +319,6 @@ class BacktestEngine:
             benchmark_symbol=bsym,
         )
 
-        # 5) Results
-        analyzer = ResultsAnalyzer(periods_per_year=self.spec.periods_per_year, rf_annual=self.spec.rf_annual)
-        report = analyzer.analyze(pres, market_data=md, symbols=symbols)
         
         meta = {
             "symbols": symbols,
@@ -338,33 +338,7 @@ class BacktestEngine:
         )
 
 
-# -----------------------------
-# Example specs
-# -----------------------------
-def example_engine_bmce_one_symbol(path: str) -> BacktestBundle:
-    spec = EngineSpec(
-        data=DataConfig(
-            source="bmce",
-            symbols=["IAM"],
-            bmce_paths=path,        # single symbol -> single path
-            timezone="GMT",
-            interval="1d",
-        ),
-        indicators=IndicatorsConfig(specs=None),  # infer from strategy (ma_cross)
-        strategy=StrategyConfig(
-            kind="ma_cross",
-            params={"fast_window": 20, "slow_window": 50, "allow_short": True, "nan_policy": "flat"},
-        ),
-        portfolio=PortfolioConfig(
-            allow_short=True,
-            initial_cash=1_000_000.0,
-            rebalance_policy="on_change",
-            max_gross=1.0,
-            cash_buffer=0.0,
-            # costs can be configured here
-        ),
-    )
-    return BacktestEngine(spec).run()
+
 
 
 """
