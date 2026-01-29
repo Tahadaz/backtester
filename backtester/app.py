@@ -72,14 +72,10 @@ def plot_price_indicators_trades_plotly(
             cols = [c for c in indicator_cols if c in ind.columns]
         else:
             cols = list(ind.columns)
-        indicator_colors = {
-             "#38F10A",   # blue
-             "#FF0E0E",   # orange
-        }
         for c in cols:
             s = ind[c].astype(float)
             if s.notna().any():
-                fig.add_trace(go.Scatter(x=df.index, y=s, mode="lines", name=c,line=dict(width=0.5, color=indicator_colors.get(c, None)),))
+                fig.add_trace(go.Scatter(x=df.index, y=s, mode="lines", name=c,line=dict(width=0.5),))
 
     # Trades
     if trades is not None and not trades.empty:
@@ -344,10 +340,37 @@ else:
     yf_interval = st.sidebar.selectbox("yfinance interval", ["1d"], index=0)
     yf_auto_adjust = st.sidebar.checkbox("auto_adjust", value=False)
 
-st.sidebar.header("Strategy: MA Cross")
-fast = st.sidebar.number_input("Fast window", min_value=2, max_value=300, value=20, step=1)
-slow = st.sidebar.number_input("Slow window", min_value=3, max_value=500, value=50, step=1)
-allow_short = st.sidebar.checkbox("Allow short", value=True)
+with st.sidebar:
+    st.header("Strategy")
+
+    strategy_kind = st.selectbox(
+        "Choose strategy",
+        options=["ma_cross", "sma_price"],
+        index=0,
+        help="ma_cross: SMA fast vs SMA slow. sma_price: Close vs SMA(window).",
+    )
+
+    allow_short = st.checkbox("Allow short", value=False)
+
+    if strategy_kind == "ma_cross":
+        fast = st.number_input("Fast SMA window", min_value=2, max_value=500, value=20, step=1)
+        slow = st.number_input("Slow SMA window", min_value=3, max_value=500, value=50, step=1)
+        # enforce fast < slow defensively
+        if fast >= slow:
+            st.warning("Fast window must be < Slow window. Adjusting automatically.")
+            fast = min(int(fast), int(slow) - 1)
+
+        # pack params for engine
+        strat_fast = int(fast)
+        strat_slow = int(slow)
+        strat_window = None
+
+    else:  # "sma_price"
+        window = st.number_input("SMA window", min_value=2, max_value=500, value=50, step=1)
+        strat_window = int(window)
+        strat_fast = None
+        strat_slow = None
+
 
 st.sidebar.header("Portfolio")
 initial_cash = st.sidebar.number_input("Initial cash", min_value=1_000.0, value=1_000_000.0, step=10_000.0)
@@ -387,9 +410,9 @@ def run_engine_cached(
     yf_interval: Optional[str],
     yf_auto_adjust: Optional[bool],
     # strategy
-    fast: int,
-    slow: int,
     allow_short: bool,
+    strategy_kind: str,
+    strategy_params: dict,
     # portfolio
     initial_cash: float,
     rebalance_policy: str,
@@ -423,14 +446,11 @@ def run_engine_cached(
 
     # ---- Strategy config ----
     strat_cfg = StrategyConfig(
-        kind="ma_cross",
-        params={
-            "fast_window": int(fast),
-            "slow_window": int(slow),
-            "allow_short": bool(allow_short),
-            "nan_policy": "flat",
-        },
+        kind=strategy_kind,
+        params=dict(strategy_params or {}),
     )
+
+
 
     # ---- Indicators config ----
     # specs=None => engine infers SMA specs for MA cross
@@ -454,14 +474,12 @@ def run_engine_cached(
         cost_model=cost_model,
         # fill/marking semantics are inside your portfolio.py (you said mark to close(t+1))
     )
-
-    plot_inds = [f"sma_{int(fast)}", f"sma_{int(slow)}"]
+    
     spec = EngineSpec(
         data=data_cfg,
         indicators=ind_cfg,
         strategy=strat_cfg,
         portfolio=port_cfg,
-        plot_indicators=plot_inds,
         periods_per_year=252,
         rf_annual=0.0,
     )
@@ -530,6 +548,8 @@ try:
             settlement_bps=float(settlement_bps),
             vat_rate=float(vat_rate),
             slippage_bps=float(slippage_bps),
+            strategy_kind=str,
+            strategy_params=dict,
         )
 
     rep = bundle.report
@@ -544,10 +564,10 @@ try:
     bars = bundle.md.bars[sym]  # full OHLCV bars (better than using Close only)
 
     fig = plot_price_indicators_trades_plotly(
-        bars=bars,
+        bars=bundle.md.bars[bundle.md.symbols()[0]],
         indicators=pp["indicators"],
         trades=pp["trades"],
-        indicator_cols=getattr(bundle.meta, "plot_indicators", None),  # or spec.plot_indicators
+        indicator_cols=pp.get("indicator_cols"),
     )
     st.plotly_chart(fig, use_container_width=True)
 

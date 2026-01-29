@@ -17,9 +17,12 @@ from strategy import (
     MovingAverageCrossStrategy,
     MovingAverageCrossParams,
     SignalFrame,
+    PriceAboveSMAStrategy,
+    PriceAboveSMAParams,
 )
 from portfolio import PortfolioEngine, PortfolioConfig, PortfolioResult
 from results import ResultsAnalyzer, BacktestReport
+from strategy import default_plot_indicators  # add import
 
 
 DataSourceKind = Literal["bmce", "yfinance"]
@@ -152,30 +155,37 @@ def resolve_specs(ind_cfg: IndicatorsConfig, strat_cfg: StrategyConfig) -> List[
             raise ValueError("IndicatorsConfig.spec_builder returned empty specs list.")
         return specs
 
-    # Infer from known strategies
-    if strat_cfg.kind == "ma_cross":
-        fast = int(strat_cfg.params.get("fast_window", 20))
-        slow = int(strat_cfg.params.get("slow_window", 50))
-        return sma_specs_for_ma_cross(fast, slow)
-
-    raise ValueError(
-        "No indicator specs provided and no inference rule exists for this strategy kind. "
-        "Provide IndicatorsConfig.specs or spec_builder."
-    )
+    # ✅ Generic: build the strategy and ask it
+    strat = build_strategy(strat_cfg)
+    specs = strat.required_features()
+    if not specs:
+        raise ValueError("Strategy.required_features returned empty list.")
+    return specs
 
 
 # -----------------------------
 # Strategy registry
 # -----------------------------
-def build_strategy(cfg: StrategyConfig) -> BaseStrategy:
-    if cfg.kind == "ma_cross":
+def build_strategy(cfg) -> BaseStrategy:
+    kind = cfg.kind.lower()
+    p = cfg.params or {}
+
+    if kind in ("ma_cross", "moving_average_cross"):
         params = MovingAverageCrossParams(
-            fast_window=int(cfg.params.get("fast_window", 20)),
-            slow_window=int(cfg.params.get("slow_window", 50)),
-            allow_short=bool(cfg.params.get("allow_short", True)),
-            nan_policy=str(cfg.params.get("nan_policy", "flat")),
+            fast_window=int(p.get("fast_window", 15)),
+            slow_window=int(p.get("slow_window", 50)),
+            allow_short=bool(p.get("allow_short", False)),
+            nan_policy=str(p.get("nan_policy", "flat")),
         )
         return MovingAverageCrossStrategy(params)
+
+    if kind in ("sma_price", "price_sma", "price_above_sma"):
+        params = PriceAboveSMAParams(
+            window=int(p.get("window", 50)),
+            allow_short=bool(p.get("allow_short", False)),
+            nan_policy=str(p.get("nan_policy", "flat")),
+        )
+        return PriceAboveSMAStrategy(params)
 
     raise ValueError(f"Unknown strategy kind: {cfg.kind}")
 
@@ -307,7 +317,10 @@ class BacktestEngine:
             )
             bsym = bcfg.symbol
 
-        
+        plot_inds = self.spec.plot_indicators
+        if not plot_inds:
+            plot_inds = default_plot_indicators(self.spec.strategy.kind, self.spec.strategy.params)
+
         # 5) Results
         analyzer = ResultsAnalyzer(periods_per_year=self.spec.periods_per_year, rf_annual=self.spec.rf_annual)
         report = analyzer.analyze(
@@ -315,7 +328,7 @@ class BacktestEngine:
             market_data=md,
             symbols=symbols,
             features_data=feats,
-            plot_indicators=getattr(self.spec, "plot_indicators", None),
+            plot_indicators=plot_inds,
             benchmark_market_data=bmd,
             benchmark_symbol=bsym,
         )

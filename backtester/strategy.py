@@ -311,22 +311,103 @@ class MovingAverageCrossStrategy(BaseStrategy):
 
 
 # =============================================================================
-# Convenience: simple factory (optional)
+# Concrete strategy: Price vs SMA (single moving average filter)
 # =============================================================================
 
-def make_ma_cross_strategy(
-    fast_window: int = 15,
-    slow_window: int = 50,
-    allow_short: bool = False,
-    nan_policy: str = "flat",
-) -> MovingAverageCrossStrategy:
+@dataclass(frozen=True)
+class PriceAboveSMAParams:
+    window: int = 50
+    allow_short: bool = False
+    nan_policy: str = "flat"  # "flat" or "nan"
+
+    def __post_init__(self) -> None:
+        if self.window <= 0:
+            raise ValueError("window must be positive")
+        if self.nan_policy not in ("flat", "nan"):
+            raise ValueError("nan_policy must be 'flat' or 'nan'")
+
+
+class PriceAboveSMAStrategy(BaseStrategy):
     """
-    Small helper for quick experiments.
+    Signal rule at time t:
+        if Close[t] > SMA_window[t] -> +1
+        elif allow_short and Close[t] < SMA_window[t] -> -1
+        else -> 0
     """
-    params = MovingAverageCrossParams(
-        fast_window=fast_window,
-        slow_window=slow_window,
-        allow_short=allow_short,
-        nan_policy=nan_policy,
-    )
-    return MovingAverageCrossStrategy(params)
+
+    def __init__(self, params: PriceAboveSMAParams) -> None:
+        self.params = params
+        self._sma_name = f"sma_{params.window}"
+
+    @property
+    def spec(self) -> StrategySpec:
+        return StrategySpec(
+            name="PriceAboveSMAStrategy",
+            params=asdict(self.params),
+        )
+
+    def required_features(self) -> List[FeatureSpec]:
+        return [
+            FeatureSpec(
+                indicator="sma",
+                params={"window": self.params.window},
+                inputs=("Close",),
+                warmup=self.params.window,
+            )
+        ]
+
+    def generate_signals(
+        self,
+        market_data: MarketDataLike,
+        features_data: FeaturesDataLike,
+        symbols: Optional[Sequence[str]] = None,
+    ) -> SignalFrame:
+        symbols = list(symbols) if symbols is not None else list(market_data.bars.keys())
+
+        # common index
+        all_indexes = [market_data.bars[s].index for s in symbols]
+        common_index = all_indexes[0]
+        for idx in all_indexes[1:]:
+            common_index = common_index.union(idx)
+        common_index = common_index.sort_values()
+
+        sig_df = pd.DataFrame(index=common_index, columns=symbols, dtype="float64")
+        valid_df = pd.DataFrame(index=common_index, columns=symbols, dtype="bool")
+
+        for s in symbols:
+            bars = market_data.bars[s]
+            feats = features_data.features[s]
+
+            close = bars["Close"].reindex(common_index).astype(float)
+            sma = feats[self._sma_name].reindex(common_index).astype(float)
+
+            valid = close.notna() & sma.notna()
+            long_mask = close > sma
+
+            if self.params.allow_short:
+                short_mask = close < sma
+                signal = pd.Series(0.0, index=common_index)
+                signal[long_mask] = 1.0
+                signal[short_mask] = -1.0
+            else:
+                signal = long_mask.astype("float64")
+
+            if self.params.nan_policy == "flat":
+                signal = signal.where(valid, 0.0)
+            else:
+                signal = signal.where(valid, np.nan)
+
+            sig_df[s] = signal
+            valid_df[s] = valid
+
+        meta = {
+            "strategy_signature": self.spec.signature(),
+            "strategy_name": self.spec.name,
+            "strategy_params": self.spec.params,
+            "required_features": [fs.canonical_name() for fs in self.required_features()],
+            "note": "signals are intent at time t; fills/costs handled downstream",
+        }
+
+        sf = SignalFrame(signals=sig_df, validity=valid_df, meta=meta)
+        sf.assert_well_formed(symbols)
+        return sf
