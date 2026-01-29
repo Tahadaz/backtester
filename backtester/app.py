@@ -43,12 +43,19 @@ def plot_price_indicators_trades(price: pd.Series,
     fig = plt.figure(figsize=(14, 5))
     ax = plt.gca()
 
-    ax.plot(price.index, price.values, label="Close")
+    # Price
+    price = price.dropna()
+    ax.plot(price.index, price.values, label="Close", linewidth=1.6)
 
+    # SMA lines
     if indicators is not None and not indicators.empty:
+        indicators = indicators.reindex(price.index)
         for c in indicators.columns:
-            ax.plot(indicators.index, indicators[c].values, label=c)
+            s = indicators[c].dropna()
+            if not s.empty:
+                ax.plot(s.index, s.values, label=c, linewidth=1.3)
 
+    # Trade markers
     if trades is not None and not trades.empty:
         t = trades.copy()
         t["timestamp"] = pd.to_datetime(t["timestamp"])
@@ -58,15 +65,16 @@ def plot_price_indicators_trades(price: pd.Series,
         buys = t[t["side"] == "BUY"]
         sells = t[t["side"] == "SELL"]
 
+        # Use trade price if present; otherwise use close at timestamp
         if not buys.empty:
-            ax.scatter(buys["timestamp"], buys["price"], marker="^", label="BUY")
+            ax.scatter(buys["timestamp"], buys["price"], marker="^", s=60, label="BUY")
         if not sells.empty:
-            ax.scatter(sells["timestamp"], sells["price"], marker="v", label="SELL")
+            ax.scatter(sells["timestamp"], sells["price"], marker="v", s=60, label="SELL")
 
-    ax.set_title("Price + Indicators + Trades")
+    ax.set_title("Price + SMA + Trades")
     ax.set_xlabel("Date")
     ax.set_ylabel("Price")
-    ax.grid(True)
+    ax.grid(True, alpha=0.3)
     ax.legend()
     return fig
 
