@@ -16,7 +16,8 @@ def main() -> None:
     # 1) Load AAPL data
     srcY = YahooFinanceDataSource(timezone="UTC")
     mdY = srcY.load(
-        symbols=["AAPL"],
+        symbols=["IAM"],
+        paths={"IAM": "DATA IAM.xlsx"},
         start="2000-01-01",
         end="2014-01-01",
         interval="1d",
@@ -28,15 +29,15 @@ def main() -> None:
     # 3) Compute required features for this strategy
     specs = strat.required_features()
     ind = IndicatorEngine(cache_dir=".cache/features", enable_disk_cache=True)
-    featsY = ind.compute(mdY, specs, symbols=["AAPL"])
+    featsY = ind.compute(mdY, specs, symbols=["IAM"])
 
     # 4) Generate signals (intent at time t)
-    sf = strat.generate_signals(mdY, featsY, symbols=["AAPL"])
-    sig = sf.signals["AAPL"]
+    sf = strat.generate_signals(mdY, featsY, symbols=["IAM"])
+    sig = sf.signals["IAM"]
 
     # 5) Show when signals are generated / change
     # "Generated" here means the timestamps where the signal takes a value (after warmup).
-    valid = sf.validity["AAPL"] if sf.validity is not None else sig.notna()
+    valid = sf.validity["IAM"] if sf.validity is not None else sig.notna()
 
     # 4) Run portfolio
     cfg = PortfolioConfig(
@@ -55,12 +56,12 @@ def main() -> None:
         ),
     )
     engine = PortfolioEngine(cfg)
-    res = engine.run(mdY, sf, symbols=["AAPL"])
+    res = engine.run(mdY, sf, symbols=["IAM"])
 
 
 
     an = ResultsAnalyzer(periods_per_year=252, rf_annual=0.0)
-    rep = an.analyze(res, market_data=mdY, symbols=["AAPL"])
+    rep = an.analyze(res, market_data=mdY, symbols=["IAM"])
 
     an.plot_cumulative_returns(rep)
     an.plot_drawdown(rep)

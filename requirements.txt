@@ -13,6 +13,7 @@ kiwisolver==1.4.9
 matplotlib==3.10.8
 multitasking==0.0.12
 numpy==2.4.1
+openpyxl==3.1.2
 packaging==26.0
 pandas==3.0.0
 patsy==1.0.2
@@ -30,6 +31,7 @@ scipy==1.17.0
 six==1.17.0
 soupsieve==2.8.3
 statsmodels==0.14.6
+streamlit==1.40.2
 threadpoolctl==3.6.0
 typing_extensions==4.15.0
 tzdata==2025.3
