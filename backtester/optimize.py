@@ -1,552 +1,633 @@
 # optimize.py
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union, Literal
-import itertools
-import random
+import copy
 import math
-import pandas as pd
+import random
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
 import numpy as np
+import pandas as pd
 
-# ---- project imports ----
-# adjust import paths if you later package your code under a module folder
-from engine import BacktestEngine, EngineSpec, DataConfig, StrategyConfig, IndicatorsConfig, load_marketdata
-
-
-# ============================================================
-# Types
-# ============================================================
-Params = Dict[str, Any]
-
-SearchMode = Literal["grid", "random"]
-ObjectiveMode = Literal["pnl_then_efficiency"]
+from engine import BacktestEngine, EngineSpec
 
 
 # ============================================================
-# Parameter Specs (simple, readable)
+# Parameter specification
 # ============================================================
 @dataclass(frozen=True)
-class ChoiceParam:
-    key: str
-    choices: Sequence[Any]
+class ParamSpec:
+    """
+    A spec describing how to sample a parameter.
 
-    def grid(self) -> List[Any]:
-        return list(self.choices)
-
-    def sample(self, rng: random.Random) -> Any:
-        return rng.choice(list(self.choices))
-
-
-@dataclass(frozen=True)
-class IntRangeParam:
-    key: str
-    low: int
-    high: int
-    step: int = 1
-
-    def grid(self) -> List[int]:
-        return list(range(int(self.low), int(self.high) + 1, int(self.step)))
-
-    def sample(self, rng: random.Random) -> int:
-        return rng.randrange(int(self.low), int(self.high) + 1, int(self.step))
-
-
-@dataclass(frozen=True)
-class FloatRangeParam:
-    key: str
-    low: float
-    high: float
-    step: Optional[float] = None  # if None => random only
-
-    def grid(self) -> List[float]:
-        if self.step is None:
-            raise ValueError(f"{self.key}: step=None => cannot grid.")
-        n = int(math.floor((self.high - self.low) / self.step)) + 1
-        return [float(self.low + i * self.step) for i in range(n)]
-
-    def sample(self, rng: random.Random) -> float:
-        return float(rng.uniform(float(self.low), float(self.high)))
-
-
-ParamSpec = Union[ChoiceParam, IntRangeParam, FloatRangeParam]
-
-
-@dataclass
-class SearchSpace:
-    specs: List[ParamSpec]
-
-    def grid(self) -> Iterable[Params]:
-        keys = [s.key for s in self.specs]
-        grids = [s.grid() for s in self.specs]
-        for vals in itertools.product(*grids):
-            yield dict(zip(keys, vals))
-
-    def sample(self, rng: random.Random) -> Params:
-        return {s.key: s.sample(rng) for s in self.specs}
-
-
-def build_space(catalog: Dict[str, ParamSpec], active_keys: Sequence[str]) -> SearchSpace:
-    missing = [k for k in active_keys if k not in catalog]
-    if missing:
-        raise KeyError(f"Unknown parameter keys: {missing}. Available: {list(catalog.keys())}")
-    return SearchSpace([catalog[k] for k in active_keys])
+    kind:
+      - "int": integer range [low, high], optional step for grid
+      - "float": float range [low, high], optional step for grid
+      - "categorical": list of choices
+    """
+    kind: str  # "int" | "float" | "categorical"
+    low: Optional[float] = None
+    high: Optional[float] = None
+    step: Optional[float] = None
+    choices: Optional[List[Any]] = None
+    default: Optional[Any] = None
 
 
 # ============================================================
-# Trial output
+# Optimization config + result
 # ============================================================
+@dataclass(frozen=True)
+class OptimizeConfig:
+    """
+    mode:
+      - "random": random search over active parameters
+      - "grid": cartesian grid search over active parameters
+      - "wfo": walk-forward evaluation (candidate params evaluated over rolling test windows)
+
+    objective:
+      - "pnl_then_efficiency"  (primary: pnl, secondary: profit/volume)
+    """
+    mode: str  # "random" | "grid" | "wfo"
+    n_trials: Optional[int] = 200               # random only
+    top_k: int = 30
+    seed: int = 42
+    objective: str = "pnl_then_efficiency"
+    verbose: bool = False
+
+    # grid only
+    grid_max_combos: Optional[int] = 500
+
+    # wfo only (bars count; daily data => 252 ~ 1y)
+    wfo_train_bars: Optional[int] = 252
+    wfo_test_bars: Optional[int] = 63
+    wfo_step_bars: Optional[int] = 21
+
+
 @dataclass
 class TrialResult:
-    params: Params
+    params: Dict[str, Any]
     pnl: float
     traded_notional: float
-    efficiency: float  # pnl / traded_notional
-    score: Tuple[float, float]  # (pnl, efficiency) for lexicographic ranking
-    metrics: Dict[str, float]
-    notes: Dict[str, Any]
+    efficiency: float  # pnl / traded_notional (0 if traded_notional=0)
+    spec: EngineSpec
 
 
 # ============================================================
-# Objective
+# Public API
 # ============================================================
-def score_pnl_then_efficiency(pnl: float, efficiency: float) -> Tuple[float, float]:
-    # lexicographic: primary pnl, tie-breaker efficiency
-    return (float(pnl), float(efficiency))
-
-
-# ============================================================
-# Parameter application: Params dict -> EngineSpec
-# Keys convention:
-#   data.start, data.end
-#   strategy.kind, strategy.fast_window, strategy.slow_window, strategy.window
-#   portfolio.sizing_mode, portfolio.buy_pct_cash, portfolio.sell_pct_shares, etc.
-# ============================================================
-def _set_in_dict(d: Dict[str, Any], k: str, v: Any) -> None:
-    d[k] = v
-
-
-def apply_params_to_spec(base: EngineSpec, params: Params) -> EngineSpec:
+def default_param_catalog_for_your_app(strategy_kind: Optional[str] = None) -> Dict[str, ParamSpec]:
     """
-    Returns a NEW EngineSpec with params applied.
-    Uses dataclasses.replace for frozen dataclasses.
+    Catalog keys use a dotted-path convention. Supported keys in this file:
+      - strategy.fast_window, strategy.slow_window, strategy.window
+      - portfolio.buy_pct_cash, portfolio.sell_pct_shares, portfolio.cooldown_bars
+      - data.window  (categorical: {"start": "...", "end": "..."} dicts)  -> added via add_date_window_param()
+
+    If strategy_kind is provided, strategy keys are filtered accordingly.
     """
-    spec = base
+    cat: Dict[str, ParamSpec] = {
+        # ---------- Strategy ----------
+        "strategy.fast_window": ParamSpec(kind="int", low=2, high=200, step=1, default=20),
+        "strategy.slow_window": ParamSpec(kind="int", low=3, high=400, step=1, default=50),
+        "strategy.window":      ParamSpec(kind="int", low=2, high=400, step=1, default=50),
 
-    # ---- DataConfig ----
-    data_updates = {}
-    if "data.start" in params:
-        data_updates["start"] = params["data.start"]
-    if "data.end" in params:
-        data_updates["end"] = params["data.end"]
-    if "data.symbol" in params:
-        data_updates["symbols"] = [str(params["data.symbol"])]
+        # ---------- Portfolio / sizing ----------
+        "portfolio.buy_pct_cash":   ParamSpec(kind="float", low=0.01, high=1.00, step=0.01, default=0.25),
+        "portfolio.sell_pct_shares":ParamSpec(kind="float", low=0.01, high=1.00, step=0.01, default=1.00),
 
-    if data_updates:
-        spec = replace(spec, data=replace(spec.data, **data_updates))
+        # Minimum period between trades (requires you to add and enforce cooldown_bars in PortfolioConfig + PortfolioEngine)
+        "portfolio.cooldown_bars":  ParamSpec(kind="int", low=0, high=60, step=1, default=0),
+    }
 
-    # ---- StrategyConfig ----
-    strat_updates = {}
-    strat_params = dict(spec.strategy.params or {})
+    if strategy_kind is None:
+        return cat
 
-    if "strategy.kind" in params:
-        strat_updates["kind"] = str(params["strategy.kind"])
-
-    # MA cross
-    if "strategy.fast_window" in params:
-        strat_params["fast_window"] = int(params["strategy.fast_window"])
-    if "strategy.slow_window" in params:
-        strat_params["slow_window"] = int(params["strategy.slow_window"])
-
-    # SMA price
-    if "strategy.window" in params:
-        strat_params["window"] = int(params["strategy.window"])
-
-    # allow_short / nan_policy if you ever decide to tune them
-    if "strategy.allow_short" in params:
-        strat_params["allow_short"] = bool(params["strategy.allow_short"])
-    if "strategy.nan_policy" in params:
-        strat_params["nan_policy"] = str(params["strategy.nan_policy"])
-
-    strat_updates["params"] = strat_params
-    spec = replace(spec, strategy=replace(spec.strategy, **strat_updates))
-
-    # ---- PortfolioConfig ----
-    port = spec.portfolio
-    port_updates = {}
-
-    # common mechanics
-    for key, field_name, cast in [
-        ("portfolio.initial_cash", "initial_cash", float),
-        ("portfolio.rebalance_policy", "rebalance_policy", str),
-        ("portfolio.max_gross", "max_gross", float),
-        ("portfolio.cash_buffer", "cash_buffer", float),
-        ("portfolio.sizing_mode", "sizing_mode", str),
-        ("portfolio.buy_pct_cash", "buy_pct_cash", float),
-        ("portfolio.sell_pct_shares", "sell_pct_shares", float),
-    ]:
-        if key in params:
-            port_updates[field_name] = cast(params[key])
-
-    # costs
-    # Note: cost_model is a dataclass in PortfolioConfig; we keep it unchanged unless you tune it.
-    if port_updates:
-        spec = replace(spec, portfolio=replace(port, **port_updates))
-
-    # ---- IndicatorsConfig (usually inferred; keep as is) ----
-    # If you later want to tune indicator engine config, you can add keys here.
-
-    return spec
+    return filter_catalog_for_strategy(cat, strategy_kind=strategy_kind)
 
 
-# ============================================================
-# Constraints / validation to avoid wasting trials
-# ============================================================
-def validate_params(spec: EngineSpec) -> Tuple[bool, str]:
+def filter_catalog_for_strategy(catalog: Dict[str, ParamSpec], strategy_kind: str) -> Dict[str, ParamSpec]:
     """
-    Return (ok, reason). Keep it minimal and explicit.
+    Keep only strategy keys relevant to the selected strategy.
+    Non-strategy keys are always preserved.
     """
-    kind = str(spec.strategy.kind).lower()
-    p = spec.strategy.params or {}
+    out: Dict[str, ParamSpec] = {}
+    for k, spec in catalog.items():
+        if not k.startswith("strategy."):
+            out[k] = spec
+            continue
 
-    if kind in ("ma_cross", "moving_average_cross"):
-        fast = int(p.get("fast_window", 0))
-        slow = int(p.get("slow_window", 0))
-        if fast < 2 or slow < 3:
-            return False, "MA cross windows too small"
-        if fast >= slow:
-            return False, "MA cross constraint violated: fast_window must be < slow_window"
+        if strategy_kind == "ma_cross" and k in ("strategy.fast_window", "strategy.slow_window"):
+            out[k] = spec
+        elif strategy_kind == "sma_price" and k in ("strategy.window",):
+            out[k] = spec
 
-    if kind in ("sma_price", "price_sma", "price_above_sma"):
-        w = int(p.get("window", 0))
-        if w < 2:
-            return False, "SMA window too small"
-
-    # sizing sanity
-    if str(spec.portfolio.sizing_mode) == "pct_cash_shares":
-        b = float(spec.portfolio.buy_pct_cash)
-        s = float(spec.portfolio.sell_pct_shares)
-        if not (0.0 < b <= 1.0):
-            return False, "buy_pct_cash must be in (0,1]"
-        if not (0.0 < s <= 1.0):
-            return False, "sell_pct_shares must be in (0,1]"
-
-    return True, "ok"
+    return out
 
 
-# ============================================================
-# Compute PnL and Profit/Volume from a BacktestBundle
-# ============================================================
-def compute_pnl_and_efficiency(bundle) -> Tuple[float, float, float]:
-    """
-    Returns: (total_pnl, total_traded_notional, efficiency=pnl/notional)
-    Efficiency = profit / volume (volume approximated by traded notional).
-    """
-    # PnL: prefer report series 'pnl' if present; else use equity delta
-    rep = bundle.report
-    if rep is not None and isinstance(rep.series, dict) and "pnl" in rep.series:
-        pnl_series = rep.series["pnl"]
-        total_pnl = float(pd.to_numeric(pnl_series, errors="coerce").fillna(0.0).sum())
-    else:
-        eq = bundle.portfolio_result.equity_curve
-        total_pnl = float(eq.iloc[-1] - eq.iloc[0]) if len(eq) else 0.0
-
-    # Volume: sum of absolute notional traded
-    trades = bundle.portfolio_result.trades
-    if trades is None or trades.empty or "notional" not in trades.columns:
-        total_notional = 0.0
-    else:
-        total_notional = float(pd.to_numeric(trades["notional"], errors="coerce").fillna(0.0).sum())
-
-    eff = float(total_pnl / total_notional) if total_notional > 0 else float("-inf" if total_pnl < 0 else 0.0)
-    return total_pnl, total_notional, eff
-
-
-# ============================================================
-# Optimizer
-# ============================================================
-@dataclass
-class OptimizeConfig:
-    mode: SearchMode = "random"
-    n_trials: int = 200                 # random trials
-    seed: int = 42
-    top_k: int = 30
-    objective: ObjectiveMode = "pnl_then_efficiency"
-    verbose: bool = False
-    # If you want to hard-stop expensive trials:
-    max_failures: int = 50
-
-
-class Optimizer:
-    def __init__(
-        self,
-        base_spec: EngineSpec,
-        space: SearchSpace,
-        cfg: OptimizeConfig,
-        fixed_params: Optional[Params] = None,
-    ) -> None:
-        self.base_spec = base_spec
-        self.space = space
-        self.cfg = cfg
-        self.fixed_params = dict(fixed_params or {})
-        self.rng = random.Random(cfg.seed)
-
-    def _iter_trials(self) -> Iterable[Params]:
-        if self.cfg.mode == "grid":
-            return self.space.grid()
-        return (self.space.sample(self.rng) for _ in range(int(self.cfg.n_trials)))
-
-    def run(self) -> Tuple[TrialResult, pd.DataFrame]:
-        failures = 0
-        results: List[TrialResult] = []
-
-        for trial_params in self._iter_trials():
-            params = dict(self.fixed_params)
-            params.update(trial_params)
-
-            # build spec
-            spec_i = apply_params_to_spec(self.base_spec, params)
-
-            ok, reason = validate_params(spec_i)
-            if not ok:
-                if self.cfg.verbose:
-                    print(f"[skip] {reason} params={trial_params}")
-                continue
-
-            try:
-                bundle = BacktestEngine(spec_i).run()
-                pnl, notional, eff = compute_pnl_and_efficiency(bundle)
-
-                if self.cfg.objective == "pnl_then_efficiency":
-                    score = score_pnl_then_efficiency(pnl, eff)
-                else:
-                    score = (pnl, eff)
-
-                metrics = dict(bundle.report.metrics or {})
-                notes = {
-                    "strategy_kind": str(spec_i.strategy.kind),
-                    "data_start": spec_i.data.start,
-                    "data_end": spec_i.data.end,
-                }
-
-                results.append(
-                    TrialResult(
-                        params=params,
-                        pnl=pnl,
-                        traded_notional=notional,
-                        efficiency=eff,
-                        score=score,
-                        metrics=metrics,
-                        notes=notes,
-                    )
-                )
-
-            except Exception as e:
-                failures += 1
-                if self.cfg.verbose:
-                    print(f"[fail] {type(e).__name__}: {e} params={trial_params}")
-                if failures >= self.cfg.max_failures:
-                    break
-
-        if not results:
-            raise RuntimeError("No successful trials. Check constraints / data range / parameter space.")
-
-        # Rank: pnl desc, efficiency desc
-        results_sorted = sorted(results, key=lambda r: (r.score[0], r.score[1]), reverse=True)
-        best = results_sorted[0]
-
-        df = self._results_to_df(results_sorted)
-        df = df.head(int(self.cfg.top_k)).reset_index(drop=True)
-        return best, df
-
-    @staticmethod
-    def _results_to_df(results: List[TrialResult]) -> pd.DataFrame:
-        rows = []
-        for r in results:
-            row = {
-                "pnl": r.pnl,
-                "traded_notional": r.traded_notional,
-                "profit_per_notional": r.efficiency,
-                "score_pnl": r.score[0],
-                "score_eff": r.score[1],
-                "strategy_kind": r.notes.get("strategy_kind"),
-                "data_start": r.notes.get("data_start"),
-                "data_end": r.notes.get("data_end"),
-            }
-            # add a few common metrics if present
-            for k in ["Sharpe", "CAGR", "Total return", "Max drawdown"]:
-                if k in r.metrics:
-                    row[k] = r.metrics[k]
-            # add params flattened
-            for pk, pv in r.params.items():
-                row[f"param::{pk}"] = pv
-            rows.append(row)
-        return pd.DataFrame(rows)
-
-
-# ============================================================
-# One-at-a-time optimization (param importance / sensitivity)
-# ============================================================
-def optimize_one_at_a_time(
-    base_spec: EngineSpec,
-    catalog: Dict[str, ParamSpec],
-    keys: Sequence[str],
-    cfg: OptimizeConfig,
-    fixed_params: Optional[Params] = None,
-) -> pd.DataFrame:
-    """
-    For each parameter in `keys`, optimize only that param (others fixed).
-    Ranks parameters by best pnl improvement (primary) and efficiency (secondary).
-    """
-    fixed_params = dict(fixed_params or {})
-
-    # baseline run
-    base_bundle = BacktestEngine(base_spec).run()
-    base_pnl, base_notional, base_eff = compute_pnl_and_efficiency(base_bundle)
-
-    rows = []
-    for k in keys:
-        space = build_space(catalog, [k])
-        opt = Optimizer(base_spec=base_spec, space=space, cfg=cfg, fixed_params=fixed_params)
-        best, _top = opt.run()
-
-        rows.append({
-            "param_key": k,
-            "baseline_pnl": base_pnl,
-            "best_pnl": best.pnl,
-            "delta_pnl": best.pnl - base_pnl,
-            "baseline_profit_per_notional": base_eff,
-            "best_profit_per_notional": best.efficiency,
-            "best_value": best.params.get(k),
-        })
-
-    df = pd.DataFrame(rows)
-    df = df.sort_values(["delta_pnl", "best_profit_per_notional"], ascending=[False, False]).reset_index(drop=True)
-    return df
-
-
-# ============================================================
-# Date-window catalog builder (for uploaded BMCE data)
-# ============================================================
 def build_date_window_choices_from_uploaded_bmce(
-    base_data_cfg: DataConfig,
-    symbol: Optional[str] = None,
+    base_data_cfg: Any,
+    symbol: str,
     min_bars: int = 252,
     step_bars: int = 21,
     max_windows: int = 200,
-) -> List[Tuple[str, str]]:
+) -> List[Dict[str, str]]:
     """
-    Loads MarketData ONCE to get index, then creates candidate (start,end) windows.
-    Returns list of (start_iso, end_iso).
+    Builds rolling start/end choices (ISO date strings) from a BMCE uploaded file.
 
-    Notes:
-    - windows are forward in time
-    - end is inclusive in your loaders (typically); this is fine for research
+    Assumptions:
+      - base_data_cfg.source == "bmce"
+      - base_data_cfg.bmce_paths points to the uploaded CSV/XLSX (single path)
     """
-    md = load_marketdata(base_data_cfg)
-    sym = symbol or base_data_cfg.symbols[0]
-    idx = pd.DatetimeIndex(md.bars[sym].index).sort_values()
+    path = getattr(base_data_cfg, "bmce_paths", None)
+    if not path:
+        return []
+    # In your app you pass bmce_paths=tmp_path (string). If it's a list, take first.
+    if isinstance(path, (list, tuple)):
+        path = path[0]
 
-    windows: List[Tuple[str, str]] = []
-    n = len(idx)
-    if n < min_bars:
-        # fallback: just the full range
-        return [(idx[0].date().isoformat(), idx[-1].date().isoformat())]
+    idx = _load_datetime_index_from_bmce_file(path)
+    if idx is None or len(idx) < min_bars:
+        return []
 
-    # rolling window ends at various points; keep it simple
-    count = 0
-    for start_i in range(0, n - min_bars, step_bars):
-        end_i = min(n - 1, start_i + min_bars - 1)
-        # you can also make end_i vary, but keep simple here
-        start_iso = idx[start_i].date().isoformat()
-        end_iso = idx[-1].date().isoformat()  # full to end by default
-        windows.append((start_iso, end_iso))
-        count += 1
-        if count >= max_windows:
+    idx = idx.sort_values()
+    windows: List[Dict[str, str]] = []
+
+    # rolling windows over the entire history
+    # Window length grows? Here we use fixed length = min_bars and slide by step_bars.
+    # You can change to variable length by changing end_i.
+    start_i = 0
+    while start_i + min_bars <= len(idx):
+        end_i = start_i + min_bars - 1
+        start_dt = idx[start_i]
+        end_dt = idx[end_i]
+        windows.append({"start": start_dt.date().isoformat(), "end": end_dt.date().isoformat()})
+        start_i += step_bars
+        if len(windows) >= max_windows:
             break
 
     return windows
 
 
-def add_date_window_param(
-    catalog: Dict[str, ParamSpec],
-    windows: Sequence[Tuple[str, str]],
-    key: str = "data.window",
-) -> None:
+def add_date_window_param(catalog: Dict[str, ParamSpec], windows: List[Dict[str, str]]) -> None:
     """
-    Adds a single param 'data.window' whose choice is a tuple(start_iso, end_iso).
-    Runner will map it into data.start/data.end.
+    Adds a categorical param: data.window, choices=[{"start": "...", "end": "..."}, ...]
     """
-    catalog[key] = ChoiceParam(key=key, choices=list(windows))
+    if not windows:
+        return
+    catalog["data.window"] = ParamSpec(kind="categorical", choices=list(windows), default=windows[0])
 
 
-def expand_window_param(params: Params) -> Params:
-    """
-    If params contains data.window=(start,end), expand into data.start/data.end.
-    """
-    if "data.window" in params:
-        w = params["data.window"]
-        if isinstance(w, (tuple, list)) and len(w) == 2:
-            params = dict(params)
-            params["data.start"] = str(w[0]) if w[0] is not None else None
-            params["data.end"] = str(w[1]) if w[1] is not None else None
-    return params
-
-
-# ============================================================
-# High-level convenience API (what your Streamlit page should call)
-# ============================================================
 def run_optimization(
     base_spec: EngineSpec,
     catalog: Dict[str, ParamSpec],
-    active_keys: Sequence[str],
+    active_keys: List[str],
     cfg: OptimizeConfig,
-    fixed_params: Optional[Params] = None,
 ) -> Tuple[TrialResult, pd.DataFrame, EngineSpec]:
     """
-    Joint optimization across chosen active keys.
-
     Returns:
-      best_trial, top_trials_df, best_spec
+      - best TrialResult
+      - top_df (top K)
+      - best_spec (EngineSpec for best)
     """
-    space = build_space(catalog, active_keys)
-    opt = Optimizer(base_spec=base_spec, space=space, cfg=cfg, fixed_params=fixed_params)
+    rng = random.Random(int(cfg.seed))
+    np_rng = np.random.default_rng(int(cfg.seed))
 
-    best, df = opt.run()
+    # Validate active keys
+    missing = [k for k in active_keys if k not in catalog]
+    if missing:
+        raise KeyError(f"Active keys not found in catalog: {missing}")
 
-    # Expand window param if used
-    best_params = expand_window_param(best.params)
+    # Generate candidate parameter sets
+    if cfg.mode == "random":
+        if cfg.n_trials is None:
+            raise ValueError("OptimizeConfig.n_trials must be set for random mode.")
+        candidates = _iter_random_candidates(catalog, active_keys, int(cfg.n_trials), rng, np_rng)
 
-    best_spec = apply_params_to_spec(base_spec, best_params)
-    return best, df, best_spec
+    elif cfg.mode == "grid":
+        candidates = _iter_grid_candidates(
+            catalog=catalog,
+            active_keys=active_keys,
+            max_combos=cfg.grid_max_combos,
+            rng=rng,
+        )
+
+    elif cfg.mode == "wfo":
+        candidates = _iter_candidates_for_wfo(
+            catalog=catalog,
+            active_keys=active_keys,
+            cfg=cfg,
+            rng=rng,
+            np_rng=np_rng,
+        )
+
+    else:
+        raise ValueError(f"Unknown optimization mode: {cfg.mode}")
+
+    # Evaluate candidates
+    results: List[TrialResult] = []
+    for i, params in enumerate(candidates, start=1):
+        if cfg.mode == "wfo":
+            res = _eval_candidate_wfo(base_spec, params, cfg)
+        else:
+            res = _eval_candidate_once(base_spec, params)
+
+        results.append(res)
+
+        if cfg.verbose and (i % 25 == 0):
+            print(f"[opt] evaluated {i} candidates; last pnl={res.pnl:.2f}, eff={res.efficiency:.6f}")
+
+    # Rank results
+    results_sorted = sorted(results, key=lambda r: _objective_key(r, cfg.objective), reverse=True)
+    best = results_sorted[0]
+
+    # Build top dataframe
+    top = results_sorted[: int(cfg.top_k)]
+    top_df = pd.DataFrame([{
+        "rank": j + 1,
+        "pnl": r.pnl,
+        "traded_notional": r.traded_notional,
+        "efficiency": r.efficiency,
+        **{f"param.{k}": v for k, v in r.params.items()},
+    } for j, r in enumerate(top)])
+
+    return best, top_df, best.spec
 
 
 # ============================================================
-# Default catalog (adapt ranges as you like)
+# Candidate generation
 # ============================================================
-def default_param_catalog_for_your_app() -> Dict[str, ParamSpec]:
+def _iter_random_candidates(
+    catalog: Dict[str, ParamSpec],
+    active_keys: List[str],
+    n_trials: int,
+    rng: random.Random,
+    np_rng: np.random.Generator,
+) -> Iterable[Dict[str, Any]]:
+    for _ in range(n_trials):
+        p: Dict[str, Any] = {}
+        for k in active_keys:
+            p[k] = _sample_one(catalog[k], rng, np_rng)
+        yield p
+
+
+def _iter_grid_candidates(
+    catalog: Dict[str, ParamSpec],
+    active_keys: List[str],
+    max_combos: Optional[int],
+    rng: random.Random,
+) -> Iterable[Dict[str, Any]]:
+    grids: List[Tuple[str, List[Any]]] = []
+    for k in active_keys:
+        grids.append((k, _grid_values(catalog[k])))
+
+    # cartesian product
+    combos = 1
+    for _, vals in grids:
+        combos *= max(1, len(vals))
+
+    # If too many combos, we will randomly sample a subset of combos (without replacement approximation)
+    # to keep runtime bounded.
+    if max_combos is not None and combos > int(max_combos):
+        # Create an index-based sampler
+        # We approximate without replacement by sampling random tuples directly.
+        # This is simpler than materializing all combos.
+        n = int(max_combos)
+        for _ in range(n):
+            p = {k: rng.choice(vals) for k, vals in grids}
+            yield p
+        return
+
+    # full cartesian
+    def rec(i: int, cur: Dict[str, Any]):
+        if i == len(grids):
+            yield dict(cur)
+            return
+        k, vals = grids[i]
+        for v in vals:
+            cur[k] = v
+            yield from rec(i + 1, cur)
+
+    yield from rec(0, {})
+
+
+def _iter_candidates_for_wfo(
+    catalog: Dict[str, ParamSpec],
+    active_keys: List[str],
+    cfg: OptimizeConfig,
+    rng: random.Random,
+    np_rng: np.random.Generator,
+) -> Iterable[Dict[str, Any]]:
     """
-    A sane starting catalog consistent with your Streamlit UI and engine.
-    You can freely add/remove keys.
+    WFO can be run as either:
+      - grid (if all active keys have reasonable step/choices)
+      - random (fallback)
+    Here: if grid_max_combos is provided we use grid sampling, else random with n_trials.
     """
-    cat: Dict[str, ParamSpec] = {}
+    # If the user set n_trials, use random; else use grid sampling capped by grid_max_combos.
+    if cfg.n_trials is not None:
+        return _iter_random_candidates(catalog, active_keys, int(cfg.n_trials), rng, np_rng)
+    return _iter_grid_candidates(catalog, active_keys, cfg.grid_max_combos, rng)
 
-    # Strategy kind (optional to optimize; usually keep fixed)
-    cat["strategy.kind"] = ChoiceParam("strategy.kind", ["ma_cross", "sma_price"])
 
-    # MA cross windows
-    
-    cat["strategy.fast_window"] = IntRangeParam("strategy.fast_window", 5, 80, step=1)
-    cat["strategy.slow_window"] = IntRangeParam("strategy.slow_window", 20, 200, step=1)
+def _sample_one(spec: ParamSpec, rng: random.Random, np_rng: np.random.Generator) -> Any:
+    if spec.kind == "categorical":
+        if not spec.choices:
+            return spec.default
+        return rng.choice(spec.choices)
 
-    # SMA price window
-    cat["strategy.window"] = IntRangeParam("strategy.window", 10, 200, step=1)
+    if spec.kind == "int":
+        lo = int(spec.low) if spec.low is not None else 0
+        hi = int(spec.high) if spec.high is not None else lo
+        return rng.randint(lo, hi)
 
-    # Portfolio sizing
-    cat["portfolio.buy_pct_cash"] = FloatRangeParam("portfolio.buy_pct_cash", 0.05, 1.0, step=0.05)
-    cat["portfolio.sell_pct_shares"] = FloatRangeParam("portfolio.sell_pct_shares", 0.05, 1.0, step=0.05)
+    if spec.kind == "float":
+        lo = float(spec.low) if spec.low is not None else 0.0
+        hi = float(spec.high) if spec.high is not None else lo
+        return float(np_rng.uniform(lo, hi))
 
-    # Portfolio mechanics
-    cat["portfolio.rebalance_policy"] = ChoiceParam("portfolio.rebalance_policy", ["on_change", "every_bar"])
+    raise ValueError(f"Unknown ParamSpec.kind: {spec.kind}")
 
-    return cat
+
+def _grid_values(spec: ParamSpec) -> List[Any]:
+    if spec.kind == "categorical":
+        return list(spec.choices or [])
+
+    if spec.kind in ("int", "float"):
+        if spec.low is None or spec.high is None:
+            return [spec.default]
+        step = spec.step
+        if step is None or step <= 0:
+            # fallback: just low/high/default unique
+            vals = [spec.default, spec.low, spec.high]
+            # unique, stable
+            out = []
+            for v in vals:
+                if v is None:
+                    continue
+                if v not in out:
+                    out.append(v)
+            return out
+
+        lo = float(spec.low)
+        hi = float(spec.high)
+        n = int(math.floor((hi - lo) / float(step))) + 1
+        arr = [lo + i * float(step) for i in range(max(1, n))]
+
+        if spec.kind == "int":
+            arr = [int(round(x)) for x in arr]
+            # remove duplicates due to rounding
+            out = []
+            for v in arr:
+                if v not in out:
+                    out.append(v)
+            return out
+        else:
+            return [float(x) for x in arr]
+
+    raise ValueError(f"Unknown ParamSpec.kind: {spec.kind}")
+
+
+# ============================================================
+# Evaluation
+# ============================================================
+def _eval_candidate_once(base_spec: EngineSpec, params: Dict[str, Any]) -> TrialResult:
+    spec = apply_params_to_spec(base_spec, params)
+    bundle = BacktestEngine(spec).run()
+    pnl, traded_notional = extract_pnl_and_traded_notional(bundle)
+    eff = pnl / traded_notional if traded_notional > 0 else 0.0
+    return TrialResult(params=dict(params), pnl=float(pnl), traded_notional=float(traded_notional), efficiency=float(eff), spec=spec)
+
+
+def _eval_candidate_wfo(base_spec: EngineSpec, params: Dict[str, Any], cfg: OptimizeConfig) -> TrialResult:
+    """
+    Walk-forward evaluation:
+      - We build rolling windows from BMCE file index
+      - For each fold we evaluate candidate on TEST window only
+      - Aggregate pnl and traded_notional across folds
+    """
+    # WFO requires BMCE upload (so we can derive datetime index reliably without calling yfinance)
+    data_cfg = getattr(base_spec, "data", None)
+    if data_cfg is None or getattr(data_cfg, "source", None) != "bmce":
+        raise ValueError("WFO mode currently supported for BMCE uploads only.")
+
+    path = getattr(data_cfg, "bmce_paths", None)
+    if isinstance(path, (list, tuple)):
+        path = path[0]
+    if not path:
+        raise ValueError("WFO needs base_spec.data.bmce_paths to point to the uploaded file.")
+
+    idx = _load_datetime_index_from_bmce_file(path)
+    if idx is None:
+        raise ValueError("Could not load BMCE datetime index for WFO.")
+    idx = idx.sort_values()
+
+    train_bars = int(cfg.wfo_train_bars or 252)
+    test_bars = int(cfg.wfo_test_bars or 63)
+    step_bars = int(cfg.wfo_step_bars or 21)
+
+    min_needed = train_bars + test_bars
+    if len(idx) < min_needed:
+        # fallback: run once on full range
+        return _eval_candidate_once(base_spec, params)
+
+    total_pnl = 0.0
+    total_notional = 0.0
+    folds = 0
+
+    start_i = 0
+    while start_i + min_needed <= len(idx):
+        # Train: [start_i, start_i+train_bars-1]   (not directly used here)
+        # Test:  [start_i+train_bars, start_i+train_bars+test_bars-1]
+        test_start_i = start_i + train_bars
+        test_end_i = test_start_i + test_bars - 1
+
+        test_start = idx[test_start_i].date().isoformat()
+        test_end = idx[test_end_i].date().isoformat()
+
+        fold_params = dict(params)
+        # If user also optimizes data.window, we respect it and skip WFO slicing.
+        # Otherwise, we set the fold window.
+        if "data.window" not in fold_params:
+            fold_params["data.window"] = {"start": test_start, "end": test_end}
+
+        spec = apply_params_to_spec(base_spec, fold_params)
+        bundle = BacktestEngine(spec).run()
+        pnl, notional = extract_pnl_and_traded_notional(bundle)
+        total_pnl += float(pnl)
+        total_notional += float(notional)
+        folds += 1
+
+        start_i += step_bars
+
+    eff = total_pnl / total_notional if total_notional > 0 else 0.0
+    # Return a spec that corresponds to "full range" with chosen params (not fold-specific),
+    # so the app can "Run best configuration" as a single backtest.
+    final_spec = apply_params_to_spec(base_spec, params)
+
+    return TrialResult(
+        params=dict(params),
+        pnl=float(total_pnl),
+        traded_notional=float(total_notional),
+        efficiency=float(eff),
+        spec=final_spec,
+    )
+
+
+def _objective_key(r: TrialResult, objective: str) -> Tuple[float, float]:
+    if objective == "pnl_then_efficiency":
+        return (float(r.pnl), float(r.efficiency))
+    # fallback
+    return (float(r.pnl), float(r.efficiency))
+
+
+# ============================================================
+# Spec mutation / param application
+# ============================================================
+def apply_params_to_spec(base_spec: EngineSpec, params: Dict[str, Any]) -> EngineSpec:
+    """
+    Returns a deep-copied spec with params applied.
+
+    Supported keys:
+      - strategy.fast_window, strategy.slow_window, strategy.window
+      - portfolio.buy_pct_cash, portfolio.sell_pct_shares, portfolio.cooldown_bars
+      - data.window: {"start": "...", "end": "..."}
+    """
+    spec: EngineSpec = copy.deepcopy(base_spec)
+
+    # Strategy
+    strat = getattr(spec, "strategy", None)
+    if strat is None:
+        raise ValueError("EngineSpec.strategy missing")
+
+    if "strategy.fast_window" in params:
+        strat.params["fast_window"] = int(params["strategy.fast_window"])
+    if "strategy.slow_window" in params:
+        strat.params["slow_window"] = int(params["strategy.slow_window"])
+    if "strategy.window" in params:
+        strat.params["window"] = int(params["strategy.window"])
+
+    # Always ensure allow_short remains consistent if present in base params
+    # (We don't optimize allow_short here by default)
+    # If you want it optimizable, add it to the catalog and handle it here.
+
+    # Portfolio sizing / cooldown
+    port = getattr(spec, "portfolio", None)
+    if port is None:
+        raise ValueError("EngineSpec.portfolio missing")
+
+    if "portfolio.buy_pct_cash" in params:
+        port.buy_pct_cash = float(params["portfolio.buy_pct_cash"])
+    if "portfolio.sell_pct_shares" in params:
+        port.sell_pct_shares = float(params["portfolio.sell_pct_shares"])
+    if "portfolio.cooldown_bars" in params:
+        # requires PortfolioConfig.cooldown_bars to exist
+        port.cooldown_bars = int(params["portfolio.cooldown_bars"])
+
+    # Data window override
+    data = getattr(spec, "data", None)
+    if data is None:
+        raise ValueError("EngineSpec.data missing")
+
+    if "data.window" in params and params["data.window"] is not None:
+        w = params["data.window"]
+        if isinstance(w, dict) and "start" in w and "end" in w:
+            data.start = w["start"]
+            data.end = w["end"]
+
+    return spec
+
+
+# ============================================================
+# Metrics extraction
+# ============================================================
+def extract_pnl_and_traded_notional(bundle: Any) -> Tuple[float, float]:
+    """
+    Robustly extract:
+      - pnl (absolute profit) for the backtest
+      - traded_notional (proxy for "volume" / activity)
+
+    Priority:
+      1) report.tables["trade_ledger"] if present (net_pnl and qty*price)
+      2) report.series["pnl"] sum if present (fallback)
+      3) else 0
+    """
+    rep = getattr(bundle, "report", None)
+    if rep is None:
+        return 0.0, 0.0
+
+    tables = getattr(rep, "tables", {}) or {}
+    series = getattr(rep, "series", {}) or {}
+
+    # Trade ledger approach (best)
+    ledger = tables.get("trade_ledger", None)
+    if isinstance(ledger, pd.DataFrame) and not ledger.empty:
+        pnl = 0.0
+        if "net_pnl" in ledger.columns:
+            pnl = float(pd.to_numeric(ledger["net_pnl"], errors="coerce").fillna(0.0).sum())
+        elif "gross_pnl" in ledger.columns:
+            pnl = float(pd.to_numeric(ledger["gross_pnl"], errors="coerce").fillna(0.0).sum())
+
+        # traded notional = sum(|qty| * entry_price) as a proxy
+        qty_col = "qty" if "qty" in ledger.columns else None
+        price_col = "entry_price" if "entry_price" in ledger.columns else ("price" if "price" in ledger.columns else None)
+
+        traded = 0.0
+        if qty_col and price_col:
+            q = pd.to_numeric(ledger[qty_col], errors="coerce").fillna(0.0).abs()
+            p = pd.to_numeric(ledger[price_col], errors="coerce").fillna(0.0).abs()
+            traded = float((q * p).sum())
+
+        return pnl, traded
+
+    # PnL series fallback
+    pnl_series = series.get("pnl", None)
+    if isinstance(pnl_series, pd.Series) and not pnl_series.empty:
+        pnl = float(pd.to_numeric(pnl_series, errors="coerce").fillna(0.0).sum())
+        # no traded notional available -> 0
+        return pnl, 0.0
+
+    # Last resort: try curve vs benchmark table total return * initial cash? (not recommended)
+    return 0.0, 0.0
+
+
+# ============================================================
+# BMCE datetime parsing
+# ============================================================
+def _load_datetime_index_from_bmce_file(path: str) -> Optional[pd.DatetimeIndex]:
+    """
+    Tries to load a BMCE CSV/XLSX and extract a datetime index.
+    Handles common column names: Date, date, Datetime, timestamp.
+    """
+    p = str(path).lower()
+    try:
+        if p.endswith(".csv"):
+            df = pd.read_csv(path)
+        elif p.endswith(".xlsx") or p.endswith(".xls"):
+            df = pd.read_excel(path, engine="openpyxl")
+        else:
+            # try csv as fallback
+            df = pd.read_csv(path)
+    except Exception:
+        return None
+
+    if df is None or df.empty:
+        return None
+
+    # Find a date-like column
+    candidates = ["Date", "date", "Datetime", "datetime", "Timestamp", "timestamp", "Time", "time"]
+    date_col = None
+    for c in candidates:
+        if c in df.columns:
+            date_col = c
+            break
+
+    if date_col is None:
+        # fallback to first column
+        date_col = df.columns[0]
+
+    dt = pd.to_datetime(df[date_col], errors="coerce")
+    dt = dt.dropna()
+    if dt.empty:
+        return None
+
+    return pd.DatetimeIndex(dt.values)
