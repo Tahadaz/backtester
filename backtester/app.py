@@ -1,6 +1,7 @@
 # app.py — Streamlit entrypoint (Backtest + Optimize)
 from __future__ import annotations
 
+from dataclasses import replace
 import io
 import json
 import hashlib
@@ -810,7 +811,9 @@ with tab_opt:
                     step2 = c3.number_input(f"{k} step", value=int(step), step=1, key=f"dom_{k}_step")
                     if lo2 > hi2:
                         st.error(f"{k}: min must be <= max")
-                    pdef.domain = (int(lo2), int(hi2), int(step2))
+                        st.stop
+                    pdef = replace(pdef, domain=(int(lo2), int(hi2), int(step2)))
+                    catalog[k] = pdef
 
                 elif pdef.kind == "float":
                     lo, hi, step = pdef.domain
@@ -820,7 +823,9 @@ with tab_opt:
                     step2 = c3.number_input(f"{k} step", value=float(step), step=0.01, key=f"dom_{k}_step")
                     if lo2 > hi2:
                         st.error(f"{k}: min must be <= max")
-                    pdef.domain = (float(lo2), float(hi2), float(step2))
+                    pdef = replace(pdef, domain=(float(lo2), float(hi2), float(step2)))
+                    catalog[k] = pdef
+
 
                 elif pdef.kind == "choice":
                     choices = list(pdef.domain)
