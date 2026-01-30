@@ -26,8 +26,124 @@ from optimize import (
     run_optimization,
 )
 
+import optimize as _opt_mod
+st.sidebar.caption(f"optimize.py loaded from: {_opt_mod.__file__}")
+st.sidebar.caption(f"run_optimization: {_opt_mod.run_optimization.__module__}.{_opt_mod.run_optimization.__name__}")
+
 st.set_page_config(page_title="Backtester", layout="wide")
 st.title("Backtester (TA) — Backtest / Optimize")
+
+def info_popover(key: str):
+    e = EXPLAIN.get(key)
+    if not e:
+        st.write("")
+        return
+    with st.popover("ℹ️"):
+        st.markdown(f"**{e['title']}**")
+        st.write(e["why"])
+        if e.get("latex"):
+            st.latex(e["latex"])
+        if e.get("notes"):
+            st.caption(e["notes"])
+
+def metric_with_info(label: str, value: str, explain_key: str):
+    c1, c2 = st.columns([6, 1], vertical_alignment="center")
+    with c1:
+        st.metric(label, value)
+    with c2:
+        info_popover(explain_key)
+
+EXPLAIN = {
+    # ===== Strategy params =====
+    "strategy.window": {
+        "title": "SMA window",
+        "why": "Defines the smoothing horizon. Larger windows react slower (fewer trades), smaller windows react faster (more trades).",
+        "latex": r"SMA_t(w)=\frac{1}{w}\sum_{i=0}^{w-1}P_{t-i}",
+        "notes": "Used in the rule: signal=1 if Close > SMA, signal=-1 if Close < SMA (if short allowed).",
+    },
+    "strategy.fast_window": {
+        "title": "Fast SMA window",
+        "why": "Short-term trend estimate. Smaller = more reactive.",
+        "latex": r"SMA_t(f)=\frac{1}{f}\sum_{i=0}^{f-1}P_{t-i}",
+        "notes": "Used with slow SMA to form crossover signals.",
+    },
+    "strategy.slow_window": {
+        "title": "Slow SMA window",
+        "why": "Long-term trend estimate. Larger = more stable.",
+        "latex": r"SMA_t(s)=\frac{1}{s}\sum_{i=0}^{s-1}P_{t-i}",
+        "notes": "Constraint: fast_window < slow_window.",
+    },
+
+    # ===== Portfolio sizing =====
+    "portfolio.buy_pct_cash": {
+        "title": "Buy % of available cash",
+        "why": "Controls aggressiveness of entries when signal=+1 (percentage sizing).",
+        "latex": r"\text{buy\_qty}=\left\lfloor \frac{\alpha\cdot \text{Cash}_{avail}}{\text{Open}_{t+1}} \right\rfloor",
+        "notes": r"Here \alpha = buy\_pct\_cash. Cash_avail respects cash_buffer.",
+    },
+    "portfolio.sell_pct_shares": {
+        "title": "Sell % of shares",
+        "why": "Controls partial exits when signal=-1 (percentage sizing).",
+        "latex": r"\text{sell\_qty}=\left\lceil \beta \cdot |\text{pos}| \right\rceil",
+        "notes": r"Here \beta = sell\_pct\_shares. delta = -sell_qty.",
+    },
+    "portfolio.cooldown_bars": {
+        "title": "Cooldown (bars)",
+        "why": "Prevents over-trading by enforcing a minimum number of bars between trades.",
+        "latex": r"t_{trade}(sym) \rightarrow \text{block if } (i+1)-i_{last}(sym) < cooldown",
+        "notes": "Applies per symbol.",
+    },
+
+    # ===== Performance metrics =====
+    "metric.pnl": {
+        "title": "PnL (currency)",
+        "why": "Absolute profit in account currency. Primary objective in your optimizer.",
+        "latex": r"\mathrm{PnL}=Equity_T-Equity_0",
+        "notes": "Equity includes cash + marked-to-market positions.",
+    },
+    "metric.efficiency": {
+        "title": "Efficiency (PnL per notional)",
+        "why": "Rewards strategies that make money with less turnover (cost/impact proxy). Secondary objective.",
+        "latex": r"\mathrm{Efficiency}=\frac{\mathrm{PnL}}{\sum_k |\text{qty}_k|\cdot \text{price}_k}",
+        "notes": "In your optimizer: rank by (PnL desc, Efficiency desc).",
+    },
+    "metric.total_return": {
+        "title": "Total Return",
+        "why": "Overall strategy return over the backtest period.",
+        "latex": r"R_{tot}=\prod_{t=1}^{T}(1+r_t)-1",
+        "notes": "Uses equity returns r_t.",
+    },
+    "metric.cagr": {
+        "title": "CAGR",
+        "why": "Annualized return accounting for compounding (comparable across periods).",
+        "latex": r"\mathrm{CAGR}=\left(\prod_{t=1}^{T}(1+r_t)\right)^{\frac{ppY}{T}}-1",
+        "notes": r"ppY = periods_per_year (e.g., 252).",
+    },
+    "metric.vol": {
+        "title": "Annualized Volatility",
+        "why": "Risk proxy (dispersion of returns).",
+        "latex": r"\sigma_{ann}=\mathrm{std}(r_t)\sqrt{ppY}",
+        "notes": "Higher volatility generally means higher risk.",
+    },
+    "metric.sharpe": {
+        "title": "Sharpe Ratio",
+        "why": "Risk-adjusted return vs volatility (higher is better).",
+        "latex": r"\mathrm{Sharpe}=\frac{\mathrm{CAGR}-r_f}{\sigma_{ann}}",
+        "notes": "If rf_annual=0, it’s CAGR / vol.",
+    },
+    "metric.sortino": {
+        "title": "Sortino Ratio",
+        "why": "Risk-adjusted return using downside volatility only (penalizes negative returns).",
+        "latex": r"\mathrm{Sortino}=\frac{\mathrm{CAGR}-r_f}{\sigma_{down}}",
+        "notes": r"\sigma_{down} = std(r_t \mid r_t<0)\sqrt{ppY}",
+    },
+    "metric.max_dd": {
+        "title": "Max Drawdown",
+        "why": "Worst peak-to-trough decline (tail risk / pain measure).",
+        "latex": r"DD_t=\frac{Equity_t}{\max_{u\le t}Equity_u}-1,\ \ \max DD=\min_t DD_t",
+        "notes": "More negative is worse.",
+    },
+}
 
 # ============================================================
 # Plotting helpers (NORMAL price line + indicators + buy/sell)
@@ -459,7 +575,7 @@ with tab_backtest:
                 fast = min(int(fast), int(slow) - 1)
             strategy_params = {"fast_window": int(fast), "slow_window": int(slow), "allow_short": bool(allow_short), "nan_policy": nan_policy}
         else:
-            window = st.number_input("SMA window", min_value=2, max_value=500, value=50, step=1)
+            window = st.number_input("SMA window", min_value=2, max_value=500, value=50, step=1, help=f"{EXPLAIN['strategy.window']['why']}\n\nFormula:\n{EXPLAIN['strategy.window']['latex']}")
             strategy_params = {"window": int(window), "allow_short": bool(allow_short), "nan_policy": nan_policy}
 
         st.markdown("### Portfolio")

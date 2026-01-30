@@ -91,7 +91,7 @@ def main():
 
     if STRATEGY_KIND == "sma_price":
         active_params += [
-            ParamDef("strategy.window", "int", (10, 20, 5), int),
+            ParamDef("strategy.window", "int", (10, 15, 5), int),
         ]
     else:
         active_params += [
@@ -100,9 +100,9 @@ def main():
         ]
 
     active_params += [
-        ParamDef("portfolio.buy_pct_cash", "float", (0.10, 1.00, 0.10), float),
-        ParamDef("portfolio.sell_pct_shares", "float", (0.25, 1.00, 0.25), float),
-        ParamDef("portfolio.cooldown_bars", "int", (0, 20, 2), int),
+        ParamDef("portfolio.buy_pct_cash", "float", (0.10, 0.1, 0.10), float),
+        ParamDef("portfolio.sell_pct_shares", "float", (0.25, 0.25, 0.25), float),
+        ParamDef("portfolio.cooldown_bars", "int", (0, 0, 2), int),
         # ParamDef("data.window", "date_window", [("2021-01-01","2023-12-31"), ...], lambda x: x),
     ]
 
