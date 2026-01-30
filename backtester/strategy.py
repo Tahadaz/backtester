@@ -279,13 +279,12 @@ class MovingAverageCrossStrategy(BaseStrategy):
 
             # Core crossover logic
             long_mask = fast > slow
-            if self.params.allow_short:
-                short_mask = fast < slow
-                signal = pd.Series(0.0, index=common_index)
-                signal[long_mask] = 1.0
-                signal[short_mask] = -1.0
-            else:
-                signal = long_mask.astype("float64")  # 1.0 if long else 0.0
+            short_mask = fast < slow
+
+            signal = pd.Series(0.0, index=common_index)
+            signal[long_mask] = 1.0
+            signal[short_mask] = -1.0
+
 
             # Apply NaN/warmup policy
             if self.params.nan_policy == "flat":
@@ -383,14 +382,19 @@ class PriceAboveSMAStrategy(BaseStrategy):
 
             valid = close.notna() & sma.notna()
             long_mask = close > sma
+            short_mask = close < sma  # treat as EXIT when long-only
 
-            if self.params.allow_short:
-                short_mask = close < sma
-                signal = pd.Series(0.0, index=common_index)
-                signal[long_mask] = 1.0
-                signal[short_mask] = -1.0
+            signal = pd.Series(0.0, index=common_index)
+            signal[long_mask] = 1.0
+            signal[short_mask] = -1.0  # <-- emit exit signal even if allow_short=False
+
+            # If allow_short True, -1 can mean actual short exposure downstream,
+            # but in long-only target_weight mode it's clamped to 0 anyway.
+            if self.params.nan_policy == "flat":
+                signal = signal.where(valid, 0.0)
             else:
-                signal = long_mask.astype("float64")
+                signal = signal.where(valid, np.nan)
+
 
             if self.params.nan_policy == "flat":
                 signal = signal.where(valid, 0.0)
