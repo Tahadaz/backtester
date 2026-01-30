@@ -469,82 +469,75 @@ else:
     yf_interval = st.sidebar.selectbox("yfinance interval", ["1d"], index=0)
     yf_auto_adjust = st.sidebar.checkbox("auto_adjust", value=False)
 
-if mode=="Backtest":
 
-    st.sidebar.header("Backtest period")
 
-    use_date_range = st.sidebar.checkbox("Use date range", value=False)
+st.sidebar.header("Backtest period")
 
-    start_date = None
-    end_date = None
-    if use_date_range:
-        start_date = st.sidebar.date_input("Start date", value=None)
-        end_date = st.sidebar.date_input("End date", value=None)
+use_date_range = st.sidebar.checkbox("Use date range", value=False)
 
-        # basic validation
-        if start_date and end_date and start_date > end_date:
-            st.sidebar.error("Start date must be <= End date.")
-            st.stop()
+start_date = None
+end_date = None
+if use_date_range:
+    start_date = st.sidebar.date_input("Start date", value=None)
+    end_date = st.sidebar.date_input("End date", value=None)
 
-    # Convert to ISO strings (what your DataConfig expects)
-    start_str = start_date.isoformat() if start_date else None
-    end_str = end_date.isoformat() if end_date else None
-
-    with st.sidebar:
-        st.header("Strategy")
-
-        strategy_kind = st.selectbox(
-            "Choose strategy",
-            options=["ma_cross", "sma_price"],
-            index=0,
-            help="ma_cross: SMA fast vs SMA slow. sma_price: Close vs SMA(window).",
-        )
-
-        allow_short = st.checkbox("Allow short", value=False)
-
-        if strategy_kind == "ma_cross":
-            fast = st.number_input("Fast SMA window", min_value=2, max_value=500, value=20, step=1)
-            slow = st.number_input("Slow SMA window", min_value=3, max_value=500, value=50, step=1)
-            # enforce fast < slow defensively
-            if fast >= slow:
-                st.warning("Fast window must be < Slow window. Adjusting automatically.")
-                fast = min(int(fast), int(slow) - 1)
-
-            # pack params for engine
-            strat_fast = int(fast)
-            strat_slow = int(slow)
-            strat_window = None
-
-        else:  # "sma_price"
-            window = st.number_input("SMA window", min_value=2, max_value=500, value=50, step=1)
-            strat_window = int(window)
-            strat_fast = None
-            strat_slow = None
-
-    nan_policy = "flat"
-
+    # basic validation
+    if start_date and end_date and start_date > end_date:
+        st.sidebar.error("Start date must be <= End date.")
+        st.stop()
+# Convert to ISO strings (what your DataConfig expects)
+start_str = start_date.isoformat() if start_date else None
+end_str = end_date.isoformat() if end_date else None
+with st.sidebar:
+    st.header("Strategy")
+    strategy_kind = st.selectbox(
+        "Choose strategy",
+        options=["ma_cross", "sma_price"],
+        index=0,
+        help="ma_cross: SMA fast vs SMA slow. sma_price: Close vs SMA(window).",
+    )
+    allow_short = st.checkbox("Allow short", value=False)
     if strategy_kind == "ma_cross":
-        strategy_params = {
-            "fast_window": int(strat_fast),
-            "slow_window": int(strat_slow),
-            "allow_short": bool(allow_short),
-            "nan_policy": nan_policy,
-        }
-    else:
-        strategy_params = {
-            "window": int(strat_window),
-            "allow_short": bool(allow_short),
-            "nan_policy": nan_policy,
-        }
+        fast = st.number_input("Fast SMA window", min_value=2, max_value=500, value=20, step=1)
+        slow = st.number_input("Slow SMA window", min_value=3, max_value=500, value=50, step=1)
+        # enforce fast < slow defensively
+        if fast >= slow:
+            st.warning("Fast window must be < Slow window. Adjusting automatically.")
+            fast = min(int(fast), int(slow) - 1)
+        # pack params for engine
+        strat_fast = int(fast)
+        strat_slow = int(slow)
+        strat_window = None
 
-    st.sidebar.header("Portfolio")
-    initial_cash = st.sidebar.number_input("Initial cash", min_value=1_000.0, value=1_000_000.0, step=10_000.0)
-    rebalance_policy = st.sidebar.selectbox("Rebalance policy", ["on_change", "every_bar"], index=0)
-    max_gross = st.sidebar.number_input("Max gross exposure", min_value=0.1, value=1.0, step=0.1)
-    cash_buffer = st.sidebar.number_input("Cash buffer", min_value=0.0, max_value=0.5, value=0.0, step=0.01)
+    else:  # "sma_price"
+        window = st.number_input("SMA window", min_value=2, max_value=500, value=50, step=1)
+        strat_window = int(window)
+        strat_fast = None
+        strat_slow = None
+
+nan_policy = "flat"
+
+if strategy_kind == "ma_cross":
+    strategy_params = {
+        "fast_window": int(strat_fast),
+        "slow_window": int(strat_slow),
+        "allow_short": bool(allow_short),
+        "nan_policy": nan_policy,
+    }
+else:
+    strategy_params = {
+        "window": int(strat_window),
+        "allow_short": bool(allow_short),
+        "nan_policy": nan_policy,
+    }
+st.sidebar.header("Portfolio")
+initial_cash = st.sidebar.number_input("Initial cash", min_value=1_000.0, value=1_000_000.0, step=10_000.0)
+rebalance_policy = st.sidebar.selectbox("Rebalance policy", ["on_change", "every_bar"], index=0)
+max_gross = st.sidebar.number_input("Max gross exposure", min_value=0.1, value=1.0, step=0.1)
+cash_buffer = st.sidebar.number_input("Cash buffer", min_value=0.0, max_value=0.5, value=0.0, step=0.01)
+
+if mode=="Backtest":
     st.sidebar.header("Sizing")
-    sizing_mode = st.sidebar.selectbox("Sizing mode", ["target_weight", "pct_cash_shares"], index=0)
-
     buy_pct_cash = st.sidebar.slider("Buy % of cash per entry", 0.01, 1.00, 0.25, 0.01)
     sell_pct_shares = st.sidebar.slider("Sell % of shares per exit", 0.01, 1.00, 1.00, 0.01)
 
@@ -573,8 +566,7 @@ if mode == "Optimize":
     st.sidebar.subheader("Select parameters to optimize")
     # Build a catalog and let the user pick keys
     cat = default_param_catalog_for_your_app()
-    # Remove strategy.kind unless you really want it tuned
-    cat.pop("strategy.kind", None)
+
 
     selectable_keys = list(cat.keys())
     active_keys = st.sidebar.multiselect(

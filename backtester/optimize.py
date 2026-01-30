@@ -542,13 +542,10 @@ def default_param_catalog_for_your_app() -> Dict[str, ParamSpec]:
     cat["strategy.window"] = IntRangeParam("strategy.window", 10, 200, step=1)
 
     # Portfolio sizing
-    cat["portfolio.sizing_mode"] = ChoiceParam("portfolio.sizing_mode", ["target_weight", "pct_cash_shares"])
     cat["portfolio.buy_pct_cash"] = FloatRangeParam("portfolio.buy_pct_cash", 0.05, 1.0, step=0.05)
     cat["portfolio.sell_pct_shares"] = FloatRangeParam("portfolio.sell_pct_shares", 0.05, 1.0, step=0.05)
 
     # Portfolio mechanics
     cat["portfolio.rebalance_policy"] = ChoiceParam("portfolio.rebalance_policy", ["on_change", "every_bar"])
-    cat["portfolio.max_gross"] = FloatRangeParam("portfolio.max_gross", 0.5, 2.0, step=0.1)
-    cat["portfolio.cash_buffer"] = FloatRangeParam("portfolio.cash_buffer", 0.0, 0.3, step=0.01)
 
     return cat
