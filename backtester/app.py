@@ -461,23 +461,11 @@ def render_bundle(bundle):
 
     st.subheader("Cumulative Returns vs Benchmark")
     cvb = plots["cum_vs_bench"]
-    fig_cum = plot_cum_vs_bench(cvb["strategy"], cvb.get("benchmark"))
-    plot_with_info(
-        "Cumulative Returns vs Benchmark",
-        "plot.cum_returns",
-        fig_cum,
-        key="cum_vs_bench",
-    )
+    st.pyplot(plot_cum_vs_bench(cvb["strategy"], cvb.get("benchmark")))
 
 
     st.subheader("Drawdown")
-    # --- Drawdown plot with explanation ---
-    plot_with_info(
-        "Drawdown",
-        "plot.drawdown",
-        plot_drawdown_red(plots["drawdown"]),
-        key="drawdown",
-    )
+    st.pyplot(plot_drawdown_red(plots["drawdown"]))
 
 
 
