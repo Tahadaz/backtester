@@ -600,42 +600,54 @@ class PortfolioEngine:
         symbols: List[str],
     ) -> List[Tuple[str, int]]:
         """
-        pct_cash_shares sizing (LONG/FLAT):
-        - sig > 0: buy using buy_pct_cash of available cash (split across active +1 symbols)
-        - sig <= 0: if currently long, sell sell_pct_shares of current position
+        Action-mode sizing (long-only, percentages):
+        +1 -> buy using buy_pct_cash of available cash (split across +1 symbols)
+        0 -> do nothing (hold)
+        -1 -> sell sell_pct_shares of current long position (partial/total exit)
         """
         orders: List[Tuple[str, int]] = []
 
-        active_buy_syms = [s for s in symbols if float(sig_row.get(s, 0.0)) > 0.0]
-        n_active_buy = max(1, len(active_buy_syms))
+        # Treat signals as actions: only +1 counts as buy
+        buy_syms = [s for s in symbols if float(sig_row.get(s, 0.0)) > 0.0]
+        n_buy = max(1, len(buy_syms))
 
         avail_cash = self._available_cash(state, equity_t)
 
         for s in symbols:
-            sig = float(np.clip(float(sig_row.get(s, 0.0)), -1.0, 1.0))
+            sig = float(sig_row.get(s, 0.0))
+            sig = float(np.clip(sig, -1.0, 1.0))
+
             pos = int(state.position(s))
             px = float(open_t1[s])
             cap_abs = self._max_abs_shares_cap(equity_t, px)
 
-            # EXIT when signal is not positive
-            if sig <= 0.0:
-                if pos > 0:
-                    q = int(np.ceil(self.cfg.sell_pct_shares * pos))
-                    q = min(q, pos)
-                    if q > 0:
-                        orders.append((s, -q))
+            # ---- SELL ONLY on -1 ----
+            if sig == -1.0:
+                if pos <= 0:
+                    continue
+                q = int(np.ceil(self.cfg.sell_pct_shares * abs(pos)))
+                q = min(q, abs(pos))
+                delta = -q
+                if delta != 0:
+                    orders.append((s, int(delta)))
                 continue
 
-            # ENTRY when signal is positive
-            cash_budget = (self.cfg.buy_pct_cash * avail_cash) / n_active_buy
-            buy_qty = int(cash_budget / px)
-            if buy_qty <= 0:
+            # ---- HOLD on 0 ----
+            if sig == 0.0:
                 continue
 
-            desired_pos = min(pos + buy_qty, cap_abs)
-            delta = desired_pos - pos
-            if delta != 0:
-                orders.append((s, int(delta)))
+            # ---- BUY ONLY on +1 ----
+            if sig == 1.0:
+                cash_budget = (self.cfg.buy_pct_cash * avail_cash) / n_buy
+                buy_qty = int(cash_budget / px)
+                if buy_qty <= 0:
+                    continue
+
+                desired_pos = min(pos + buy_qty, cap_abs)
+                delta = desired_pos - pos
+                if delta != 0:
+                    orders.append((s, int(delta)))
+                continue
 
         return orders
 
