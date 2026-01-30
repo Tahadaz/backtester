@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly
+import plotly.graph_objects as go
 # Your project imports
 from engine import BacktestEngine, EngineSpec, DataConfig, IndicatorsConfig, StrategyConfig
 from portfolio import PortfolioConfig, CostModel
