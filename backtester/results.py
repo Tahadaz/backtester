@@ -262,18 +262,24 @@ class ResultsAnalyzer:
 
         style = self._style_spec()
 
-        return BacktestReport(
-            metrics=metrics,
-            series=series,
-            tables=tables,
-            plots=plots,
-            style=style,
-            explain=explain,
-            meta={
-                "symbols": symbols,
-                "benchmark_symbol": benchmark_symbol,
-            },
-        )
+        try:
+            rep = BacktestReport(
+                metrics=metrics,
+                series=series,
+                tables=tables,
+                plots=plots,
+                style=style,
+                meta={
+                    "symbols": symbols,
+                    "benchmark_symbol": benchmark_symbol,
+                },
+            )
+            return rep
+        except Exception as e:
+            print("FAILED building BacktestReport:", type(e), e)
+            print("types:",
+                type(metrics), type(series), type(tables), type(plots), type(style))
+            raise
 
     # =============================
     # Styling hints for the UI
