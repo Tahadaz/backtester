@@ -487,77 +487,50 @@ class PortfolioEngine:
         symbols: List[str],
     ) -> List[Tuple[str, int]]:
         """
-        Build (symbol, delta_shares) orders for pct_cash_shares sizing.
-
-        Rules (single-asset friendly, multi-asset works by splitting budgets):
-        - If signal==0: reduce existing position by sell_pct_shares (partial exit)
-        - If signal==+1: if short, close full short first; then buy with buy_pct_cash of available cash
-        - If signal==-1: if long, close full long first; then short with buy_pct_cash of investable equity (simplified)
+        pct_cash_shares sizing (NO SHORT version):
+        - sig == +1: buy with buy_pct_cash of available cash (split across active +1 symbols)
+        - sig ==  0: do nothing (hold)
+        - sig == -1: sell sell_pct_shares of current long position (partial exit)
         """
         orders: List[Tuple[str, int]] = []
 
-        # Budget splitting across active (non-zero) signals for entries
-        active_syms = [s for s in symbols if float(sig_row.get(s, 0.0)) != 0.0]
-        n_active = max(1, len(active_syms))
+        # Active entries are ONLY the +1 signals (since no shorting)
+        active_buy_syms = [s for s in symbols if float(sig_row.get(s, 0.0)) > 0.0]
+        n_active_buy = max(1, len(active_buy_syms))
 
         avail_cash = self._available_cash(state, equity_t)
 
         for s in symbols:
             sig = float(sig_row.get(s, 0.0))
-            if not self.cfg.allow_short and sig < 0:
-                sig = 0.0
             sig = float(np.clip(sig, -1.0, 1.0))
 
             pos = int(state.position(s))
             px = float(open_t1[s])
             cap_abs = self._max_abs_shares_cap(equity_t, px)
 
-            # ---- FLAT: partial exit ----
-            if sig == 0.0:
-                if pos == 0:
-                    continue
+            # ---- SELL signal (-1): partial exit from long ----
+            if sig < 0.0:
+                if pos <= 0:
+                    continue  # nothing to sell (no short positions expected)
                 q = int(np.ceil(self.cfg.sell_pct_shares * abs(pos)))
                 q = min(q, abs(pos))
-                delta = -q if pos > 0 else +q  # sell long / cover short
-                orders.append((s, int(delta)))
-                continue
-
-            # ---- LONG intent ----
-            if sig > 0:
-                # If currently short, close it fully first (intent-consistent)
-                if pos < 0:
-                    orders.append((s, -pos))  # buy to cover
-
-                    # after closing, treat as flat for entry sizing
-                    pos = 0
-
-                # Enter/increase long using % of available cash
-                cash_budget = (self.cfg.buy_pct_cash * avail_cash) / n_active
-                buy_qty = int(cash_budget / px)  # floor, integer shares
-                if buy_qty <= 0:
-                    continue
-
-                # Cap by gross limits
-                desired_pos = min(pos + buy_qty, cap_abs)
-                delta = desired_pos - pos
+                delta = -q  # sell q shares
                 if delta != 0:
                     orders.append((s, int(delta)))
                 continue
 
-            # ---- SHORT intent ----
-            if sig < 0 and self.cfg.allow_short:
-                # If currently long, close it fully first
-                if pos > 0:
-                    orders.append((s, -pos))  # sell to flat
-                    pos = 0
+            # ---- HOLD (0): do nothing ----
+            if sig == 0.0:
+                continue
 
-                investable_equity = float(equity_t) * (1.0 - float(self.cfg.cash_buffer))
-                short_notional = (self.cfg.buy_pct_cash * investable_equity) / n_active
-                short_qty = int(short_notional / px)  # floor
-                if short_qty <= 0:
+            # ---- BUY signal (+1): enter/increase long using % of available cash ----
+            if sig > 0.0:
+                cash_budget = (self.cfg.buy_pct_cash * avail_cash) / n_active_buy
+                buy_qty = int(cash_budget / px)  # floor, integer shares
+                if buy_qty <= 0:
                     continue
 
-                desired_pos = max(pos - short_qty, -cap_abs)
+                desired_pos = min(pos + buy_qty, cap_abs)
                 delta = desired_pos - pos
                 if delta != 0:
                     orders.append((s, int(delta)))
@@ -567,34 +540,4 @@ class PortfolioEngine:
 
 
 
-"""
-TEXT EXPLANATION (for Cursor review)
 
-What this file does:
-- Implements a complete "portfolio layer" as a single module: sizing/targets, constraints, execution simulation, and accounting.
-- It consumes MarketData (market_data.bars[symbol]) and SignalFrame (signals + validity) and produces:
-  * equity_curve (marked at close(t+1))
-  * returns series
-  * positions history (shares)
-  * trade ledger (fills with cost breakdown)
-
-Key causal conventions:
-- Signals are read at time t.
-- Orders are executed at Open(t+1) (FillPriceModel = next_open).
-- Equity is marked-to-market at Close(t+1) (as requested).
-
-Sizing and constraints:
-- Signals map to target weights in [-1,1] (long/short).
-- Optional per-asset max weight and cash buffer exist but do not have to be set.
-- max_gross is always applied (default 1.0), scaling weights down if needed.
-- Weights are converted to integer shares using Open(t+1). No fractional shares.
-
-Costs:
-- CostModel is configurable. Defaults use commonly cited Morocco brochure-style levels:
-  brokerage 0.60% HT + exchange 0.10% HT + settlement 0.20% HT, VAT 10% on commissions, plus optional slippage.
-- estimate_cost() returns a breakdown (commission_ht, vat, slippage) stored in each Fill.
-
-How to integrate:
-- Create PortfolioEngine(config) then call run(market_data, signal_frame, symbols=...).
-- Ensure bars have 'Open' and 'Close' columns (canonicalized).
-"""
