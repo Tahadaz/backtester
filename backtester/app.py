@@ -732,22 +732,15 @@ if mode == "Optimize":
 
 
     st.sidebar.header("Optimization method")
-    method = st.sidebar.selectbox("Method", ["random", "grid", "wfo"], index=0)
+    method = st.sidebar.selectbox("Method", ["random", "grid"], index=0)
     seed = st.sidebar.number_input("Seed", min_value=0, value=42, step=1)
     top_k = st.sidebar.number_input("Show top K", min_value=5, value=30, step=5)
 
     # Method-specific controls
     if method == "random":
         n_trials = st.sidebar.number_input("Trials", min_value=10, value=200, step=10)
-        wfo_train_bars = wfo_test_bars = wfo_step_bars = None
-    elif method == "grid":
+    else:
         n_trials = 0
-        wfo_train_bars = wfo_test_bars = wfo_step_bars = None
-    else:  # wfo
-        n_trials = st.sidebar.number_input("Trials per fold (random search)", min_value=10, value=200, step=10)
-        wfo_train_bars = st.sidebar.number_input("Train bars", min_value=100, value=504, step=21)
-        wfo_test_bars = st.sidebar.number_input("Test bars", min_value=20, value=63, step=21)
-        wfo_step_bars = st.sidebar.number_input("Step bars", min_value=10, value=63, step=21)
 
     run_btn = st.sidebar.button("Run optimization")
 
@@ -853,12 +846,10 @@ try:
         opt_cfg = OptimizeConfig(
             method=method,
             seed=int(seed),
-            n_trials=int(n_trials) if method in ("random", "wfo") else 0,
+            n_trials=int(n_trials) if method in ("random") else 0,
             top_k=int(top_k),
             objective="pnl_then_eff",
-            wfo_train_bars=int(wfo_train_bars) if method == "wfo" else 0,
-            wfo_test_bars=int(wfo_test_bars) if method == "wfo" else 0,
-            wfo_step_bars=int(wfo_step_bars) if method == "wfo" else 0,
+
         )
 
         with st.spinner("Running optimization..."):
