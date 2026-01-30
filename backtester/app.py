@@ -870,7 +870,6 @@ try:
             exchange_bps=float(exchange_bps),
             settlement_bps=float(settlement_bps),
             vat_rate=float(vat_rate),
-            slippage_bps=float(vat_rate),
             slippage_bps=float(slippage_bps),
         )
 
