@@ -223,26 +223,30 @@ def plot_yearly_returns_bar(yearly: pd.Series) -> plt.Figure:
 
 def plot_price_indicators_trades_plotly(
     bars: pd.DataFrame,
-    indicators: Optional[pd.DataFrame],
-    trades: Optional[pd.DataFrame],
-    indicator_cols: Optional[List[str]] = None,
+    indicators: pd.DataFrame | None,
+    trades: pd.DataFrame | None,
+    indicator_cols: list[str] | None = None,
 ) -> go.Figure:
     df = bars.copy().sort_index()
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
 
     fig = go.Figure()
+
+    # --- NORMAL GRAPH: Close line ---
+    if "Close" not in df.columns:
+        raise KeyError("bars must contain a 'Close' column for normal price line plot.")
     fig.add_trace(
-        go.Candlestick(
+        go.Scatter(
             x=df.index,
-            open=df["Open"],
-            high=df["High"],
-            low=df["Low"],
-            close=df["Close"],
-            name="Price",
+            y=df["Close"].astype(float),
+            mode="lines",
+            name="Close",
+            line=dict(width=2),
         )
     )
 
+    # --- Indicators (lines) ---
     if indicators is not None and not indicators.empty:
         ind = indicators.copy()
         if not isinstance(ind.index, pd.DatetimeIndex):
@@ -255,6 +259,7 @@ def plot_price_indicators_trades_plotly(
             if s.notna().any():
                 fig.add_trace(go.Scatter(x=df.index, y=s, mode="lines", name=c, line=dict(width=1)))
 
+    # --- Trades markers (BUY/SELL) ---
     if trades is not None and not trades.empty:
         t = trades.copy()
         t["timestamp"] = pd.to_datetime(t["timestamp"], errors="coerce")
@@ -263,6 +268,7 @@ def plot_price_indicators_trades_plotly(
         if "side" not in t.columns:
             t["side"] = np.where(t["qty"].astype(float) > 0, "BUY", "SELL")
 
+        # plot marker y = trade price if present else Close on that date
         y = pd.to_numeric(t.get("price", np.nan), errors="coerce")
         close_map = df["Close"].reindex(t["timestamp"]).ffill()
         t["y_plot"] = np.where(np.isfinite(y.values), y.values, close_map.values)
@@ -279,7 +285,7 @@ def plot_price_indicators_trades_plotly(
                     text=["BUY"] * len(buys),
                     textposition="top center",
                     name="BUY",
-                    marker=dict(size=8),
+                    marker=dict(size=9, symbol="triangle-up"),
                 )
             )
         if not sells.empty:
@@ -289,9 +295,9 @@ def plot_price_indicators_trades_plotly(
                     y=sells["y_plot"],
                     mode="markers+text",
                     text=["SELL"] * len(sells),
-                    textposition="top center",
+                    textposition="bottom center",
                     name="SELL",
-                    marker=dict(size=8),
+                    marker=dict(size=9, symbol="triangle-down"),
                 )
             )
 
