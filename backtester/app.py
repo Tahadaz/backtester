@@ -130,8 +130,8 @@ def plot_price_indicators_trades_plotly(
                     mode="text",
                     text="BUY",
                     name="BUY",
-                    textposition="bottom center",
-                    textfont=dict(size=7, color ="#1C60E9"),
+                    textposition="upper center",
+                    textfont=dict(size=14, color ="#1C60E9"),
                 )
             )
         if not sells.empty:
@@ -139,9 +139,11 @@ def plot_price_indicators_trades_plotly(
                 go.Scatter(
                     x=sells["timestamp"],
                     y=sells["y_plot"],
-                    mode="markers",
+                    mode="text",
+                    text="SELL",
                     name="SELL",
-                    marker=dict(symbol="triangle-down", size=7, color="#F73434"),
+                    textposition="upper center"
+                    textfont=dict( size=20, color="#1C60E9"),
                 )
             )
 
