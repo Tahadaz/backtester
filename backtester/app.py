@@ -99,7 +99,7 @@ def plot_price_indicators_trades_plotly(
         for c in cols:
             s = ind[c].astype(float)
             if s.notna().any():
-                fig.add_trace(go.Scatter(x=df.index, y=s, mode="lines", name=c,line=dict(width=0.5),))
+                fig.add_trace(go.Scatter(x=df.index, y=s, mode="lines", name=c,line=dict(width=1),))
 
     # Trades
     if trades is not None and not trades.empty:
@@ -142,7 +142,7 @@ def plot_price_indicators_trades_plotly(
                     mode="text",
                     text="SELL",
                     name="SELL",
-                    textposition="upper center"
+                    textposition="upper center",
                     textfont=dict( size=20, color="#1C60E9"),
                 )
             )
