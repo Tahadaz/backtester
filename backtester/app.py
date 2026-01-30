@@ -16,6 +16,13 @@ import matplotlib.colors as mcolors
 # ---- your project imports (adjust if your modules are inside a package folder) ----
 from engine import BacktestEngine, EngineSpec, DataConfig, IndicatorsConfig, StrategyConfig
 from portfolio import PortfolioConfig, CostModel
+from optimize import (
+    default_param_catalog_for_your_app,
+    run_optimization,
+    OptimizeConfig,
+    build_date_window_choices_from_uploaded_bmce,
+    add_date_window_param,
+)
 
 
 st.set_page_config(page_title="Backtester", layout="wide")
@@ -25,6 +32,96 @@ st.title("Backtester (TA) — Data → Indicators → Strategy → Portfolio →
 # --------------------------
 # Small plotting helpers
 # --------------------------
+def render_bundle(bundle):
+    rep = bundle.report
+    plots = rep.plots
+    tables = rep.tables
+    series = rep.series
+    # paste your existing rendering block here unchanged
+
+def make_base_spec(
+    source_key: str,
+    symbol: str,
+    timezone: str,
+    interval: str,
+    bmce_tmp_path: Optional[str],
+    start: Optional[str],
+    end: Optional[str],
+    yf_period: Optional[str],
+    yf_interval: Optional[str],
+    yf_auto_adjust: Optional[bool],
+    strategy_kind: str,
+    strategy_params: dict,
+    allow_short: bool,
+    initial_cash: float,
+    rebalance_policy: str,
+    max_gross: float,
+    cash_buffer: float,
+    sizing_mode: str,
+    buy_pct_cash: float,
+    sell_pct_shares: float,
+    brokerage_bps: float,
+    exchange_bps: float,
+    settlement_bps: float,
+    vat_rate: float,
+    slippage_bps: float,
+) -> EngineSpec:
+    # Data config
+    if source_key == "bmce":
+        data_cfg = DataConfig(
+            source="bmce",
+            symbols=[symbol],
+            timezone=timezone,
+            interval=interval,
+            start=start,
+            end=end,
+            bmce_paths=bmce_tmp_path,
+        )
+    else:
+        data_cfg = DataConfig(
+            source="yfinance",
+            symbols=[symbol],
+            timezone=timezone,
+            interval=interval,
+            start=start,
+            end=end,
+            yf_period=yf_period or "max",
+            yf_interval=yf_interval or "1d",
+            yf_auto_adjust=bool(yf_auto_adjust),
+        )
+
+    strat_cfg = StrategyConfig(kind=strategy_kind, params=dict(strategy_params or {}))
+    ind_cfg = IndicatorsConfig(specs=None)
+
+    cost_model = CostModel(
+        brokerage_bps=float(brokerage_bps),
+        exchange_bps=float(exchange_bps),
+        settlement_bps=float(settlement_bps),
+        slippage_bps=float(slippage_bps),
+        vat_rate=float(vat_rate),
+    )
+
+    port_cfg = PortfolioConfig(
+        allow_short=bool(allow_short),
+        initial_cash=float(initial_cash),
+        rebalance_policy=str(rebalance_policy),
+        max_gross=float(max_gross),
+        cash_buffer=float(cash_buffer),
+        cost_model=cost_model,
+        sizing_mode=str(sizing_mode),
+        buy_pct_cash=float(buy_pct_cash),
+        sell_pct_shares=float(sell_pct_shares),
+    )
+
+    return EngineSpec(
+        data=data_cfg,
+        indicators=ind_cfg,
+        strategy=strat_cfg,
+        portfolio=port_cfg,
+        periods_per_year=252,
+        rf_annual=0.0,
+    )
+
 def plot_line(series: pd.Series, title: str, ylabel: str):
     fig = plt.figure(figsize=(12, 4))
     plt.plot(series.index, series.values)
@@ -130,7 +227,7 @@ def plot_price_indicators_trades_plotly(
                     mode="text",
                     text="BUY",
                     name="BUY",
-                    textposition="upper center",
+                    textposition="top center",
                     textfont=dict(size=14, color ="#1C60E9"),
                 )
             )
@@ -142,7 +239,7 @@ def plot_price_indicators_trades_plotly(
                     mode="text",
                     text="SELL",
                     name="SELL",
-                    textposition="upper center",
+                    textposition="top center",
                     textfont=dict( size=20, color="#1C60E9"),
                 )
             )
@@ -352,6 +449,9 @@ def style_time_table(df: pd.DataFrame):
 # --------------------------
 # Sidebar inputs
 # --------------------------
+st.sidebar.header("Mode")
+mode = st.sidebar.radio("Choose mode", ["Backtest", "Optimize"], index=0)
+
 st.sidebar.header("Data source")
 source = st.sidebar.selectbox("Source", ["bmce (upload)", "yfinance"], index=0)
 
@@ -460,7 +560,11 @@ else:
     vat_rate = 0.0
 
 st.sidebar.header("Run")
-run_btn = st.sidebar.button("Run backtest")
+if mode == "Backtest":
+    run_btn = st.sidebar.button("Run backtest")
+else:
+    run_btn = st.sidebar.button("Run optimization")
+
 
 
 # --------------------------
@@ -494,6 +598,9 @@ def run_engine_cached(
     settlement_bps: float,
     vat_rate: float,
     slippage_bps: float,
+    sizing_mode: str,
+    buy_pct_cash: float,
+    sell_pct_shares: float,
 ):
     # ---- Data config ----
     if source_key == "bmce":
@@ -604,133 +711,219 @@ try:
         with open(tmp_path, "wb") as f:
             f.write(bmce_file.getbuffer())
 
-    with st.spinner("Running backtest..."):
-        bundle = run_engine_cached(
-            source_key="bmce" if source.startswith("bmce") else "yfinance",
+    if mode == "Backtest":
+        with st.spinner("Running backtest..."):
+            bundle = run_engine_cached(
+                source_key="bmce" if source.startswith("bmce") else "yfinance",
+                symbol=symbol,
+                timezone=timezone,
+                interval=interval,
+                start=start_str,   # <-- add
+                end=end_str,       # <-- add
+                bmce_tmp_path=tmp_path,
+                yf_period=(yf_period if not source.startswith("bmce") else None),
+                yf_interval=(yf_interval if not source.startswith("bmce") else None),
+                yf_auto_adjust=(yf_auto_adjust if not source.startswith("bmce") else None),
+                allow_short=bool(allow_short),
+                initial_cash=float(initial_cash),
+                rebalance_policy=str(rebalance_policy),
+                max_gross=float(max_gross),
+                cash_buffer=float(cash_buffer),
+                brokerage_bps=float(brokerage_bps),
+                exchange_bps=float(exchange_bps),
+                settlement_bps=float(settlement_bps),
+                vat_rate=float(vat_rate),
+                slippage_bps=float(slippage_bps),
+                strategy_kind=strategy_kind,
+                strategy_params=strategy_params,
+                sizing_mode=str(sizing_mode),
+                buy_pct_cash=float(buy_pct_cash),
+                sell_pct_shares=float(sell_pct_shares),
+            )
+
+        rep = bundle.report
+
+        # --- Outputs ---
+        plots = bundle.report.plots
+        tables = bundle.report.tables
+        series = bundle.report.series
+
+        st.subheader("Price + Indicators + Trades")
+        pp = bundle.report.plots["price_panel"]
+        sym = bundle.md.symbols()[0]
+        bars = bundle.md.bars[sym]  # full OHLCV bars (better than using Close only)
+
+        fig = plot_price_indicators_trades_plotly(
+            bars=bundle.md.bars[bundle.md.symbols()[0]],
+            indicators=pp["indicators"],
+            trades=pp["trades"],
+            indicator_cols=pp.get("indicator_cols"),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Cumulative Returns vs Benchmark")
+        cvb = plots["cum_vs_bench"]
+        st.pyplot(plot_cum_vs_bench(cvb["strategy"], cvb["benchmark"]))
+
+        st.subheader("Drawdown")
+        st.pyplot(plot_drawdown_red(plots["drawdown"]))
+
+        st.subheader("PnL")
+        if "pnl" in series:
+            st.pyplot(plot_pnl_series(series["pnl"]))
+        else:
+            st.info("PnL series not found in report.series (did you add it in ResultsAnalyzer?)")
+
+        st.subheader("Cumulative PnL")
+        if "cum_pnl" in series:
+            st.pyplot(plot_cum_pnl_series(series["cum_pnl"]))
+        else:
+            st.info("cum_pnl series not found in report.series (did you add it in ResultsAnalyzer?)")
+
+        st.subheader("Monthly Returns Heatmap")
+        st.pyplot(plot_monthly_heatmap_with_values(plots["monthly_heatmap"]))
+
+        st.subheader("Yearly Returns")
+        st.pyplot(plot_yearly_returns_bar(plots["yearly_bar"]))
+
+        st.subheader("Trade Performance (summary)")
+        if "trade_performance" in tables:
+            st.dataframe(tables["trade_performance"], use_container_width=True)
+        else:
+            st.info("trade_performance not found in report.tables")
+
+        st.subheader("Trades Ledger (PnL per trade)")
+        if "trade_ledger" in tables:
+            ledger = tables["trade_ledger"].copy()
+
+            # Optional: nicer formatting
+            pct_cols = [c for c in ["return_pct"] if c in ledger.columns]
+            money_cols = [c for c in ["gross_pnl", "net_pnl", "entry_cost", "exit_cost"] if c in ledger.columns]
+            price_cols = [c for c in ["entry_price", "exit_price"] if c in ledger.columns]
+
+            for c in pct_cols:
+                ledger[c] = pd.to_numeric(ledger[c], errors="coerce") * 100.0
+            for c in money_cols + price_cols:
+                ledger[c] = pd.to_numeric(ledger[c], errors="coerce")
+
+            # Reorder columns if present
+            preferred = [
+                "entry_time","exit_time","symbol","side","qty",
+                "entry_price","exit_price",
+                "gross_pnl","entry_cost","exit_cost","net_pnl",
+                "return_pct","hold_days"
+            ]
+            cols = [c for c in preferred if c in ledger.columns] + [c for c in ledger.columns if c not in preferred]
+            ledger = ledger[cols]
+
+            st.dataframe(ledger, use_container_width=True)
+        else:
+            st.info("trade_ledger not found in report.tables")
+
+        
+        t_curve = bundle.report.tables["curve_vs_benchmark"]
+        t_trade = bundle.report.tables["trade_summary"]
+        t_time  = bundle.report.tables["time_summary"]
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("### Curve vs. Benchmark")
+            st.dataframe(style_curve_vs_bench(t_curve), use_container_width=True)
+        with c2:
+            st.markdown("### Trade")
+            st.dataframe(style_trade_table(t_trade), use_container_width=True)
+        with c3:
+            st.markdown("### Time")
+            st.dataframe(style_time_table(t_time), use_container_width=True)
+
+
+        with st.expander("Debug: feature columns / signals head", expanded=False):
+            sym = bundle.md.symbols()[0]
+            st.write("Features columns:", list(bundle.feats.features[sym].columns))
+            st.write("Signals head:")
+            st.dataframe(bundle.signals.signals.head(10), use_container_width=True)
+
+    elif mode == "Optimize":
+        # ---- Optimize mode ----
+        base_spec = make_base_spec(
+            source_key=source_key,
             symbol=symbol,
             timezone=timezone,
             interval=interval,
-            start=start_str,   # <-- add
-            end=end_str,       # <-- add
             bmce_tmp_path=tmp_path,
-            yf_period=(yf_period if not source.startswith("bmce") else None),
-            yf_interval=(yf_interval if not source.startswith("bmce") else None),
-            yf_auto_adjust=(yf_auto_adjust if not source.startswith("bmce") else None),
+            start=start_str,
+            end=end_str,
+            yf_period=(yf_period if source_key != "bmce" else None),
+            yf_interval=(yf_interval if source_key != "bmce" else None),
+            yf_auto_adjust=(yf_auto_adjust if source_key != "bmce" else None),
+            strategy_kind=strategy_kind,
+            strategy_params=strategy_params,
             allow_short=bool(allow_short),
             initial_cash=float(initial_cash),
             rebalance_policy=str(rebalance_policy),
             max_gross=float(max_gross),
             cash_buffer=float(cash_buffer),
+            sizing_mode=str(sizing_mode),
+            buy_pct_cash=float(buy_pct_cash),
+            sell_pct_shares=float(sell_pct_shares),
             brokerage_bps=float(brokerage_bps),
             exchange_bps=float(exchange_bps),
             settlement_bps=float(settlement_bps),
             vat_rate=float(vat_rate),
+            slippage_bps=float(vat_rate),
             slippage_bps=float(slippage_bps),
-            strategy_kind=strategy_kind,
-            strategy_params=strategy_params,
         )
 
-    rep = bundle.report
+        cat = default_param_catalog_for_your_app()
+        cat.pop("strategy.kind", None)  # optional
 
-    # --- Outputs ---
-    plots = bundle.report.plots
-    tables = bundle.report.tables
-    series = bundle.report.series
+        # active_keys, search_mode, n_trials, top_k, optimize_dates
+        # must come from the optimize sidebar you already built.
+        if optimize_dates and source_key == "bmce":
+            windows = build_date_window_choices_from_uploaded_bmce(
+                base_data_cfg=base_spec.data,
+                symbol=symbol,
+                min_bars=252,
+                step_bars=21,
+                max_windows=200,
+            )
+            add_date_window_param(cat, windows)
+            if "data.window" not in active_keys:
+                active_keys = list(active_keys) + ["data.window"]
 
-    st.subheader("Price + Indicators + Trades")
-    pp = bundle.report.plots["price_panel"]
-    sym = bundle.md.symbols()[0]
-    bars = bundle.md.bars[sym]  # full OHLCV bars (better than using Close only)
+        opt_cfg = OptimizeConfig(
+            mode=search_mode,
+            n_trials=int(n_trials),
+            top_k=int(top_k),
+            seed=42,
+            objective="pnl_then_efficiency",
+            verbose=False,
+        )
 
-    fig = plot_price_indicators_trades_plotly(
-        bars=bundle.md.bars[bundle.md.symbols()[0]],
-        indicators=pp["indicators"],
-        trades=pp["trades"],
-        indicator_cols=pp.get("indicator_cols"),
-    )
-    st.plotly_chart(fig, use_container_width=True)
+        with st.spinner("Running optimization..."):
+            best, top_df, best_spec = run_optimization(
+                base_spec=base_spec,
+                catalog=cat,
+                active_keys=active_keys,
+                cfg=opt_cfg,
+            )
 
-    st.subheader("Cumulative Returns vs Benchmark")
-    cvb = plots["cum_vs_bench"]
-    st.pyplot(plot_cum_vs_bench(cvb["strategy"], cvb["benchmark"]))
+        st.subheader("Optimization results")
+        st.write("Best trial:")
+        st.json({
+            "pnl": best.pnl,
+            "traded_notional": best.traded_notional,
+            "profit_per_notional": best.efficiency,
+            "params": best.params,
+        })
+        st.dataframe(top_df, use_container_width=True)
 
-    st.subheader("Drawdown")
-    st.pyplot(plot_drawdown_red(plots["drawdown"]))
-
-    st.subheader("PnL")
-    if "pnl" in series:
-        st.pyplot(plot_pnl_series(series["pnl"]))
-    else:
-        st.info("PnL series not found in report.series (did you add it in ResultsAnalyzer?)")
-
-    st.subheader("Cumulative PnL")
-    if "cum_pnl" in series:
-        st.pyplot(plot_cum_pnl_series(series["cum_pnl"]))
-    else:
-        st.info("cum_pnl series not found in report.series (did you add it in ResultsAnalyzer?)")
-
-    st.subheader("Monthly Returns Heatmap")
-    st.pyplot(plot_monthly_heatmap_with_values(plots["monthly_heatmap"]))
-
-    st.subheader("Yearly Returns")
-    st.pyplot(plot_yearly_returns_bar(plots["yearly_bar"]))
-
-    st.subheader("Trade Performance (summary)")
-    if "trade_performance" in tables:
-        st.dataframe(tables["trade_performance"], use_container_width=True)
-    else:
-        st.info("trade_performance not found in report.tables")
-
-    st.subheader("Trades Ledger (PnL per trade)")
-    if "trade_ledger" in tables:
-        ledger = tables["trade_ledger"].copy()
-
-        # Optional: nicer formatting
-        pct_cols = [c for c in ["return_pct"] if c in ledger.columns]
-        money_cols = [c for c in ["gross_pnl", "net_pnl", "entry_cost", "exit_cost"] if c in ledger.columns]
-        price_cols = [c for c in ["entry_price", "exit_price"] if c in ledger.columns]
-
-        for c in pct_cols:
-            ledger[c] = pd.to_numeric(ledger[c], errors="coerce") * 100.0
-        for c in money_cols + price_cols:
-            ledger[c] = pd.to_numeric(ledger[c], errors="coerce")
-
-        # Reorder columns if present
-        preferred = [
-            "entry_time","exit_time","symbol","side","qty",
-            "entry_price","exit_price",
-            "gross_pnl","entry_cost","exit_cost","net_pnl",
-            "return_pct","hold_days"
-        ]
-        cols = [c for c in preferred if c in ledger.columns] + [c for c in ledger.columns if c not in preferred]
-        ledger = ledger[cols]
-
-        st.dataframe(ledger, use_container_width=True)
-    else:
-        st.info("trade_ledger not found in report.tables")
-
-    
-    t_curve = bundle.report.tables["curve_vs_benchmark"]
-    t_trade = bundle.report.tables["trade_summary"]
-    t_time  = bundle.report.tables["time_summary"]
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown("### Curve vs. Benchmark")
-        st.dataframe(style_curve_vs_bench(t_curve), use_container_width=True)
-    with c2:
-        st.markdown("### Trade")
-        st.dataframe(style_trade_table(t_trade), use_container_width=True)
-    with c3:
-        st.markdown("### Time")
-        st.dataframe(style_time_table(t_time), use_container_width=True)
-
-
-    with st.expander("Debug: feature columns / signals head", expanded=False):
-        sym = bundle.md.symbols()[0]
-        st.write("Features columns:", list(bundle.feats.features[sym].columns))
-        st.write("Signals head:")
-        st.dataframe(bundle.signals.signals.head(10), use_container_width=True)
+        if st.button("Run best configuration"):
+            with st.spinner("Running best backtest..."):
+                bundle = BacktestEngine(best_spec).run()
+            # reuse your exact rendering code below:
+            rep = bundle.report
+            ...
 
 finally:
     # cleanup temp upload file
