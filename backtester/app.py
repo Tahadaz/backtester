@@ -15,7 +15,7 @@ import plotly.graph_objects as go
 # Your project imports
 from engine import BacktestEngine, EngineSpec, DataConfig, IndicatorsConfig, StrategyConfig
 from portfolio import PortfolioConfig, CostModel
-
+import matplotlib.colors as mcolors
 from optimize import (
     OptimizeConfig,
     TrialResult,
