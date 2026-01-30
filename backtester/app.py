@@ -228,7 +228,7 @@ def plot_price_indicators_trades_plotly(
                     text="BUY",
                     name="BUY",
                     textposition="top center",
-                    textfont=dict(size=14, color ="#1C60E9"),
+                    textfont=dict(size=10, color ="#1C60E9"),
                 )
             )
         if not sells.empty:
@@ -240,7 +240,7 @@ def plot_price_indicators_trades_plotly(
                     text="SELL",
                     name="SELL",
                     textposition="top center",
-                    textfont=dict( size=20, color="#1C60E9"),
+                    textfont=dict( size=10, color="#1C60E9"),
                 )
             )
 
