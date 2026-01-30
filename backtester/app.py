@@ -480,27 +480,12 @@ def render_bundle(bundle):
         st.dataframe(tables["trades"], use_container_width=True)
 
     st.subheader("Trade Ledger (PnL per closed trade)")
-        # --- Trade Ledger (explain Gross/Net/Return%) ---
     if "trade_ledger" in tables:
-        table_with_info(
-            "Trades Ledger (PnL per trade)",
-            "ledger.pnl",
-            tables["trade_ledger"],
-        )
-    else:
-        st.info("trade_ledger not found in report.tables")
-
+        st.dataframe(tables["trade_ledger"], use_container_width=True)
 
     st.subheader("Trade Performance (summary)")
-        # --- Trade Performance (explain Profit Factor) ---
     if "trade_performance" in tables:
-        table_with_info(
-            "Trade Performance (summary)",
-            "trade.profit_factor",
-            tables["trade_performance"],
-        )
-    else:
-        st.info("trade_performance not found in report.tables")
+        st.dataframe(tables["trade_performance"], use_container_width=True)
 
 
 
