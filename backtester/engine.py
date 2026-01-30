@@ -26,7 +26,7 @@ from strategy import default_plot_indicators  # add import
 
 
 DataSourceKind = Literal["bmce", "yfinance"]
-
+StrategyKind = Literal["ma_cross","sma_price", ...]
 
 # -----------------------------
 # Engine Spec Objects
