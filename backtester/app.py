@@ -1044,17 +1044,16 @@ with tab_opt:
                 render_bundle(bundle)
 
         finally:
-                if bench_tmp_path and os.path.exists(bench_tmp_path):
-                    try:
-                        os.remove(bench_tmp_path)
-                    except OSError:
-                        pass
-                if bench_tmp_dir and os.path.isdir(bench_tmp_dir):
-                    try:
-                        os.rmdir(bench_tmp_dir)
-                    except OSError:
-                        pass
-
+            if bench_tmp_path and os.path.exists(bench_tmp_path):
+                try:
+                    os.remove(bench_tmp_path)
+                except OSError:
+                    pass
+            if bench_tmp_dir and os.path.isdir(bench_tmp_dir):
+                try:
+                    os.rmdir(bench_tmp_dir)
+                except OSError:
+                    pass
             if tmp_path and os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
