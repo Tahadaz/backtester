@@ -488,17 +488,17 @@ if mode=="Backtest":
     # Convert to ISO strings (what your DataConfig expects)
     start_str = start_date.isoformat() if start_date else None
     end_str = end_date.isoformat() if end_date else None
-with st.sidebar:
-    st.header("Strategy")
-    strategy_kind = st.selectbox(
-        "Choose strategy",
-        options=["ma_cross", "sma_price"],
-        index=0,
-        help="ma_cross: SMA fast vs SMA slow. sma_price: Close vs SMA(window).",
-    )
-    allow_short = st.checkbox("Allow short", value=False)
+
 if mode=="Backtest":
     with st.sidebar:
+        st.header("Strategy")
+        strategy_kind = st.selectbox(
+            "Choose strategy",
+            options=["ma_cross", "sma_price"],
+            index=0,
+            help="ma_cross: SMA fast vs SMA slow. sma_price: Close vs SMA(window).",
+        )
+        allow_short = st.checkbox("Allow short", value=False)
         if strategy_kind == "ma_cross":
             fast = st.number_input("Fast SMA window", min_value=2, max_value=500, value=20, step=1)
             slow = st.number_input("Slow SMA window", min_value=3, max_value=500, value=50, step=1)
@@ -532,7 +532,16 @@ if mode=="Backtest":
             "allow_short": bool(allow_short),
             "nan_policy": nan_policy,
         }
-
+else : 
+    with st.sidebar:
+        st.header("Strategy")
+        strategy_kind = st.selectbox(
+            "Choose strategy",
+            options=["ma_cross", "sma_price"],
+            index=0,
+            help="ma_cross: SMA fast vs SMA slow. sma_price: Close vs SMA(window).",
+        )
+        allow_short = st.checkbox("Allow short", value=False)
 st.sidebar.header("Portfolio")
 initial_cash = st.sidebar.number_input("Initial cash", min_value=1_000.0, value=1_000_000.0, step=10_000.0)
 rebalance_policy = st.sidebar.selectbox("Rebalance policy", ["on_change", "every_bar"], index=0)
