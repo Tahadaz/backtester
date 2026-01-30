@@ -25,6 +25,8 @@ from optimize import (
     default_param_catalog,
     run_optimization,
 )
+from data import BMCEDataSource, YahooFinanceDataSource
+from results import ResultsAnalyzer
 
 import optimize as _opt_mod
 st.sidebar.caption(f"optimize.py loaded from: {_opt_mod.__file__}")
@@ -144,6 +146,43 @@ def table_with_info(title: str, explain_key: str, df: pd.DataFrame):
 # ============================================================
 # Plotting helpers (NORMAL price line + indicators + buy/sell)
 # ============================================================
+@st.cache_data(show_spinner=False)
+def load_benchmark_market_data_cached(
+    bench_source_key: str,
+    bench_symbol: str,
+    timezone: str,
+    interval: str,
+    bmce_path: str | None,
+    start: str | None,
+    end: str | None,
+    yf_period: str | None,
+    yf_interval: str | None,
+    yf_auto_adjust: bool | None,
+):
+    if bench_source_key == "bmce":
+        if bmce_path is None:
+            raise ValueError("Benchmark BMCE selected but no file path provided.")
+        ds = BMCEDataSource(timezone=timezone)
+        md = ds.load(
+            symbols=[bench_symbol],
+            start=start,
+            end=end,
+            interval=interval,
+            paths=bmce_path,
+        )
+        return md
+
+    # yfinance
+    ds = YahooFinanceDataSource(timezone=timezone)
+    md = ds.load(
+        symbols=[bench_symbol],
+        start=start,
+        end=end,
+        interval=(yf_interval or "1d"),
+        auto_adjust=bool(yf_auto_adjust),
+        progress=False,
+    )
+    return md
 
 def plot_price_indicators_trades_line(
     bars: pd.DataFrame,
@@ -535,6 +574,48 @@ def ss_get(key: str, default):
         st.session_state[key] = default
     return st.session_state[key]
 
+# ============================================================
+# Sidebar: Benchmark (optional)
+# ============================================================
+st.sidebar.header("Benchmark (optional)")
+use_benchmark = st.sidebar.checkbox("Enable benchmark", value=False)
+
+bench_source_key = None
+bench_symbol = None
+bench_bmce_file = None
+bench_yf_period = None
+bench_yf_interval = None
+bench_yf_auto_adjust = None
+
+if use_benchmark:
+    bench_mode = st.sidebar.selectbox(
+        "Benchmark source",
+        ["same as main source", "yfinance", "bmce (upload)"],
+        index=0
+    )
+
+    if bench_mode == "same as main source":
+        bench_source_key = source_key
+        bench_symbol = st.sidebar.text_input("Benchmark symbol", value="MASI" if source_key == "bmce" else "SPY")
+
+        if bench_source_key == "bmce":
+            bench_bmce_file = st.sidebar.file_uploader("Upload BMCE benchmark CSV/XLSX", type=["csv", "xlsx"], key="bench_bmce")
+        else:
+            bench_yf_period = st.sidebar.text_input("Benchmark yfinance period", value=yf_period or "5y", key="bench_yf_period")
+            bench_yf_interval = st.sidebar.selectbox("Benchmark yfinance interval", ["1d"], index=0, key="bench_yf_interval")
+            bench_yf_auto_adjust = st.sidebar.checkbox("Benchmark auto_adjust", value=bool(yf_auto_adjust), key="bench_yf_auto_adjust")
+
+    elif bench_mode == "yfinance":
+        bench_source_key = "yfinance"
+        bench_symbol = st.sidebar.text_input("Benchmark symbol", value="SPY")
+        bench_yf_period = st.sidebar.text_input("Benchmark yfinance period", value="5y")
+        bench_yf_interval = st.sidebar.selectbox("Benchmark yfinance interval", ["1d"], index=0)
+        bench_yf_auto_adjust = st.sidebar.checkbox("Benchmark auto_adjust", value=False)
+
+    else:  # bmce upload
+        bench_source_key = "bmce"
+        bench_symbol = st.sidebar.text_input("Benchmark symbol", value="MASI")
+        bench_bmce_file = st.sidebar.file_uploader("Upload BMCE benchmark CSV/XLSX", type=["csv", "xlsx"], key="bench_bmce2")
 
 # ============================================================
 # Sidebar: Data source
@@ -839,7 +920,19 @@ with tab_opt:
     if run_opt:
         tmp_path = None
         tmp_dir = None
+        bench_tmp_path = None
+        bench_tmp_dir = None
         try:
+            if use_benchmark and bench_source_key == "bmce":
+                if bench_bmce_file is None:
+                    st.warning("Benchmark enabled but no BMCE benchmark file uploaded.")
+                    st.stop()
+
+                suffix_b = Path(bench_bmce_file.name).suffix.lower()
+                bench_tmp_dir = tempfile.mkdtemp(prefix="bmce_benchmark_")
+                bench_tmp_path = str(Path(bench_tmp_dir) / f"{bench_symbol}{suffix_b}")
+                with open(bench_tmp_path, "wb") as f:
+                    f.write(bench_bmce_file.getbuffer())
             if source_key == "bmce":
                 suffix = Path(bmce_file.name).suffix.lower()
                 tmp_dir = tempfile.mkdtemp(prefix="bmce_upload_")
@@ -951,6 +1044,17 @@ with tab_opt:
                 render_bundle(bundle)
 
         finally:
+                if bench_tmp_path and os.path.exists(bench_tmp_path):
+                    try:
+                        os.remove(bench_tmp_path)
+                    except OSError:
+                        pass
+                if bench_tmp_dir and os.path.isdir(bench_tmp_dir):
+                    try:
+                        os.rmdir(bench_tmp_dir)
+                    except OSError:
+                        pass
+
             if tmp_path and os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
