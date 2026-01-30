@@ -1060,19 +1060,7 @@ with tab_opt:
             # Ensure pnl + efficiency visible even if many params
             show_cols = [c for c in top_df.columns if c in ("pnl","efficiency","traded_notional","n_fills","error")] + \
                         [c for c in top_df.columns if c not in ("pnl","efficiency","traded_notional","n_fills","error")]
-            # --- Explain optimization metrics + show top candidates ---
-            table_with_info(
-                "Top candidates (ranked by PnL then Efficiency)",
-                "opt.top",
-                top_df[[
-                    # Keep only the most relevant columns first, if they exist
-                    *[c for c in top_df.columns if c.startswith("strategy.")],
-                    *[c for c in top_df.columns if c.startswith("portfolio.")],
-                    "pnl", "efficiency", "traded_notional", "n_fills",
-                    *([c for c in ["error"] if c in top_df.columns]),
-                ]].copy()
-            )
-
+            st.dataframe(top_df[show_cols], use_container_width=True)
 
             st.divider()
             if st.button("Run best configuration backtest", key="run_best_backtest_btn"):
