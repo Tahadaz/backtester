@@ -103,6 +103,9 @@ class PortfolioConfig:
 
     allow_fractional_shares: bool = False
 
+    cooldown_bars: int = 0
+
+
 
     def __post_init__(self) -> None:
         if not (0.0 < self.buy_pct_cash <= 1.0):
@@ -213,6 +216,9 @@ class PortfolioEngine:
 
         prev_target_weights: Optional[Dict[str, float]] = None
 
+        last_trade_i: Dict[str, int] = {s: -10**9 for s in symbols}  # bar index of last executed trade per symbol
+        cooldown = int(getattr(self.cfg, "cooldown_bars", 0) or 0)
+        
         # iterate up to second last timestamp because we fill at t+1
         for i in range(len(idx) - 1):
             t = pd.Timestamp(idx[i])
@@ -268,6 +274,17 @@ class PortfolioEngine:
             else:
                 # --- new per-trade sizing behavior ---
                 orders = self._deltas_pct_cash_shares(sig_row, state, open_t1, equity_t, symbols)
+            # --- cooldown filter: block trades if too soon since last trade ---
+            if cooldown > 0 and orders:
+                filtered = []
+                for s, delta in orders:
+                    if delta == 0:
+                        continue
+                    # trade executes at t1 which corresponds to loop index i+1
+                    if (i + 1) - last_trade_i.get(s, -10**9) < cooldown:
+                        continue  # skip trade for this symbol due to cooldown
+                    filtered.append((s, delta))
+                orders = filtered
 
             # Execute orders at open(t+1)
             for s, delta in orders:
@@ -277,7 +294,7 @@ class PortfolioEngine:
                 fill_price = float(open_t1[s])
                 notional = abs(delta) * fill_price
                 cost, breakdown = self.cfg.cost_model.estimate_cost(notional)
-
+                last_trade_i[s] = i + 1
                 f = Fill(
                     timestamp=t1,
                     symbol=s,
