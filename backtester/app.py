@@ -574,6 +574,43 @@ def ss_get(key: str, default):
         st.session_state[key] = default
     return st.session_state[key]
 
+
+# ============================================================
+# Sidebar: Data source
+# ============================================================
+
+st.sidebar.header("Data source")
+source = st.sidebar.selectbox("Source", ["bmce (upload)", "yfinance"], index=0)
+source_key = "bmce" if source.startswith("bmce") else "yfinance"
+
+symbol = st.sidebar.text_input("Symbol", value="IAM" if source_key == "bmce" else "AAPL")
+timezone = st.sidebar.text_input("Timezone", value="GMT")
+interval = st.sidebar.selectbox("Interval", ["1d"], index=0)
+
+bmce_file = None
+yf_period = yf_interval = None
+yf_auto_adjust = None
+
+if source_key == "bmce":
+    bmce_file = st.sidebar.file_uploader("Upload BMCE CSV/XLSX", type=["csv", "xlsx"])
+else:
+    st.sidebar.caption("yfinance needs internet + yfinance in requirements.txt")
+    yf_period = st.sidebar.text_input("yfinance period", value="5y")
+    yf_interval = st.sidebar.selectbox("yfinance interval", ["1d"], index=0)
+    yf_auto_adjust = st.sidebar.checkbox("auto_adjust", value=False)
+
+st.sidebar.header("Strategy")
+strategy_kind = st.sidebar.selectbox("Strategy kind", ["ma_cross", "sma_price"], index=0)
+allow_short = st.sidebar.checkbox("Allow short", value=False)
+
+# Reset optimization UI on strategy change (prevents stale widget keys)
+prev_kind = ss_get("prev_strategy_kind", strategy_kind)
+if prev_kind != strategy_kind:
+    for k in list(st.session_state.keys()):
+        if k.endswith("_min") or k.endswith("_max") or k.endswith("_step") or k.endswith("_choices"):
+            del st.session_state[k]
+    st.session_state["prev_strategy_kind"] = strategy_kind
+
 # ============================================================
 # Sidebar: Benchmark (optional)
 # ============================================================
@@ -616,43 +653,6 @@ if use_benchmark:
         bench_source_key = "bmce"
         bench_symbol = st.sidebar.text_input("Benchmark symbol", value="MASI")
         bench_bmce_file = st.sidebar.file_uploader("Upload BMCE benchmark CSV/XLSX", type=["csv", "xlsx"], key="bench_bmce2")
-
-# ============================================================
-# Sidebar: Data source
-# ============================================================
-
-st.sidebar.header("Data source")
-source = st.sidebar.selectbox("Source", ["bmce (upload)", "yfinance"], index=0)
-source_key = "bmce" if source.startswith("bmce") else "yfinance"
-
-symbol = st.sidebar.text_input("Symbol", value="IAM" if source_key == "bmce" else "AAPL")
-timezone = st.sidebar.text_input("Timezone", value="GMT")
-interval = st.sidebar.selectbox("Interval", ["1d"], index=0)
-
-bmce_file = None
-yf_period = yf_interval = None
-yf_auto_adjust = None
-
-if source_key == "bmce":
-    bmce_file = st.sidebar.file_uploader("Upload BMCE CSV/XLSX", type=["csv", "xlsx"])
-else:
-    st.sidebar.caption("yfinance needs internet + yfinance in requirements.txt")
-    yf_period = st.sidebar.text_input("yfinance period", value="5y")
-    yf_interval = st.sidebar.selectbox("yfinance interval", ["1d"], index=0)
-    yf_auto_adjust = st.sidebar.checkbox("auto_adjust", value=False)
-
-st.sidebar.header("Strategy")
-strategy_kind = st.sidebar.selectbox("Strategy kind", ["ma_cross", "sma_price"], index=0)
-allow_short = st.sidebar.checkbox("Allow short", value=False)
-
-# Reset optimization UI on strategy change (prevents stale widget keys)
-prev_kind = ss_get("prev_strategy_kind", strategy_kind)
-if prev_kind != strategy_kind:
-    for k in list(st.session_state.keys()):
-        if k.endswith("_min") or k.endswith("_max") or k.endswith("_step") or k.endswith("_choices"):
-            del st.session_state[k]
-    st.session_state["prev_strategy_kind"] = strategy_kind
-
 
 # ============================================================
 # Main preview (BMCE)
@@ -1041,6 +1041,47 @@ with tab_opt:
             if st.button("Run best configuration backtest", key="run_best_backtest_btn"):
                 with st.spinner("Running best backtest..."):
                     bundle = BacktestEngine(best_spec).run()
+                    # ============================================================
+                    # Optional: rebuild report with benchmark (no engine changes)
+                    # ============================================================
+                    if use_benchmark and bench_source_key and bench_symbol:
+                        try:
+                            bench_md = load_benchmark_market_data_cached(
+                                bench_source_key=bench_source_key,
+                                bench_symbol=bench_symbol,
+                                timezone=timezone,
+                                interval=interval,
+                                bmce_path=bench_tmp_path if bench_source_key == "bmce" else None,
+                                start=start_str,
+                                end=end_str,
+                                yf_period=bench_yf_period,
+                                yf_interval=bench_yf_interval,
+                                yf_auto_adjust=bench_yf_auto_adjust,
+                            )
+
+                            analyzer = ResultsAnalyzer(periods_per_year=252, rf_annual=0.0)
+
+                            # robust attribute fetch (adjust once you confirm exact bundle field names)
+                            portfolio_result = getattr(bundle, "portfolio_result", None) or getattr(bundle, "portfolio", None) or getattr(bundle, "pres", None)
+                            if portfolio_result is None:
+                                raise AttributeError("Bundle has no portfolio result attribute (expected portfolio_result/portfolio/pres).")
+
+                            report = analyzer.analyze(
+                                portfolio_result=portfolio_result,
+                                market_data=bundle.md,
+                                symbols=bundle.md.symbols(),
+                                features_data=getattr(bundle, "feats", None),
+                                plot_indicators=getattr(bundle.report.plots.get("price_panel", {}), "indicator_cols", None) if hasattr(bundle, "report") else None,
+                                benchmark_market_data=bench_md,
+                                benchmark_symbol=bench_symbol,
+                            )
+
+                            # overwrite bundle.report so render_bundle() stays unchanged
+                            bundle.report = report
+
+                        except Exception as e:
+                            st.warning(f"Benchmark could not be applied: {e}")
+
                 render_bundle(bundle)
 
         finally:
