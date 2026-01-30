@@ -452,6 +452,7 @@ def style_time_table(df: pd.DataFrame):
 st.sidebar.header("Mode")
 mode = st.sidebar.radio("Choose mode", ["Backtest", "Optimize"], index=0)
 
+
 st.sidebar.header("Data source")
 source = st.sidebar.selectbox("Source", ["bmce (upload)", "yfinance"], index=0)
 
@@ -468,104 +469,121 @@ else:
     yf_interval = st.sidebar.selectbox("yfinance interval", ["1d"], index=0)
     yf_auto_adjust = st.sidebar.checkbox("auto_adjust", value=False)
 
+if mode=="Backtest":
 
-st.sidebar.header("Backtest period")
+    st.sidebar.header("Backtest period")
 
-use_date_range = st.sidebar.checkbox("Use date range", value=False)
+    use_date_range = st.sidebar.checkbox("Use date range", value=False)
 
-start_date = None
-end_date = None
-if use_date_range:
-    start_date = st.sidebar.date_input("Start date", value=None)
-    end_date = st.sidebar.date_input("End date", value=None)
+    start_date = None
+    end_date = None
+    if use_date_range:
+        start_date = st.sidebar.date_input("Start date", value=None)
+        end_date = st.sidebar.date_input("End date", value=None)
 
-    # basic validation
-    if start_date and end_date and start_date > end_date:
-        st.sidebar.error("Start date must be <= End date.")
-        st.stop()
+        # basic validation
+        if start_date and end_date and start_date > end_date:
+            st.sidebar.error("Start date must be <= End date.")
+            st.stop()
 
-# Convert to ISO strings (what your DataConfig expects)
-start_str = start_date.isoformat() if start_date else None
-end_str = end_date.isoformat() if end_date else None
+    # Convert to ISO strings (what your DataConfig expects)
+    start_str = start_date.isoformat() if start_date else None
+    end_str = end_date.isoformat() if end_date else None
 
-with st.sidebar:
-    st.header("Strategy")
+    with st.sidebar:
+        st.header("Strategy")
 
-    strategy_kind = st.selectbox(
-        "Choose strategy",
-        options=["ma_cross", "sma_price"],
-        index=0,
-        help="ma_cross: SMA fast vs SMA slow. sma_price: Close vs SMA(window).",
-    )
+        strategy_kind = st.selectbox(
+            "Choose strategy",
+            options=["ma_cross", "sma_price"],
+            index=0,
+            help="ma_cross: SMA fast vs SMA slow. sma_price: Close vs SMA(window).",
+        )
 
-    allow_short = st.checkbox("Allow short", value=False)
+        allow_short = st.checkbox("Allow short", value=False)
+
+        if strategy_kind == "ma_cross":
+            fast = st.number_input("Fast SMA window", min_value=2, max_value=500, value=20, step=1)
+            slow = st.number_input("Slow SMA window", min_value=3, max_value=500, value=50, step=1)
+            # enforce fast < slow defensively
+            if fast >= slow:
+                st.warning("Fast window must be < Slow window. Adjusting automatically.")
+                fast = min(int(fast), int(slow) - 1)
+
+            # pack params for engine
+            strat_fast = int(fast)
+            strat_slow = int(slow)
+            strat_window = None
+
+        else:  # "sma_price"
+            window = st.number_input("SMA window", min_value=2, max_value=500, value=50, step=1)
+            strat_window = int(window)
+            strat_fast = None
+            strat_slow = None
+
+    nan_policy = "flat"
 
     if strategy_kind == "ma_cross":
-        fast = st.number_input("Fast SMA window", min_value=2, max_value=500, value=20, step=1)
-        slow = st.number_input("Slow SMA window", min_value=3, max_value=500, value=50, step=1)
-        # enforce fast < slow defensively
-        if fast >= slow:
-            st.warning("Fast window must be < Slow window. Adjusting automatically.")
-            fast = min(int(fast), int(slow) - 1)
+        strategy_params = {
+            "fast_window": int(strat_fast),
+            "slow_window": int(strat_slow),
+            "allow_short": bool(allow_short),
+            "nan_policy": nan_policy,
+        }
+    else:
+        strategy_params = {
+            "window": int(strat_window),
+            "allow_short": bool(allow_short),
+            "nan_policy": nan_policy,
+        }
 
-        # pack params for engine
-        strat_fast = int(fast)
-        strat_slow = int(slow)
-        strat_window = None
+    st.sidebar.header("Portfolio")
+    initial_cash = st.sidebar.number_input("Initial cash", min_value=1_000.0, value=1_000_000.0, step=10_000.0)
+    rebalance_policy = st.sidebar.selectbox("Rebalance policy", ["on_change", "every_bar"], index=0)
+    max_gross = st.sidebar.number_input("Max gross exposure", min_value=0.1, value=1.0, step=0.1)
+    cash_buffer = st.sidebar.number_input("Cash buffer", min_value=0.0, max_value=0.5, value=0.0, step=0.01)
+    st.sidebar.header("Sizing")
+    sizing_mode = st.sidebar.selectbox("Sizing mode", ["target_weight", "pct_cash_shares"], index=0)
 
-    else:  # "sma_price"
-        window = st.number_input("SMA window", min_value=2, max_value=500, value=50, step=1)
-        strat_window = int(window)
-        strat_fast = None
-        strat_slow = None
-
-nan_policy = "flat"
-
-if strategy_kind == "ma_cross":
-    strategy_params = {
-        "fast_window": int(strat_fast),
-        "slow_window": int(strat_slow),
-        "allow_short": bool(allow_short),
-        "nan_policy": nan_policy,
-    }
-else:
-    strategy_params = {
-        "window": int(strat_window),
-        "allow_short": bool(allow_short),
-        "nan_policy": nan_policy,
-    }
-
-st.sidebar.header("Portfolio")
-initial_cash = st.sidebar.number_input("Initial cash", min_value=1_000.0, value=1_000_000.0, step=10_000.0)
-rebalance_policy = st.sidebar.selectbox("Rebalance policy", ["on_change", "every_bar"], index=0)
-max_gross = st.sidebar.number_input("Max gross exposure", min_value=0.1, value=1.0, step=0.1)
-cash_buffer = st.sidebar.number_input("Cash buffer", min_value=0.0, max_value=0.5, value=0.0, step=0.01)
-st.sidebar.header("Sizing")
-sizing_mode = st.sidebar.selectbox("Sizing mode", ["target_weight", "pct_cash_shares"], index=0)
-
-buy_pct_cash = st.sidebar.slider("Buy % of cash per entry", 0.01, 1.00, 0.25, 0.01)
-sell_pct_shares = st.sidebar.slider("Sell % of shares per exit", 0.01, 1.00, 1.00, 0.01)
+    buy_pct_cash = st.sidebar.slider("Buy % of cash per entry", 0.01, 1.00, 0.25, 0.01)
+    sell_pct_shares = st.sidebar.slider("Sell % of shares per exit", 0.01, 1.00, 1.00, 0.01)
 
 
-st.sidebar.header("Costs")
-apply_costs = st.sidebar.checkbox("Apply costs", value=False)
-if apply_costs:
-    brokerage_bps = st.sidebar.number_input("Brokerage (bps)", value=60.0, step=1.0)
-    exchange_bps = st.sidebar.number_input("Exchange (bps)", value=10.0, step=1.0)
-    settlement_bps = st.sidebar.number_input("Settlement (bps)", value=20.0, step=1.0)
-    vat_rate = st.sidebar.number_input("VAT rate", value=0.10, step=0.01)
-    slippage_bps = st.sidebar.number_input("Slippage (bps)", value=0.0, step=1.0)
-else:
-    brokerage_bps = exchange_bps = settlement_bps = slippage_bps = 0.0
-    vat_rate = 0.0
-
-st.sidebar.header("Run")
-if mode == "Backtest":
+    st.sidebar.header("Costs")
+    apply_costs = st.sidebar.checkbox("Apply costs", value=False)
+    if apply_costs:
+        brokerage_bps = st.sidebar.number_input("Brokerage (bps)", value=60.0, step=1.0)
+        exchange_bps = st.sidebar.number_input("Exchange (bps)", value=10.0, step=1.0)
+        settlement_bps = st.sidebar.number_input("Settlement (bps)", value=20.0, step=1.0)
+        vat_rate = st.sidebar.number_input("VAT rate", value=0.10, step=0.01)
+        slippage_bps = st.sidebar.number_input("Slippage (bps)", value=0.0, step=1.0)
+    else:
+        brokerage_bps = exchange_bps = settlement_bps = slippage_bps = 0.0
+        vat_rate = 0.0
+    st.sidebar.header("Run")
     run_btn = st.sidebar.button("Run backtest")
-else:
-    run_btn = st.sidebar.button("Run optimization")
 
+if mode == "Optimize":
+    st.sidebar.header("Optimization")
+    search_mode = st.sidebar.selectbox("Search mode", ["random", "grid"], index=0)
+    n_trials = st.sidebar.number_input("Trials (random)", min_value=10, value=200, step=10)
+    top_k = st.sidebar.number_input("Show top K", min_value=5, value=30, step=5)
+    optimize_dates = st.sidebar.checkbox("Optimize date window", value=False)
 
+    st.sidebar.subheader("Select parameters to optimize")
+    # Build a catalog and let the user pick keys
+    cat = default_param_catalog_for_your_app()
+    # Remove strategy.kind unless you really want it tuned
+    cat.pop("strategy.kind", None)
+
+    selectable_keys = list(cat.keys())
+    active_keys = st.sidebar.multiselect(
+        "Active parameters",
+        options=selectable_keys,
+        default=["strategy.fast_window", "strategy.slow_window"] if strategy_kind == "ma_cross" else ["strategy.window"],
+    )
+    st.sidebar.header("Run")
+    run_btn = st.sidebar.button("Run Optimization")
 
 # --------------------------
 # Core runner (cached)
