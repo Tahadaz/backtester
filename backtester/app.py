@@ -912,7 +912,6 @@ with tab_opt:
             seed=int(seed),
             n_trials=int(n_trials) if method == "random" else 0,
             top_k=int(top_k),
-            objective="pnl_then_eff",
         )
 
         with st.spinner("Running optimization..."):
