@@ -13,7 +13,6 @@ import numpy as np
 # adjust import paths if you later package your code under a module folder
 from engine import BacktestEngine, EngineSpec, DataConfig, StrategyConfig, IndicatorsConfig, load_marketdata
 
-StrategyKind = Literal["ma_cross","sma_price", ...]
 
 # ============================================================
 # Types
@@ -536,11 +535,12 @@ def default_param_catalog_for_your_app() -> Dict[str, ParamSpec]:
     cat["strategy.kind"] = ChoiceParam("strategy.kind", ["ma_cross", "sma_price"])
 
     # MA cross windows
-    if strategy_kind == "ma_cross":
-        cat["strategy.fast_window"] = IntRangeParam("strategy.fast_window", 5, 80, step=1)
-        cat["strategy.slow_window"] = IntRangeParam("strategy.slow_window", 20, 200, step=1)
-    else :
-        cat["strategy.window"] = IntRangeParam("strategy.window", 10, 200, step=1)
+    
+    cat["strategy.fast_window"] = IntRangeParam("strategy.fast_window", 5, 80, step=1)
+    cat["strategy.slow_window"] = IntRangeParam("strategy.slow_window", 20, 200, step=1)
+
+    # SMA price window
+    cat["strategy.window"] = IntRangeParam("strategy.window", 10, 200, step=1)
 
     # Portfolio sizing
     cat["portfolio.buy_pct_cash"] = FloatRangeParam("portfolio.buy_pct_cash", 0.05, 1.0, step=0.05)
