@@ -470,24 +470,24 @@ else:
     yf_auto_adjust = st.sidebar.checkbox("auto_adjust", value=False)
 
 
+if mode=="Backtest":
+    st.sidebar.header("Backtest period")
 
-st.sidebar.header("Backtest period")
+    use_date_range = st.sidebar.checkbox("Use date range", value=False)
 
-use_date_range = st.sidebar.checkbox("Use date range", value=False)
+    start_date = None
+    end_date = None
+    if use_date_range:
+        start_date = st.sidebar.date_input("Start date", value=None)
+        end_date = st.sidebar.date_input("End date", value=None)
 
-start_date = None
-end_date = None
-if use_date_range:
-    start_date = st.sidebar.date_input("Start date", value=None)
-    end_date = st.sidebar.date_input("End date", value=None)
-
-    # basic validation
-    if start_date and end_date and start_date > end_date:
-        st.sidebar.error("Start date must be <= End date.")
-        st.stop()
-# Convert to ISO strings (what your DataConfig expects)
-start_str = start_date.isoformat() if start_date else None
-end_str = end_date.isoformat() if end_date else None
+        # basic validation
+        if start_date and end_date and start_date > end_date:
+            st.sidebar.error("Start date must be <= End date.")
+            st.stop()
+    # Convert to ISO strings (what your DataConfig expects)
+    start_str = start_date.isoformat() if start_date else None
+    end_str = end_date.isoformat() if end_date else None
 with st.sidebar:
     st.header("Strategy")
     strategy_kind = st.selectbox(
