@@ -432,8 +432,7 @@ def _eval_one_trial(
     adapter: StrategyAdapter,
     params: Dict[str, Any],
 ) -> TrialResult:
-    stats = port.run_stats_only(md_slice, sf, symbols=symbols)
-    print("DEBUG stats type:", type(stats), "value:", stats)
+
 
     # Validate strategy constraints early (fast<slow, etc.)
     ok, err = adapter.validate_params(params, base_spec)
