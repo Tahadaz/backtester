@@ -432,6 +432,9 @@ def _eval_one_trial(
     adapter: StrategyAdapter,
     params: Dict[str, Any],
 ) -> TrialResult:
+    stats = port.run_stats_only(md_slice, sf, symbols=symbols)
+    print("DEBUG stats type:", type(stats), "value:", stats)
+
     # Validate strategy constraints early (fast<slow, etc.)
     ok, err = adapter.validate_params(params, base_spec)
     if not ok:
@@ -471,16 +474,26 @@ def _eval_one_trial(
         # We must pass MarketData whose bars align with 'index'
         md_slice = _slice_marketdata(md, symbols, index)
 
+        # Try fast-path stats-only if it exists AND actually returns something usable
+        used_fast = False
         if hasattr(port, "run_stats_only"):
-            stats = port.run_stats_only(md_slice, sf, symbols=symbols)  # type: ignore[attr-defined]
-            pnl = float(stats.pnl)
-            traded = float(stats.traded_notional)
-            n_fills = int(stats.n_fills)
-        else:
+            try:
+                stats = port.run_stats_only(md_slice, sf, symbols=symbols)  # type: ignore[attr-defined]
+                if stats is not None and all(hasattr(stats, k) for k in ("pnl", "traded_notional", "n_fills")):
+                    pnl = float(stats.pnl)
+                    traded = float(stats.traded_notional)
+                    n_fills = int(stats.n_fills)
+                    used_fast = True
+            except Exception:
+                used_fast = False
+
+        # Fallback to full portfolio run (always works)
+        if not used_fast:
             pres = port.run(md_slice, sf, symbols=symbols)
             pnl = float(pres.equity_curve.iloc[-1]) - float(port_cfg.initial_cash) if len(pres.equity_curve) else 0.0
-            traded = float(pres.trades["notional"].sum()) if ("notional" in pres.trades.columns) else 0.0
+            traded = float(pres.trades["notional"].sum()) if (not pres.trades.empty and "notional" in pres.trades.columns) else 0.0
             n_fills = int(len(pres.trades))
+
 
         eff = pnl / traded if traded > 0 else float("-inf")
         return TrialResult(params=params, pnl=pnl, traded_notional=traded, efficiency=eff, n_fills=n_fills)
