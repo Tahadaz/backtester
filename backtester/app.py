@@ -497,26 +497,27 @@ with st.sidebar:
         help="ma_cross: SMA fast vs SMA slow. sma_price: Close vs SMA(window).",
     )
     allow_short = st.checkbox("Allow short", value=False)
-    if strategy_kind == "ma_cross":
-        fast = st.number_input("Fast SMA window", min_value=2, max_value=500, value=20, step=1)
-        slow = st.number_input("Slow SMA window", min_value=3, max_value=500, value=50, step=1)
-        # enforce fast < slow defensively
-        if fast >= slow:
-            st.warning("Fast window must be < Slow window. Adjusting automatically.")
-            fast = min(int(fast), int(slow) - 1)
-        # pack params for engine
-        strat_fast = int(fast)
-        strat_slow = int(slow)
-        strat_window = None
-
-    else:  # "sma_price"
-        window = st.number_input("SMA window", min_value=2, max_value=500, value=50, step=1)
-        strat_window = int(window)
-        strat_fast = None
-        strat_slow = None
-
-nan_policy = "flat"
 if mode=="Backtest":
+        if strategy_kind == "ma_cross":
+            fast = st.number_input("Fast SMA window", min_value=2, max_value=500, value=20, step=1)
+            slow = st.number_input("Slow SMA window", min_value=3, max_value=500, value=50, step=1)
+            # enforce fast < slow defensively
+            if fast >= slow:
+                st.warning("Fast window must be < Slow window. Adjusting automatically.")
+                fast = min(int(fast), int(slow) - 1)
+            # pack params for engine
+            strat_fast = int(fast)
+            strat_slow = int(slow)
+            strat_window = None
+
+        else:  # "sma_price"
+            window = st.number_input("SMA window", min_value=2, max_value=500, value=50, step=1)
+            strat_window = int(window)
+            strat_fast = None
+            strat_slow = None
+
+    nan_policy = "flat"
+
     if strategy_kind == "ma_cross":
         strategy_params = {
             "fast_window": int(strat_fast),
