@@ -1,4 +1,5 @@
-# app.py  (Streamlit entrypoint)
+# app.py (Streamlit entrypoint)
+
 from __future__ import annotations
 
 import os
@@ -9,26 +10,26 @@ from typing import Optional, Dict, Any, List, Tuple
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-import plotly.graph_objects as go
 
+# Your project imports
 from engine import BacktestEngine, EngineSpec, DataConfig, IndicatorsConfig, StrategyConfig
 from portfolio import PortfolioConfig, CostModel
 
 from optimize import (
-    default_param_catalog_for_your_app,
-    run_optimization,
     OptimizeConfig,
-    build_date_window_choices_from_uploaded_bmce,
-    add_date_window_param,
+    TrialResult,
+    ParamDef,
+    default_param_catalog_for_strategy,
+    run_optimization,
 )
 
-# --------------------------
-# Page config
-# --------------------------
 st.set_page_config(page_title="Backtester", layout="wide")
-st.title("Backtester (TA) — Data → Indicators → Strategy → Portfolio → Results")
+st.title("Backtester (TA) — Backtest / Optimize")
+
+
+# ============================================================
+# Rendering (keep your current rendering block)
+# ============================================================
 
 # ============================================================
 # Plotting helpers
@@ -382,8 +383,10 @@ def render_bundle(bundle):
         st.write("Signals head:")
         st.dataframe(bundle.signals.signals.head(10), use_container_width=True)
 
+
+
 # ============================================================
-# Spec builder (single source of truth)
+# Spec builder
 # ============================================================
 def make_base_spec(
     source_key: str,
@@ -405,12 +408,9 @@ def make_base_spec(
     buy_pct_cash: float,
     sell_pct_shares: float,
     cooldown_bars: int,
-    brokerage_bps: float,
-    exchange_bps: float,
-    settlement_bps: float,
-    vat_rate: float,
-    slippage_bps: float,
+    cost_model: CostModel,
 ) -> EngineSpec:
+    # Data
     if source_key == "bmce":
         data_cfg = DataConfig(
             source="bmce",
@@ -434,18 +434,13 @@ def make_base_spec(
             yf_auto_adjust=bool(yf_auto_adjust),
         )
 
+    # Strategy
     strat_cfg = StrategyConfig(kind=strategy_kind, params=dict(strategy_params or {}))
+
+    # Indicators
     ind_cfg = IndicatorsConfig(specs=None)
 
-    cost_model = CostModel(
-        brokerage_bps=float(brokerage_bps),
-        exchange_bps=float(exchange_bps),
-        settlement_bps=float(settlement_bps),
-        slippage_bps=float(slippage_bps),
-        vat_rate=float(vat_rate),
-    )
-
-    # IMPORTANT: this assumes you add cooldown_bars into PortfolioConfig
+    # Portfolio
     port_cfg = PortfolioConfig(
         allow_short=bool(allow_short),
         initial_cash=float(initial_cash),
@@ -466,46 +461,92 @@ def make_base_spec(
         rf_annual=0.0,
     )
 
+
+def apply_best_params_to_spec(base_spec: EngineSpec, best_params: Dict[str, Any]) -> EngineSpec:
+    """
+    Applies best_params (keys like strategy.fast_window, portfolio.buy_pct_cash, data.window, ...)
+    and returns a NEW EngineSpec.
+    """
+    # --- data ---
+    data_cfg = base_spec.data
+    if "data.window" in best_params and best_params["data.window"] is not None:
+        start, end = best_params["data.window"]
+        data_cfg = type(data_cfg)(**{**data_cfg.__dict__, "start": start, "end": end})
+
+    # --- strategy ---
+    strat_cfg = base_spec.strategy
+    p = dict(strat_cfg.params or {})
+    if "strategy.fast_window" in best_params:
+        p["fast_window"] = int(best_params["strategy.fast_window"])
+    if "strategy.slow_window" in best_params:
+        p["slow_window"] = int(best_params["strategy.slow_window"])
+    if "strategy.window" in best_params:
+        p["window"] = int(best_params["strategy.window"])
+    strat_cfg = StrategyConfig(kind=strat_cfg.kind, params=p)
+
+    # --- portfolio ---
+    port_cfg = base_spec.portfolio
+    pdict = dict(port_cfg.__dict__)
+    if "portfolio.buy_pct_cash" in best_params:
+        pdict["buy_pct_cash"] = float(best_params["portfolio.buy_pct_cash"])
+    if "portfolio.sell_pct_shares" in best_params:
+        pdict["sell_pct_shares"] = float(best_params["portfolio.sell_pct_shares"])
+    if "portfolio.cooldown_bars" in best_params:
+        pdict["cooldown_bars"] = int(best_params["portfolio.cooldown_bars"])
+    port_cfg = type(port_cfg)(**pdict)
+
+    return EngineSpec(
+        data=data_cfg,
+        indicators=base_spec.indicators,
+        strategy=strat_cfg,
+        portfolio=port_cfg,
+        periods_per_year=base_spec.periods_per_year,
+        rf_annual=base_spec.rf_annual,
+    )
+
+
 # ============================================================
-# Strategy param widgets (baseline values)
+# BMCE window generator (for optimizing data.window)
 # ============================================================
-def strategy_param_widgets(strategy_kind: str) -> Dict[str, Any]:
-    nan_policy = "flat"
+def build_date_windows_from_df(
+    df: pd.DataFrame,
+    date_col_candidates=("Date", "date", "timestamp", "Datetime", "DATE"),
+    min_bars: int = 252,
+    step_bars: int = 21,
+    max_windows: int = 200,
+) -> List[Tuple[str, str]]:
+    # find date col
+    date_col = None
+    for c in date_col_candidates:
+        if c in df.columns:
+            date_col = c
+            break
+    if date_col is None:
+        # fallback: first column
+        date_col = df.columns[0]
 
-    if strategy_kind == "ma_cross":
-        fast = st.sidebar.number_input("Fast SMA window", min_value=2, max_value=500, value=20, step=1)
-        slow = st.sidebar.number_input("Slow SMA window", min_value=3, max_value=500, value=50, step=1)
-        if fast >= slow:
-            st.sidebar.warning("Fast must be < Slow; adjusting slow.")
-            slow = int(fast) + 1
+    dts = pd.to_datetime(df[date_col], errors="coerce")
+    dts = dts.dropna().sort_values().reset_index(drop=True)
+    if len(dts) < min_bars:
+        return []
 
-        return {
-            "fast_window": int(fast),
-            "slow_window": int(slow),
-            "nan_policy": nan_policy,
-        }
-
-    # sma_price
-    window = st.sidebar.number_input("SMA window", min_value=2, max_value=500, value=50, step=1)
-    return {
-        "window": int(window),
-        "nan_policy": nan_policy,
-    }
-
-def strategy_keys_for_kind(kind: str, keys: List[str]) -> List[str]:
-    """Filter catalog keys to those relevant to the chosen strategy."""
     out = []
-    for k in keys:
-        if not k.startswith("strategy."):
-            continue
-        if kind == "ma_cross" and k in ("strategy.fast_window", "strategy.slow_window"):
-            out.append(k)
-        if kind == "sma_price" and k in ("strategy.window",):
-            out.append(k)
+    start = 0
+    while True:
+        end = start + min_bars - 1
+        if end >= len(dts):
+            break
+        s = dts.iloc[start].date().isoformat()
+        e = dts.iloc[end].date().isoformat()
+        out.append((s, e))
+        if len(out) >= max_windows:
+            break
+        start += step_bars
     return out
 
+
 # ============================================================
-# Sidebar: Mode + Data + Strategy + Portfolio (shared)
+# Sidebar: common (data + strategy are shared)
 # ============================================================
 st.sidebar.header("Mode")
 mode = st.sidebar.radio("Choose mode", ["Backtest", "Optimize"], index=0)
@@ -530,149 +571,196 @@ else:
     yf_interval = st.sidebar.selectbox("yfinance interval", ["1d"], index=0)
     yf_auto_adjust = st.sidebar.checkbox("auto_adjust", value=False)
 
-# Date range baseline exists for BOTH modes (needed if you optimize it)
-st.sidebar.header("Backtest period (baseline)")
-use_date_range = st.sidebar.checkbox("Use date range", value=False)
-start_str = end_str = None
-if use_date_range:
-    start_date = st.sidebar.date_input("Start date", value=None)
-    end_date = st.sidebar.date_input("End date", value=None)
-    if start_date and end_date and start_date > end_date:
-        st.sidebar.error("Start date must be <= End date.")
-        st.stop()
-    start_str = start_date.isoformat() if start_date else None
-    end_str = end_date.isoformat() if end_date else None
-
 st.sidebar.header("Strategy")
-strategy_kind = st.sidebar.selectbox(
-    "Choose strategy",
-    options=["ma_cross", "sma_price"],
-    index=0,
-)
-
+strategy_kind = st.sidebar.selectbox("Strategy kind", ["ma_cross", "sma_price"], index=0)
 allow_short = st.sidebar.checkbox("Allow short", value=False)
 
-# Baseline strategy params (used in Backtest; used as baseline in Optimize too)
-st.sidebar.subheader("Strategy params (baseline)")
-baseline_sp = strategy_param_widgets(strategy_kind)
-baseline_sp["allow_short"] = bool(allow_short)
-
-st.sidebar.header("Portfolio")
-initial_cash = st.sidebar.number_input("Initial cash", min_value=1_000.0, value=1_000_000.0, step=10_000.0)
-rebalance_policy = st.sidebar.selectbox("Rebalance policy", ["on_change", "every_bar"], index=0)
-
-st.sidebar.header("Sizing (baseline)")
-sizing_mode = st.sidebar.selectbox("Sizing mode", ["target_weight", "pct_cash_shares"], index=1)
-buy_pct_cash = st.sidebar.slider("Buy % of cash per entry", 0.01, 1.00, 0.25, 0.01)
-sell_pct_shares = st.sidebar.slider("Sell % of shares per exit", 0.01, 1.00, 1.00, 0.01)
-
-# Cooldown bars (min bars between trades) — requires portfolio.py change
-st.sidebar.header("Trade throttling")
-cooldown_bars = st.sidebar.number_input("Min bars between trades", min_value=0, value=0, step=1)
-
-st.sidebar.header("Costs")
-apply_costs = st.sidebar.checkbox("Apply costs", value=False)
-if apply_costs:
-    brokerage_bps = st.sidebar.number_input("Brokerage (bps)", value=60.0, step=1.0)
-    exchange_bps = st.sidebar.number_input("Exchange (bps)", value=10.0, step=1.0)
-    settlement_bps = st.sidebar.number_input("Settlement (bps)", value=20.0, step=1.0)
-    vat_rate = st.sidebar.number_input("VAT rate", value=0.10, step=0.01)
-    slippage_bps = st.sidebar.number_input("Slippage (bps)", value=0.0, step=1.0)
-else:
-    brokerage_bps = exchange_bps = settlement_bps = slippage_bps = 0.0
-    vat_rate = 0.0
 
 # ============================================================
-# Sidebar: Optimize-specific controls
+# Backtest mode controls (ONLY shown in Backtest mode)
 # ============================================================
-opt_cfg = None
-catalog = None
-active_keys = None
-top_k = None
+start_str = end_str = None
+strategy_params: Dict[str, Any] = {}
 
-if mode == "Optimize":
-    st.sidebar.header("Optimization")
+if mode == "Backtest":
+    st.sidebar.header("Backtest period")
+    use_date_range = st.sidebar.checkbox("Use date range", value=False)
+    if use_date_range:
+        start_date = st.sidebar.date_input("Start date", value=None)
+        end_date = st.sidebar.date_input("End date", value=None)
+        if start_date and end_date and start_date > end_date:
+            st.sidebar.error("Start date must be <= End date.")
+            st.stop()
+        start_str = start_date.isoformat() if start_date else None
+        end_str = end_date.isoformat() if end_date else None
 
-    # 1) choose what to optimize
-    catalog = default_param_catalog_for_your_app()
-    # optionally remove strategy.kind if present
-    catalog.pop("strategy.kind", None)
+    st.sidebar.subheader("Strategy parameters")
+    nan_policy = "flat"
 
-    st.sidebar.subheader("Select parameters to optimize")
+    if strategy_kind == "ma_cross":
+        fast = st.sidebar.number_input("Fast SMA window", min_value=2, max_value=500, value=20, step=1)
+        slow = st.sidebar.number_input("Slow SMA window", min_value=3, max_value=500, value=50, step=1)
+        if fast >= slow:
+            st.sidebar.warning("Fast must be < Slow. Adjusting fast automatically.")
+            fast = min(int(fast), int(slow) - 1)
+        strategy_params = {"fast_window": int(fast), "slow_window": int(slow), "allow_short": bool(allow_short), "nan_policy": nan_policy}
+    else:
+        window = st.sidebar.number_input("SMA window", min_value=2, max_value=500, value=50, step=1)
+        strategy_params = {"window": int(window), "allow_short": bool(allow_short), "nan_policy": nan_policy}
 
-    # show only relevant strategy params + portfolio/data params
-    all_keys = list(catalog.keys())
+    st.sidebar.header("Portfolio")
+    initial_cash = st.sidebar.number_input("Initial cash", min_value=1_000.0, value=1_000_000.0, step=10_000.0)
+    rebalance_policy = st.sidebar.selectbox("Rebalance policy", ["on_change", "every_bar"], index=0)
+    sizing_mode = st.sidebar.selectbox("Sizing mode", ["target_weight", "pct_cash_shares"], index=0)
+    cooldown_bars = st.sidebar.number_input("Min bars between trades (cooldown)", min_value=0, value=0, step=1)
 
-    strategy_keys = strategy_keys_for_kind(strategy_kind, all_keys)
-    non_strategy_keys = [k for k in all_keys if not k.startswith("strategy.")]
-    selectable = strategy_keys + non_strategy_keys
+    st.sidebar.header("Sizing")
+    buy_pct_cash = st.sidebar.slider("Buy % of cash per entry", 0.01, 1.00, 0.25, 0.01)
+    sell_pct_shares = st.sidebar.slider("Sell % of shares per exit", 0.01, 1.00, 1.00, 0.01)
 
-    # default selection: relevant strategy windows
-    default_sel = strategy_keys if strategy_keys else []
+    st.sidebar.header("Costs")
+    apply_costs = st.sidebar.checkbox("Apply costs", value=False)
+    if apply_costs:
+        brokerage_bps = st.sidebar.number_input("Brokerage (bps)", value=60.0, step=1.0)
+        exchange_bps = st.sidebar.number_input("Exchange (bps)", value=10.0, step=1.0)
+        settlement_bps = st.sidebar.number_input("Settlement (bps)", value=20.0, step=1.0)
+        vat_rate = st.sidebar.number_input("VAT rate", value=0.10, step=0.01)
+        slippage_bps = st.sidebar.number_input("Slippage (bps)", value=0.0, step=1.0)
+    else:
+        brokerage_bps = exchange_bps = settlement_bps = slippage_bps = 0.0
+        vat_rate = 0.0
 
-    active_keys = st.sidebar.multiselect(
-        "Active parameters",
-        options=selectable,
-        default=default_sel,
-    )
-
-    # allow date window optimization (BMCE only, because we can compute windows from uploaded file)
-    optimize_dates = st.sidebar.checkbox("Optimize date window (BMCE only)", value=False)
-
-    # 2) choose search mode + show only that mode’s parameters
-    st.sidebar.subheader("Search mode")
-    search_mode = st.sidebar.selectbox("Mode", ["random", "grid", "wfo"], index=0)
-
-    # mode-specific params
-    seed = st.sidebar.number_input("Seed", min_value=0, value=42, step=1)
-    if search_mode == "random":
-        n_trials = st.sidebar.number_input("Trials", min_value=10, value=200, step=10)
-        grid_max_combos = None
-        wfo_train_bars = wfo_test_bars = wfo_step_bars = None
-    elif search_mode == "grid":
-        # depends on how you implemented grid in optimize.py
-        n_trials = None
-        grid_max_combos = st.sidebar.number_input("Max grid combinations", min_value=10, value=500, step=10)
-        wfo_train_bars = wfo_test_bars = wfo_step_bars = None
-    else:  # wfo
-        # requires optimize.py implementation
-        n_trials = None
-        grid_max_combos = None
-        wfo_train_bars = st.sidebar.number_input("Train bars", min_value=50, value=252, step=10)
-        wfo_test_bars = st.sidebar.number_input("Test bars", min_value=10, value=63, step=1)
-        wfo_step_bars = st.sidebar.number_input("Step bars", min_value=1, value=21, step=1)
-
-    # 3) top-k results
-    top_k = st.sidebar.number_input("Show top K", min_value=5, value=30, step=5)
-
-    # objective fixed to your request:
-    #  - primary: pnl
-    #  - secondary: profit/volume (efficiency)
-    opt_cfg = OptimizeConfig(
-        mode=search_mode,
-        n_trials=int(n_trials) if n_trials is not None else None,
-        top_k=int(top_k),
-        seed=int(seed),
-        objective="pnl_then_efficiency",
-        grid_max_combos=int(grid_max_combos) if grid_max_combos is not None else None,
-        wfo_train_bars=int(wfo_train_bars) if wfo_train_bars is not None else None,
-        wfo_test_bars=int(wfo_test_bars) if wfo_test_bars is not None else None,
-        wfo_step_bars=int(wfo_step_bars) if wfo_step_bars is not None else None,
-        verbose=False,
-    )
-
-    run_btn = st.sidebar.button("Run Optimization")
-
-else:
     run_btn = st.sidebar.button("Run backtest")
 
+
 # ============================================================
-# Main page: Data preview + run
+# Optimize mode controls (ONLY shown in Optimize mode)
 # ============================================================
+if mode == "Optimize":
+    # We still need baseline values for non-optimized params.
+    # Keep them tucked into an expander so the sidebar stays “optimization-only”.
+    with st.sidebar.expander("Fixed baseline (used when NOT optimized)", expanded=False):
+        initial_cash = st.number_input("Initial cash", min_value=1_000.0, value=1_000_000.0, step=10_000.0)
+        rebalance_policy = st.selectbox("Rebalance policy", ["on_change", "every_bar"], index=0)
+        sizing_mode = st.selectbox("Sizing mode", ["target_weight", "pct_cash_shares"], index=0)
+
+        # baseline defaults (will be overridden if you optimize them)
+        buy_pct_cash = st.slider("Baseline buy % cash", 0.01, 1.00, 0.25, 0.01)
+        sell_pct_shares = st.slider("Baseline sell % shares", 0.01, 1.00, 1.00, 0.01)
+        cooldown_bars = st.number_input("Baseline cooldown_bars", min_value=0, value=0, step=1)
+
+        # baseline strategy params
+        nan_policy = "flat"
+        if strategy_kind == "ma_cross":
+            fast0 = st.number_input("Baseline fast_window", min_value=2, max_value=500, value=20, step=1)
+            slow0 = st.number_input("Baseline slow_window", min_value=3, max_value=500, value=50, step=1)
+            if fast0 >= slow0:
+                st.warning("Baseline fast must be < slow. Adjusting fast.")
+                fast0 = min(int(fast0), int(slow0) - 1)
+            strategy_params = {"fast_window": int(fast0), "slow_window": int(slow0), "allow_short": bool(allow_short), "nan_policy": nan_policy}
+        else:
+            w0 = st.number_input("Baseline window", min_value=2, max_value=500, value=50, step=1)
+            strategy_params = {"window": int(w0), "allow_short": bool(allow_short), "nan_policy": nan_policy}
+
+        apply_costs = st.checkbox("Apply costs", value=False)
+        if apply_costs:
+            brokerage_bps = st.number_input("Brokerage (bps)", value=60.0, step=1.0)
+            exchange_bps = st.number_input("Exchange (bps)", value=10.0, step=1.0)
+            settlement_bps = st.number_input("Settlement (bps)", value=20.0, step=1.0)
+            vat_rate = st.number_input("VAT rate", value=0.10, step=0.01)
+            slippage_bps = st.number_input("Slippage (bps)", value=0.0, step=1.0)
+        else:
+            brokerage_bps = exchange_bps = settlement_bps = slippage_bps = 0.0
+            vat_rate = 0.0
+
+    # Optimization selectors
+    st.sidebar.header("Optimization targets")
+    catalog = default_param_catalog_for_strategy(strategy_kind)
+    selectable_keys = list(catalog.keys())
+
+    active_keys = st.sidebar.multiselect(
+        "Select parameters to optimize",
+        options=selectable_keys,
+        default=["strategy.fast_window", "strategy.slow_window"] if strategy_kind == "ma_cross" else ["strategy.window"],
+    )
+
+    # Interval per selected parameter (your request)
+    st.sidebar.subheader("Intervals for selected parameters")
+    for k in active_keys:
+        pdef: ParamDef = catalog[k]
+        st.sidebar.markdown(f"**{k}**")
+
+        if pdef.kind == "int":
+            lo, hi, step = pdef.domain
+            c1, c2, c3 = st.sidebar.columns(3)
+            lo2 = c1.number_input(f"{k} min", value=int(lo), step=1, key=f"{k}_min")
+            hi2 = c2.number_input(f"{k} max", value=int(hi), step=1, key=f"{k}_max")
+            step2 = c3.number_input(f"{k} step", value=int(step), step=1, key=f"{k}_step")
+            if lo2 > hi2:
+                st.sidebar.error(f"{k}: min must be <= max")
+                st.stop()
+            pdef.domain = (int(lo2), int(hi2), int(step2))
+
+        elif pdef.kind == "float":
+            lo, hi, step = pdef.domain
+            c1, c2, c3 = st.sidebar.columns(3)
+            lo2 = c1.number_input(f"{k} min", value=float(lo), step=0.01, key=f"{k}_min")
+            hi2 = c2.number_input(f"{k} max", value=float(hi), step=0.01, key=f"{k}_max")
+            step2 = c3.number_input(f"{k} step", value=float(step), step=0.01, key=f"{k}_step")
+            if lo2 > hi2:
+                st.sidebar.error(f"{k}: min must be <= max")
+                st.stop()
+            pdef.domain = (float(lo2), float(hi2), float(step2))
+
+        elif pdef.kind == "choice":
+            choices = list(pdef.domain)
+            picked = st.sidebar.multiselect(f"{k} choices", choices, default=choices, key=f"{k}_choices")
+            pdef.domain = picked
+
+        elif pdef.kind == "date_window":
+            # only makes sense for BMCE uploads in your workflow
+            if source_key != "bmce":
+                st.sidebar.warning("data.window optimization is intended for BMCE uploads.")
+                pdef.domain = []
+            else:
+                min_bars = st.sidebar.number_input("min bars per window", min_value=30, value=252, step=21, key="dw_min_bars")
+                step_bars = st.sidebar.number_input("step bars", min_value=1, value=21, step=1, key="dw_step_bars")
+                max_windows = st.sidebar.number_input("max windows", min_value=10, value=200, step=10, key="dw_max_windows")
+                # domain filled later after file preview is loaded (we’ll compute after reading bmce_file)
+
+        catalog[k] = pdef  # update
+
+
+    st.sidebar.header("Optimization method")
+    method = st.sidebar.selectbox("Method", ["random", "grid", "wfo"], index=0)
+    seed = st.sidebar.number_input("Seed", min_value=0, value=42, step=1)
+    top_k = st.sidebar.number_input("Show top K", min_value=5, value=30, step=5)
+
+    # Method-specific controls
+    if method == "random":
+        n_trials = st.sidebar.number_input("Trials", min_value=10, value=200, step=10)
+        wfo_train_bars = wfo_test_bars = wfo_step_bars = None
+    elif method == "grid":
+        n_trials = 0
+        wfo_train_bars = wfo_test_bars = wfo_step_bars = None
+    else:  # wfo
+        n_trials = st.sidebar.number_input("Trials per fold (random search)", min_value=10, value=200, step=10)
+        wfo_train_bars = st.sidebar.number_input("Train bars", min_value=100, value=504, step=21)
+        wfo_test_bars = st.sidebar.number_input("Test bars", min_value=20, value=63, step=21)
+        wfo_step_bars = st.sidebar.number_input("Step bars", min_value=10, value=63, step=21)
+
+    run_btn = st.sidebar.button("Run optimization")
+
+
+# ============================================================
+# Main page: BMCE preview (shared)
+# ============================================================
+preview_df = None
+
 if source_key == "bmce":
     st.subheader("BMCE upload")
     if bmce_file is None:
-        st.info("Upload a BMCE CSV/XLSX then click Run.")
+        st.info("Upload a BMCE CSV/XLSX.")
         st.stop()
 
     try:
@@ -681,24 +769,26 @@ if source_key == "bmce":
         else:
             preview_df = pd.read_excel(bmce_file, engine="openpyxl")
         st.caption("File preview (first rows)")
-        st.dataframe(preview_df.head(20), use_container_width=True)
+        st.dataframe(preview_df.head(30), use_container_width=True)
     except Exception as e:
         st.error(f"Could not preview file: {e}")
+        st.stop()
 else:
     st.subheader("yfinance mode")
     st.caption("This requires `yfinance` in requirements.txt. BMCE is recommended for your desk data.")
 
+
 if not run_btn:
     st.stop()
+
 
 # ============================================================
 # Run (Backtest or Optimize)
 # ============================================================
 tmp_path = None
 tmp_dir = None
-
 try:
-    # Prepare tmp upload file path for BMCE
+    # Save uploaded BMCE to a temp file so the engine can read it
     if source_key == "bmce":
         suffix = Path(bmce_file.name).suffix.lower()
         tmp_dir = tempfile.mkdtemp(prefix="bmce_upload_")
@@ -706,10 +796,31 @@ try:
         with open(tmp_path, "wb") as f:
             f.write(bmce_file.getbuffer())
 
-    # Baseline strategy params
-    strategy_params = dict(baseline_sp)
+        # If in optimize mode and data.window is selected, build windows now
+        if mode == "Optimize" and "data.window" in active_keys:
+            windows = build_date_windows_from_df(
+                preview_df,
+                min_bars=int(st.session_state.get("dw_min_bars", 252)),
+                step_bars=int(st.session_state.get("dw_step_bars", 21)),
+                max_windows=int(st.session_state.get("dw_max_windows", 200)),
+            )
+            if not windows:
+                st.warning("Could not build any date windows (maybe too few bars). Removing data.window from optimization.")
+                active_keys = [k for k in active_keys if k != "data.window"]
+            else:
+                catalog["data.window"].domain = windows
+                st.sidebar.caption(f"Generated {len(windows)} windows for data.window.")
 
-    # Build base spec
+    # Cost model (shared)
+    cost_model = CostModel(
+        brokerage_bps=float(brokerage_bps),
+        exchange_bps=float(exchange_bps),
+        settlement_bps=float(settlement_bps),
+        slippage_bps=float(slippage_bps),
+        vat_rate=float(vat_rate),
+    )
+
+    # Base spec
     base_spec = make_base_spec(
         source_key=source_key,
         symbol=symbol,
@@ -730,11 +841,7 @@ try:
         buy_pct_cash=float(buy_pct_cash),
         sell_pct_shares=float(sell_pct_shares),
         cooldown_bars=int(cooldown_bars),
-        brokerage_bps=float(brokerage_bps),
-        exchange_bps=float(exchange_bps),
-        settlement_bps=float(settlement_bps),
-        vat_rate=float(vat_rate),
-        slippage_bps=float(slippage_bps),
+        cost_model=cost_model,
     )
 
     if mode == "Backtest":
@@ -743,53 +850,43 @@ try:
         render_bundle(bundle)
 
     else:
-        # Optimization mode
-        if catalog is None or active_keys is None or opt_cfg is None:
-            st.error("Optimization UI state missing. Reload and try again.")
-            st.stop()
-
-        # Date window optimization: BMCE only
-        if optimize_dates:
-            if source_key != "bmce":
-                st.warning("Date window optimization is supported for BMCE uploads only.")
-            else:
-                windows = build_date_window_choices_from_uploaded_bmce(
-                    base_data_cfg=base_spec.data,
-                    symbol=symbol,
-                    min_bars=252,
-                    step_bars=21,
-                    max_windows=200,
-                )
-                add_date_window_param(catalog, windows)
-                if "data.window" not in active_keys:
-                    active_keys = list(active_keys) + ["data.window"]
+        opt_cfg = OptimizeConfig(
+            method=method,
+            seed=int(seed),
+            n_trials=int(n_trials) if method in ("random", "wfo") else 0,
+            top_k=int(top_k),
+            objective="pnl_then_eff",
+            wfo_train_bars=int(wfo_train_bars) if method == "wfo" else 0,
+            wfo_test_bars=int(wfo_test_bars) if method == "wfo" else 0,
+            wfo_step_bars=int(wfo_step_bars) if method == "wfo" else 0,
+        )
 
         with st.spinner("Running optimization..."):
-            best, top_df, best_spec = run_optimization(
+            best, top_df, best_params = run_optimization(
                 base_spec=base_spec,
-                catalog=catalog,
                 active_keys=active_keys,
+                catalog=catalog,
                 cfg=opt_cfg,
             )
 
         st.subheader("Optimization results")
         st.json({
-            "objective": "pnl_then_efficiency",
-            "best_pnl": best.pnl,
-            "best_traded_notional": best.traded_notional,
-            "best_profit_per_notional": best.efficiency,
-            "best_params": best.params,
+            "pnl": best.pnl,
+            "traded_notional": best.traded_notional,
+            "profit_per_notional": best.efficiency,
+            "params": best.params,
+            "error": best.error,
         })
         st.dataframe(top_df, use_container_width=True)
 
         st.divider()
-        if st.button("Run best configuration (render full report)"):
+        if st.button("Run best configuration backtest"):
+            best_spec = apply_best_params_to_spec(base_spec, best.params)
             with st.spinner("Running best backtest..."):
                 bundle = BacktestEngine(best_spec).run()
             render_bundle(bundle)
 
 finally:
-    # Cleanup temp file
     if tmp_path and os.path.exists(tmp_path):
         try:
             os.remove(tmp_path)
