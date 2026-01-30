@@ -130,7 +130,7 @@ def plot_price_indicators_trades_plotly(
                     mode="text",
                     text="BUY",
                     name="BUY",
-                    textposition="center",
+                    textposition="bottom center",
                     textfont=dict(size=7, color ="#1C60E9"),
                 )
             )
