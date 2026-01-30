@@ -128,7 +128,7 @@ def plot_price_indicators_trades_plotly(
                     x=buys["timestamp"],
                     y=buys["y_plot"],
                     mode="text",
-                    text="BUY"
+                    text="BUY",
                     name="BUY",
                     textposition="center"
                     textfont=dict(size=7, color ="#1C60E9"),
