@@ -516,21 +516,21 @@ if mode=="Backtest":
             strat_fast = None
             strat_slow = None
 
-    nan_policy = "flat"
+        nan_policy = "flat"
 
-    if strategy_kind == "ma_cross":
-        strategy_params = {
-            "fast_window": int(strat_fast),
-            "slow_window": int(strat_slow),
-            "allow_short": bool(allow_short),
-            "nan_policy": nan_policy,
-        }
-    else:
-        strategy_params = {
-            "window": int(strat_window),
-            "allow_short": bool(allow_short),
-            "nan_policy": nan_policy,
-        }
+        if strategy_kind == "ma_cross":
+            strategy_params = {
+                "fast_window": int(strat_fast),
+                "slow_window": int(strat_slow),
+                "allow_short": bool(allow_short),
+                "nan_policy": nan_policy,
+            }
+        else:
+            strategy_params = {
+                "window": int(strat_window),
+                "allow_short": bool(allow_short),
+                "nan_policy": nan_policy,
+            }
 
 st.sidebar.header("Portfolio")
 initial_cash = st.sidebar.number_input("Initial cash", min_value=1_000.0, value=1_000_000.0, step=10_000.0)
