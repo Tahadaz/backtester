@@ -126,13 +126,73 @@ def info_popover(explain_key: str):
         if e.get("notes"):
             st.caption(e["notes"])
 
-def plot_with_info(title: str, explain_key: str, fig):
-    c1, c2 = st.columns([10, 1], vertical_alignment="center")
-    with c1:
+import plotly.graph_objects as go
+
+INFO = {
+    # plots
+    "plot.cum_returns": (
+        "Cumulative return:  (Π_t (1+r_t)) - 1.\n"
+        "Shows compounded growth of equity. Compare to benchmark to judge added value.\n"
+        "Benchmark series is aligned by date and forward-filled."
+    ),
+    "plot.drawdown": (
+        "Drawdown: DD_t = Equity_t / max_{u≤t}(Equity_u) - 1.\n"
+        "Measures peak-to-trough decline (risk / pain). More negative = worse."
+    ),
+    # pnl
+    "metric.gross_pnl": (
+        "Gross PnL (per bar): ΔEquity_t = Equity_t - Equity_{t-1}.\n"
+        "This is currency PnL before attributing per-trade costs in a ledger sense."
+    ),
+    "metric.net_pnl": (
+        "Net PnL: Gross PnL minus transaction costs (commissions, VAT, slippage).\n"
+        "Used to assess realism when costs are enabled."
+    ),
+    # trade ledger
+    "ledger.return_pct": (
+        "Trade return %: net_pnl / entry_notional.\n"
+        "Normalizes PnL by capital deployed to compare trades across sizes."
+    ),
+    "trade.profit_factor": (
+        "Profit Factor = (sum of winning trade net PnL) / |sum of losing trade net PnL|.\n"
+        ">1 means wins outweigh losses; higher is better."
+    ),
+    # optimization
+    "opt.pnl": "Optimization PnL: final_equity - initial_cash.",
+    "opt.traded_notional": "Traded notional: Σ |qty|×price across fills (activity / turnover proxy).",
+    "opt.efficiency": (
+        "Efficiency = PnL / traded_notional.\n"
+        "Secondary objective after PnL: prefers profit per unit of turnover."
+    ),
+    "opt.n_fills": "Number of fills executed (proxy for trade frequency).",
+}
+
+def plot_with_info(title: str, info_key: str, fig, *, key: str, use_container_width: bool = True) -> None:
+    """
+    Render a plot with a small hover tooltip (ⓘ).
+    Works for matplotlib Figure and plotly Figure.
+    """
+    help_txt = INFO.get(info_key, "No explanation available.")
+
+    h1, h2 = st.columns([0.92, 0.08])
+    with h1:
         st.subheader(title)
-    with c2:
-        info_popover(explain_key)
-    st.pyplot(fig)
+    with h2:
+        # hover tooltip:
+        st.button("ⓘ", key=f"help_{key}", help=help_txt)
+
+    if fig is None:
+        st.info("No data to plot.")
+        return
+
+    # Plotly
+    if isinstance(fig, go.Figure):
+        st.plotly_chart(fig, use_container_width=use_container_width)
+        return
+
+    # Matplotlib fallback
+    st.pyplot(fig, use_container_width=use_container_width, clear_figure=False)
+
 
 def table_with_info(title: str, explain_key: str, df: pd.DataFrame):
     c1, c2 = st.columns([10, 1], vertical_alignment="center")
