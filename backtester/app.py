@@ -6,11 +6,11 @@ import os
 import tempfile
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
-
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
-
+import plotly
 # Your project imports
 from engine import BacktestEngine, EngineSpec, DataConfig, IndicatorsConfig, StrategyConfig
 from portfolio import PortfolioConfig, CostModel

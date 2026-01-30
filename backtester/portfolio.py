@@ -31,6 +31,12 @@ RebalancePolicy = Literal["on_change", "every_bar"]
 FillPriceModel = Literal["next_open"]  # extend later: "next_close", "vwap", "mid", etc.
 MarkToMarketModel = Literal["close_t1"]  # your choice: close(t+1)
 
+@dataclass(frozen=True)
+class PortfolioStats:
+    final_equity: float
+    pnl: float
+    traded_notional: float
+    n_fills: int
 
 @dataclass(frozen=True)
 class CostModel:
@@ -218,7 +224,7 @@ class PortfolioEngine:
 
         last_trade_i: Dict[str, int] = {s: -10**9 for s in symbols}  # bar index of last executed trade per symbol
         cooldown = int(getattr(self.cfg, "cooldown_bars", 0) or 0)
-        
+
         # iterate up to second last timestamp because we fill at t+1
         for i in range(len(idx) - 1):
             t = pd.Timestamp(idx[i])
@@ -342,6 +348,96 @@ class PortfolioEngine:
             trades=trades,
             meta=meta,
         )
+    def run_stats_only(
+            self,
+            market_data: Any,
+            signal_frame: Any,
+            symbols: Optional[Sequence[str]] = None,
+        ) -> PortfolioStats:
+            """
+            Fast path for optimization:
+            - No trades DF
+            - No positions DF
+            - No equity curve
+            Returns only final equity, pnl, traded_notional, n_fills.
+
+            Assumes same t+1 semantics as run():
+            decide at t, execute at open(t+1), MTM at close(t+1).
+            """
+            symbols = list(symbols) if symbols is not None else list(signal_frame.signals.columns)
+            if len(symbols) != 1:
+                # You can implement multi-symbol later; most optimization is single asset.
+                # For now, fall back to full run() then compute stats.
+                pres = self.run(market_data, signal_frame, symbols=symbols)
+                final_eq = float(pres.equity_curve.iloc[-1]) if len(pres.equity_curve) else float(self.cfg.initial_cash)
+                traded = float(pres.trades["notional"].sum()) if ("notional" in pres.trades.columns) else 0.0
+                pnl = final_eq - float(self.cfg.initial_cash)
+                n_fills = int(len(pres.trades))
+                return PortfolioStats(final_equity=final_eq, pnl=pnl, traded_notional=traded, n_fills=n_fills)
+
+            s = symbols[0]
+
+            # --- validate required columns ---
+            bars = market_data.bars[s]
+            for col in (self.cfg.open_col, self.cfg.close_col):
+                if col not in bars.columns:
+                    raise KeyError(f"Bars for '{s}' missing required column '{col}'.")
+
+            # --- align index to signals index (we drive by signals) ---
+            idx = pd.Index(signal_frame.signals.index).sort_values()
+            if len(idx) < 2:
+                raise ValueError("Need at least 2 timestamps to apply t+1 fill semantics.")
+
+            # Extract arrays once (pandas cost paid once)
+            sig = signal_frame.signals.reindex(idx)[s].to_numpy(dtype=np.float64)
+
+            if getattr(signal_frame, "validity", None) is not None:
+                valid = signal_frame.validity.reindex(idx)[s].to_numpy(dtype=bool)
+            else:
+                valid = np.ones(len(idx), dtype=bool)
+
+            # invalid -> 0.0 (flat)
+            sig = np.where(valid, sig, 0.0)
+            sig = np.clip(sig, -1.0, 1.0)
+
+            # price arrays at timestamps in idx
+            open_px = bars.reindex(idx)[self.cfg.open_col].to_numpy(dtype=np.float64)
+            close_px = bars.reindex(idx)[self.cfg.close_col].to_numpy(dtype=np.float64)
+
+            # If there are NaNs in prices, this will propagate; you can either:
+            # - drop missing timestamps upstream, or
+            # - treat NaNs as "no trade" periods.
+            # For speed, we assume prices exist.
+
+            initial_cash = float(self.cfg.initial_cash)
+            cash = initial_cash
+            pos = 0  # int shares
+            traded_notional = 0.0
+            n_fills = 0
+
+            cooldown = int(getattr(self.cfg, "cooldown_bars", 0) or 0)
+            last_trade_i = -10**9
+
+            prev_target_w: Optional[float] = None
+
+            # loop over bars: decide at i, execute at i+1
+            for i in range(len(idx) - 1):
+                # decide at t = idx[i], execute at t1 = idx[i+1]
+                w = float(sig[i])
+
+                # respect allow_short at portfolio layer
+                if not self.cfg.allow_short and w < 0.0:
+                    w = 0.0
+
+                # rebalance_policy == on_change shortcut
+                if self.cfg.rebalance_policy == "on_change" and prev_target_w is not None:
+                    if abs(prev_target_w - w) <= 1e-12:
+                        prev_target_w = w
+                        continue
+
+                px_open_t1 = float(open_px[i + 1])
+                px_close_t = float(close_px[i]) if not np.isnan(close_px[i]) else floa
+
 
     # ---------- internals ----------
     def _signals_to_target_weights(self, sig_row: pd.Series, symbols: List[str]) -> Dict[str, float]:
