@@ -104,6 +104,15 @@ def default_param_catalog_for_your_app(strategy_kind: Optional[str] = None) -> D
 
     return filter_catalog_for_strategy(cat, strategy_kind=strategy_kind)
 
+def _is_valid_params_for_strategy(strategy_kind: str, params: dict) -> bool:
+    kind = (strategy_kind or "").lower()
+    if kind in ("ma_cross", "moving_average_cross"):
+        fw = params.get("strategy.fast_window")
+        sw = params.get("strategy.slow_window")
+        if fw is None or sw is None:
+            return True  # if you're not optimizing both, it's fine
+        return int(fw) < int(sw)
+    return True
 
 def filter_catalog_for_strategy(catalog: Dict[str, ParamSpec], strategy_kind: str) -> Dict[str, ParamSpec]:
     """
@@ -391,6 +400,15 @@ def _grid_values(spec: ParamSpec) -> List[Any]:
 # Evaluation
 # ============================================================
 def _eval_candidate_once(base_spec: EngineSpec, params: Dict[str, Any]) -> TrialResult:
+    if not _is_valid_params_for_strategy(base_spec.strategy.kind, params):
+        return TrialResult(
+            pnl=float("-inf"),
+            traded_notional=float("inf"),
+            efficiency=float("-inf"),
+            params=dict(params),
+            error="invalid_params: fast_window must be < slow_window",
+        )
+
     spec = apply_params_to_spec(base_spec, params)
     bundle = BacktestEngine(spec).run()
     pnl, traded_notional = extract_pnl_and_traded_notional(bundle)
