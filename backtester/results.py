@@ -7,6 +7,26 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional, List
+
+@dataclass(frozen=True)
+class ExplainItem:
+    title: str
+    why: str
+    latex: Optional[str] = None
+    notes: Optional[str] = None
+    columns: Optional[Dict[str, str]] = None   # for tables: col -> meaning
+
+@dataclass(frozen=True)
+class BacktestReport:
+    metrics: Dict[str, float]
+    series: Dict[str, pd.Series]
+    tables: Dict[str, pd.DataFrame]
+    plots: Dict[str, Any]
+    style: Dict[str, Any]
+    explain: Dict[str, ExplainItem] = field(default_factory=dict)  # <-- NEW
+    meta: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass(frozen=True)
 class BacktestReport:
@@ -57,7 +77,61 @@ class ResultsAnalyzer:
         # --- core strategy series ---
         equity = portfolio_result.equity_curve.astype(float).sort_index()
         rets = portfolio_result.returns.astype(float).reindex(equity.index).fillna(0.0)
-        
+        explain: Dict[str, ExplainItem] = {
+            # --- metrics ---
+            "metric.pnl": ExplainItem(
+                title="PnL (currency)",
+                why="Profit in account currency. Primary optimizer objective.",
+                latex=r"\mathrm{PnL}=Equity_T-Equity_0",
+                notes="Equity includes cash + marked-to-market positions."
+            ),
+            "metric.efficiency": ExplainItem(
+                title="Efficiency (PnL per traded notional)",
+                why="Secondary objective: prefers strategies with less turnover.",
+                latex=r"\mathrm{Eff}=\frac{\mathrm{PnL}}{\sum_k |\text{qty}_k|\cdot \text{price}_k}",
+                notes="If traded_notional = 0 → efficiency is undefined."
+            ),
+            "metric.total_return": ExplainItem(
+                title="Total return",
+                why="Total compounded return over the period.",
+                latex=r"R_{tot}=\prod_{t=1}^{T}(1+r_t)-1",
+            ),
+            "metric.cagr": ExplainItem(
+                title="CAGR",
+                why="Annualized compounded return (comparable across backtests).",
+                latex=r"\mathrm{CAGR}=\left(\prod_{t=1}^{T}(1+r_t)\right)^{\frac{ppY}{T}}-1",
+                notes="ppY = periods_per_year (e.g. 252)."
+            ),
+
+            # --- tables ---
+            "table.trade_ledger": ExplainItem(
+                title="Trade ledger (FIFO round-trips)",
+                why="Closed trades built by matching fills using FIFO lots.",
+                columns={
+                    "entry_time": "Entry timestamp",
+                    "exit_time": "Exit timestamp",
+                    "side": "LONG/SHORT",
+                    "qty": "Closed quantity",
+                    "gross_pnl": "PnL before costs",
+                    "net_pnl": "PnL after entry+exit costs",
+                    "return_pct": "net_pnl / (qty * entry_price)",
+                    "hold_days": "Holding period in days",
+                },
+            ),
+
+            # --- plots ---
+            "plot.price_panel": ExplainItem(
+                title="Price + indicator + trades",
+                why="Shows price series + strategy indicator and where trades occurred.",
+                notes="Trades are placed at open(t+1) and MTM at close(t+1) per your portfolio convention."
+            ),
+            "plot.cum_vs_bench": ExplainItem(
+                title="Cumulative returns vs benchmark",
+                why="Compares strategy performance to benchmark (if provided).",
+                latex=r"CR_t=\prod_{u\le t}(1+r_u)-1"
+            ),
+        }
+
 
         cum = (1.0 + rets).cumprod() - 1.0
         dd = self._drawdown_from_equity(equity)
@@ -194,6 +268,7 @@ class ResultsAnalyzer:
             tables=tables,
             plots=plots,
             style=style,
+            explain=explain,
             meta={
                 "symbols": symbols,
                 "benchmark_symbol": benchmark_symbol,

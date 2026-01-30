@@ -53,97 +53,93 @@ def metric_with_info(label: str, value: str, explain_key: str):
     with c2:
         info_popover(explain_key)
 
+# ============================================================
+# Metric explanations (only what you asked for)
+# ============================================================
+
 EXPLAIN = {
-    # ===== Strategy params =====
-    "strategy.window": {
-        "title": "SMA window",
-        "why": "Defines the smoothing horizon. Larger windows react slower (fewer trades), smaller windows react faster (more trades).",
-        "latex": r"SMA_t(w)=\frac{1}{w}\sum_{i=0}^{w-1}P_{t-i}",
-        "notes": "Used in the rule: signal=1 if Close > SMA, signal=-1 if Close < SMA (if short allowed).",
+    # --- Plots ---
+    "plot.cum_returns": {
+        "title": "Cumulative Returns",
+        "why": "Shows the compounded performance over time. Easier to compare strategy vs benchmark.",
+        "latex": r"CR_t=\prod_{i=1}^{t}(1+r_i)-1",
+        "notes": "Uses per-bar equity returns r_i.",
     },
-    "strategy.fast_window": {
-        "title": "Fast SMA window",
-        "why": "Short-term trend estimate. Smaller = more reactive.",
-        "latex": r"SMA_t(f)=\frac{1}{f}\sum_{i=0}^{f-1}P_{t-i}",
-        "notes": "Used with slow SMA to form crossover signals.",
-    },
-    "strategy.slow_window": {
-        "title": "Slow SMA window",
-        "why": "Long-term trend estimate. Larger = more stable.",
-        "latex": r"SMA_t(s)=\frac{1}{s}\sum_{i=0}^{s-1}P_{t-i}",
-        "notes": "Constraint: fast_window < slow_window.",
+    "plot.drawdown": {
+        "title": "Drawdown",
+        "why": "Measures peak-to-trough decline. Captures risk / pain / tail behavior.",
+        "latex": r"DD_t=\frac{E_t}{\max_{u\le t}E_u}-1,\quad \max DD=\min_t DD_t",
+        "notes": "E_t is equity at time t.",
     },
 
-    # ===== Portfolio sizing =====
-    "portfolio.buy_pct_cash": {
-        "title": "Buy % of available cash",
-        "why": "Controls aggressiveness of entries when signal=+1 (percentage sizing).",
-        "latex": r"\text{buy\_qty}=\left\lfloor \frac{\alpha\cdot \text{Cash}_{avail}}{\text{Open}_{t+1}} \right\rfloor",
-        "notes": r"Here \alpha = buy\_pct\_cash. Cash_avail respects cash_buffer.",
-    },
-    "portfolio.sell_pct_shares": {
-        "title": "Sell % of shares",
-        "why": "Controls partial exits when signal=-1 (percentage sizing).",
-        "latex": r"\text{sell\_qty}=\left\lceil \beta \cdot |\text{pos}| \right\rceil",
-        "notes": r"Here \beta = sell\_pct\_shares. delta = -sell_qty.",
-    },
-    "portfolio.cooldown_bars": {
-        "title": "Cooldown (bars)",
-        "why": "Prevents over-trading by enforcing a minimum number of bars between trades.",
-        "latex": r"t_{trade}(sym) \rightarrow \text{block if } (i+1)-i_{last}(sym) < cooldown",
-        "notes": "Applies per symbol.",
+    # --- Trade ledger columns ---
+    "ledger.pnl": {
+        "title": "Gross PnL / Net PnL / Return %",
+        "why": "Gross PnL is price PnL. Net PnL subtracts costs. Return% normalizes net PnL by entry notional.",
+        "latex": (
+            r"\mathrm{GrossPnL}=\begin{cases}"
+            r"q(\,P_{exit}-P_{entry}\,),& \text{LONG}\\"
+            r"q(\,P_{entry}-P_{exit}\,),& \text{SHORT}"
+            r"\end{cases}"
+            "\n"
+            r"\mathrm{NetPnL}=\mathrm{GrossPnL}-Cost_{entry}-Cost_{exit}"
+            "\n"
+            r"\mathrm{Return\%}=\frac{\mathrm{NetPnL}}{q\cdot P_{entry}}"
+        ),
+        "notes": "q is the closed quantity for that round-trip/lot.",
     },
 
-    # ===== Performance metrics =====
-    "metric.pnl": {
-        "title": "PnL (currency)",
-        "why": "Absolute profit in account currency. Primary objective in your optimizer.",
-        "latex": r"\mathrm{PnL}=Equity_T-Equity_0",
-        "notes": "Equity includes cash + marked-to-market positions.",
+    # --- Trade performance ---
+    "trade.profit_factor": {
+        "title": "Profit Factor",
+        "why": "Quality of the payoff distribution: how much profit you make per unit of loss (higher is better).",
+        "latex": r"\mathrm{PF}=\frac{\sum \mathrm{Wins}}{|\sum \mathrm{Losses}|}",
+        "notes": "Computed on net PnL of closed trades.",
     },
-    "metric.efficiency": {
-        "title": "Efficiency (PnL per notional)",
-        "why": "Rewards strategies that make money with less turnover (cost/impact proxy). Secondary objective.",
-        "latex": r"\mathrm{Efficiency}=\frac{\mathrm{PnL}}{\sum_k |\text{qty}_k|\cdot \text{price}_k}",
-        "notes": "In your optimizer: rank by (PnL desc, Efficiency desc).",
-    },
-    "metric.total_return": {
-        "title": "Total Return",
-        "why": "Overall strategy return over the backtest period.",
-        "latex": r"R_{tot}=\prod_{t=1}^{T}(1+r_t)-1",
-        "notes": "Uses equity returns r_t.",
-    },
-    "metric.cagr": {
-        "title": "CAGR",
-        "why": "Annualized return accounting for compounding (comparable across periods).",
-        "latex": r"\mathrm{CAGR}=\left(\prod_{t=1}^{T}(1+r_t)\right)^{\frac{ppY}{T}}-1",
-        "notes": r"ppY = periods_per_year (e.g., 252).",
-    },
-    "metric.vol": {
-        "title": "Annualized Volatility",
-        "why": "Risk proxy (dispersion of returns).",
-        "latex": r"\sigma_{ann}=\mathrm{std}(r_t)\sqrt{ppY}",
-        "notes": "Higher volatility generally means higher risk.",
-    },
-    "metric.sharpe": {
-        "title": "Sharpe Ratio",
-        "why": "Risk-adjusted return vs volatility (higher is better).",
-        "latex": r"\mathrm{Sharpe}=\frac{\mathrm{CAGR}-r_f}{\sigma_{ann}}",
-        "notes": "If rf_annual=0, it’s CAGR / vol.",
-    },
-    "metric.sortino": {
-        "title": "Sortino Ratio",
-        "why": "Risk-adjusted return using downside volatility only (penalizes negative returns).",
-        "latex": r"\mathrm{Sortino}=\frac{\mathrm{CAGR}-r_f}{\sigma_{down}}",
-        "notes": r"\sigma_{down} = std(r_t \mid r_t<0)\sqrt{ppY}",
-    },
-    "metric.max_dd": {
-        "title": "Max Drawdown",
-        "why": "Worst peak-to-trough decline (tail risk / pain measure).",
-        "latex": r"DD_t=\frac{Equity_t}{\max_{u\le t}Equity_u}-1,\ \ \max DD=\min_t DD_t",
-        "notes": "More negative is worse.",
+
+    # --- Optimization top candidates ---
+    "opt.top": {
+        "title": "Optimization metrics (ranking)",
+        "why": "You rank candidates by PnL first, then Efficiency. Turnover proxy is traded notional. n_fills is trade count.",
+        "latex": (
+            r"\mathrm{PnL}=E_T-E_0"
+            "\n"
+            r"\mathrm{TradedNotional}=\sum_k |\mathrm{qty}_k|\cdot \mathrm{price}_k"
+            "\n"
+            r"\mathrm{Efficiency}=\frac{\mathrm{PnL}}{\mathrm{TradedNotional}}"
+        ),
+        "notes": "Ranking rule: sort by (PnL desc, Efficiency desc).",
     },
 }
+
+def info_popover(explain_key: str):
+    e = EXPLAIN.get(explain_key)
+    if not e:
+        return
+    with st.popover("ℹ️"):
+        st.markdown(f"**{e['title']}**")
+        st.write(e.get("why", ""))
+        if e.get("latex"):
+            st.latex(e["latex"])
+        if e.get("notes"):
+            st.caption(e["notes"])
+
+def plot_with_info(title: str, explain_key: str, fig):
+    c1, c2 = st.columns([10, 1], vertical_alignment="center")
+    with c1:
+        st.subheader(title)
+    with c2:
+        info_popover(explain_key)
+    st.pyplot(fig)
+
+def table_with_info(title: str, explain_key: str, df: pd.DataFrame):
+    c1, c2 = st.columns([10, 1], vertical_alignment="center")
+    with c1:
+        st.subheader(title)
+    with c2:
+        info_popover(explain_key)
+    st.dataframe(df, use_container_width=True)
+
 
 # ============================================================
 # Plotting helpers (NORMAL price line + indicators + buy/sell)
@@ -303,6 +299,44 @@ def plot_yearly_returns_bar(yearly: pd.Series) -> plt.Figure:
     ax.grid(True, axis="y")
     return fig
 
+def render_explain(report, key: str):
+    e = report.explain.get(key)
+    if not e:
+        return
+    with st.popover("ℹ️"):
+        st.markdown(f"**{e.title}**")
+        st.write(e.why)
+        if e.latex:
+            st.latex(e.latex)
+        if e.notes:
+            st.caption(e.notes)
+        if e.columns:
+            st.markdown("**Columns**")
+            for c, desc in e.columns.items():
+                st.markdown(f"- `{c}`: {desc}")
+
+def metric_card(label: str, value, report, explain_key: str):
+    c1, c2 = st.columns([8, 1], vertical_alignment="center")
+    with c1:
+        st.metric(label, value)
+    with c2:
+        render_explain(report, explain_key)
+
+def table_with_info(title: str, df: pd.DataFrame, report, explain_key: str):
+    c1, c2 = st.columns([8, 1], vertical_alignment="center")
+    with c1:
+        st.subheader(title)
+    with c2:
+        render_explain(report, explain_key)
+    st.dataframe(df, use_container_width=True)
+
+def plot_with_info(title: str, fig, report, explain_key: str):
+    c1, c2 = st.columns([8, 1], vertical_alignment="center")
+    with c1:
+        st.subheader(title)
+    with c2:
+        render_explain(report, explain_key)
+    st.plotly_chart(fig, use_container_width=True)
 
 # ============================================================
 # Render bundle
@@ -328,10 +362,21 @@ def render_bundle(bundle):
 
     st.subheader("Cumulative Returns vs Benchmark")
     cvb = plots["cum_vs_bench"]
-    st.pyplot(plot_cum_vs_bench(cvb["strategy"], cvb["benchmark"]))
+    # --- Cumulative returns plot with explanation ---
+    plot_with_info(
+        "Cumulative Returns vs Benchmark",
+        "plot.cum_returns",
+        plot_cum_vs_bench(cvb["strategy"], cvb["benchmark"]),
+    )
 
     st.subheader("Drawdown")
-    st.pyplot(plot_drawdown_red(plots["drawdown"]))
+        # --- Drawdown plot with explanation ---
+    plot_with_info(
+        "Drawdown",
+        "plot.drawdown",
+        plot_drawdown_red(plots["drawdown"]),
+    )
+
 
     st.subheader("Monthly Returns Heatmap")
     st.pyplot(plot_monthly_heatmap_with_values(plots["monthly_heatmap"]))
@@ -344,12 +389,28 @@ def render_bundle(bundle):
         st.dataframe(tables["trades"], use_container_width=True)
 
     st.subheader("Trade Ledger (PnL per closed trade)")
+        # --- Trade Ledger (explain Gross/Net/Return%) ---
     if "trade_ledger" in tables:
-        st.dataframe(tables["trade_ledger"], use_container_width=True)
+        table_with_info(
+            "Trades Ledger (PnL per trade)",
+            "ledger.pnl",
+            tables["trade_ledger"],
+        )
+    else:
+        st.info("trade_ledger not found in report.tables")
+
 
     st.subheader("Trade Performance (summary)")
+        # --- Trade Performance (explain Profit Factor) ---
     if "trade_performance" in tables:
-        st.dataframe(tables["trade_performance"], use_container_width=True)
+        table_with_info(
+            "Trade Performance (summary)",
+            "trade.profit_factor",
+            tables["trade_performance"],
+        )
+    else:
+        st.info("trade_performance not found in report.tables")
+
 
 
 # ============================================================
@@ -869,7 +930,19 @@ with tab_opt:
             # Ensure pnl + efficiency visible even if many params
             show_cols = [c for c in top_df.columns if c in ("pnl","efficiency","traded_notional","n_fills","error")] + \
                         [c for c in top_df.columns if c not in ("pnl","efficiency","traded_notional","n_fills","error")]
-            st.dataframe(top_df[show_cols], use_container_width=True)
+            # --- Explain optimization metrics + show top candidates ---
+            table_with_info(
+                "Top candidates (ranked by PnL then Efficiency)",
+                "opt.top",
+                top_df[[
+                    # Keep only the most relevant columns first, if they exist
+                    *[c for c in top_df.columns if c.startswith("strategy.")],
+                    *[c for c in top_df.columns if c.startswith("portfolio.")],
+                    "pnl", "efficiency", "traded_notional", "n_fills",
+                    *([c for c in ["error"] if c in top_df.columns]),
+                ]].copy()
+            )
+
 
             st.divider()
             if st.button("Run best configuration backtest", key="run_best_backtest_btn"):
