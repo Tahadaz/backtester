@@ -636,7 +636,7 @@ with tab_backtest:
                 fast = min(int(fast), int(slow) - 1)
             strategy_params = {"fast_window": int(fast), "slow_window": int(slow), "allow_short": bool(allow_short), "nan_policy": nan_policy}
         else:
-            window = st.number_input("SMA window", min_value=2, max_value=500, value=50, step=1, help=f"{EXPLAIN['strategy.window']['why']}\n\nFormula:\n{EXPLAIN['strategy.window']['latex']}")
+            window = st.number_input("SMA window", min_value=2, max_value=500, value=50, step=1)
             strategy_params = {"window": int(window), "allow_short": bool(allow_short), "nan_policy": nan_policy}
 
         st.markdown("### Portfolio")
