@@ -451,14 +451,22 @@ def _eval_one_trial(
         else:
             index = common_index
 
-        symbols = list(base_spec.data.symbols)
+        symbols = list(base_spec.data.symbols)        # Signals from feature bank (fast, no indicator recompute)
+        # IMPORTANT: avoid per-trial indexer/reindex work when not slicing a date window.
+        if win is None:
+            bars_close_arg = bars_close
+            md_slice = md
+        else:
+            idx_pos = common_index.get_indexer_for(index)
+            bars_close_arg = {s: bars_close[s][idx_pos] for s in symbols}
+            # We must pass MarketData whose bars align with 'index'
+            md_slice = _slice_marketdata(md, symbols, index)
 
-        # Signals from feature bank (fast, no indicator recompute)
         sf = adapter.make_signals_from_bank(
             symbols=symbols,
             index=index,
             bank=bank,
-            bars_close={s: bars_close[s][(common_index.get_indexer_for(index))] for s in symbols},
+            bars_close=bars_close_arg,
             params=params,
             base_spec=base_spec,
         )
@@ -469,10 +477,6 @@ def _eval_one_trial(
 
         # Run portfolio fast stats if available, else full run
         port = PortfolioEngine(port_cfg)
-
-        # We must pass MarketData whose bars align with 'index'
-        md_slice = _slice_marketdata(md, symbols, index)
-
         # Try fast-path stats-only if it exists AND actually returns something usable
         used_fast = False
         if hasattr(port, "run_stats_only"):
@@ -644,9 +648,37 @@ def _align_marketdata_inner(md: MarketData, symbols: List[str]) -> MarketData:
 
 
 def _slice_marketdata(md: MarketData, symbols: List[str], index: pd.DatetimeIndex) -> MarketData:
+    """Slice MarketData to a given DatetimeIndex.
+
+    Optimization hot loop calls this only when you optimize data.window.
+    Prefer a cheap .loc[start:end] slice when possible; fall back to reindex
+    only if the slice doesn't exactly match the requested index.
+    """
     bars: Dict[str, pd.DataFrame] = {}
+
+    if len(index) == 0:
+        for s in symbols:
+            bars[s] = md.bars[s].iloc[0:0].reindex(index)
+        return MarketData(
+            bars=bars,
+            source=md.source,
+            timezone=md.timezone,
+            interval=md.interval,
+            meta=dict(md.meta),
+        )
+
+    start = index[0]
+    end = index[-1]
+
     for s in symbols:
-        bars[s] = md.bars[s].reindex(index)
+        df = md.bars[s]
+        df_span = df.loc[start:end]
+        # If df_span already has the exact index, keep it; else reindex
+        if df_span.index.equals(index):
+            bars[s] = df_span
+        else:
+            bars[s] = df.reindex(index)
+
     return MarketData(
         bars=bars,
         source=md.source,
@@ -654,7 +686,6 @@ def _slice_marketdata(md: MarketData, symbols: List[str], index: pd.DatetimeInde
         interval=md.interval,
         meta=dict(md.meta),
     )
-
 
 def _slice_index(index: pd.DatetimeIndex, start: Optional[str], end: Optional[str]) -> Optional[pd.DatetimeIndex]:
     if start is None and end is None:

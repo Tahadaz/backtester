@@ -114,6 +114,7 @@ class IndicatorEngine:
         self.enable_memory_cache = enable_memory_cache
         self.engine_version = engine_version
         self._mem_cache: Dict[str, pd.DataFrame] = {}
+        self._framehash_cache: Dict[Tuple[int, Tuple[str, ...]], str] = {}
 
         if self.enable_disk_cache and self.cache_dir:
             os.makedirs(self.cache_dir, exist_ok=True)
@@ -166,7 +167,7 @@ class IndicatorEngine:
             raise ValueError(f"{symbol}: missing required columns for {spec.indicator}: {missing}")
 
         # Fingerprint only the columns used (and the index)
-        data_hash = self._hash_frame(bars.loc[:, list(spec.inputs)])
+        data_hash = self._hash_frame_cached(bars, spec.inputs)
         key = f"{symbol}__{spec.spec_hash(self.engine_version)}__{data_hash}"
 
         if self.enable_memory_cache and key in self._mem_cache:
@@ -201,6 +202,20 @@ class IndicatorEngine:
 
         meta = {"symbol": symbol, "spec": spec, "cache": "miss", "key": key}
         return df_feat, self._serialize_meta(meta)
+
+    def _hash_frame_cached(self, bars: pd.DataFrame, inputs: Tuple[str, ...]) -> str:
+        """Memoize the expensive pandas hashing per (bars object, inputs tuple).
+
+        During optimization you often compute dozens/hundreds of SMA windows. The raw
+        price data (bars + inputs) is identical across specs, so hashing it once per
+        inputs avoids O(n_specs) repeated hashing.
+        """
+        k = (id(bars), tuple(inputs))
+        if k in self._framehash_cache:
+            return self._framehash_cache[k]
+        h = self._hash_frame(bars.loc[:, list(inputs)])
+        self._framehash_cache[k] = h
+        return h
 
     @staticmethod
     def _hash_frame(df: pd.DataFrame) -> str:
