@@ -1,7 +1,7 @@
 # app.py (Streamlit entrypoint) — FIXED to match your optimize.py API
 
 from __future__ import annotations
-
+import time
 import os
 import tempfile
 from pathlib import Path
@@ -1036,6 +1036,9 @@ with tab_opt:
                 top_k=int(top_k),
                 # NOTE: no "objective" field in your OptimizeConfig
             )
+            t0 = time.time()
+            best, top_df, best_params, best_spec = run_optimization(base_spec, active_params, opt_cfg)
+            st.write("Optimization time (s):", time.time() - t0)
 
             with st.spinner("Running optimization..."):
                 best, top_df, best_params, best_spec = run_optimization(
