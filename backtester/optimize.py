@@ -149,7 +149,6 @@ class MACrossAdapter(StrategyAdapter):
         col_slow = f"sma_{s}"
 
         sig = pd.DataFrame(index=index, columns=symbols, dtype="float64")
-        valid = pd.DataFrame(index=index, columns=symbols, dtype="bool")
 
         for sym in symbols:
             fast = bank[sym][col_fast]
@@ -172,11 +171,11 @@ class MACrossAdapter(StrategyAdapter):
                 out = np.where(v, out, np.nan)
 
             sig[sym] = out
-            valid[sym] = v
+            # validity omitted for speed
 
         return SignalFrame(
             signals=sig,
-            validity=valid,
+            validity=None,
             meta={"adapter": "ma_cross", "fast_window": f, "slow_window": s, "allow_short": allow_short, "nan_policy": nan_policy},
         )
 
@@ -220,7 +219,6 @@ class PriceAboveSMAAdapter(StrategyAdapter):
         col_sma = f"sma_{w}"
 
         sig = pd.DataFrame(index=index, columns=symbols, dtype="float64")
-        valid = pd.DataFrame(index=index, columns=symbols, dtype="bool")
 
         for sym in symbols:
             close = bars_close[sym]
@@ -242,11 +240,11 @@ class PriceAboveSMAAdapter(StrategyAdapter):
                 out = np.where(v, out, np.nan)
 
             sig[sym] = out
-            valid[sym] = v
+            # validity omitted for speed
 
         return SignalFrame(
             signals=sig,
-            validity=valid,
+            validity=None,
             meta={"adapter": "sma_price", "window": w, "allow_short": allow_short, "nan_policy": nan_policy},
         )
 
@@ -451,22 +449,14 @@ def _eval_one_trial(
         else:
             index = common_index
 
-        symbols = list(base_spec.data.symbols)        # Signals from feature bank (fast, no indicator recompute)
-        # IMPORTANT: avoid per-trial indexer/reindex work when not slicing a date window.
-        if win is None:
-            bars_close_arg = bars_close
-            md_slice = md
-        else:
-            idx_pos = common_index.get_indexer_for(index)
-            bars_close_arg = {s: bars_close[s][idx_pos] for s in symbols}
-            # We must pass MarketData whose bars align with 'index'
-            md_slice = _slice_marketdata(md, symbols, index)
+        symbols = list(base_spec.data.symbols)
 
+        # Signals from feature bank (fast, no indicator recompute)
         sf = adapter.make_signals_from_bank(
             symbols=symbols,
             index=index,
             bank=bank,
-            bars_close=bars_close_arg,
+            bars_close={s: bars_close[s][(common_index.get_indexer_for(index))] for s in symbols},
             params=params,
             base_spec=base_spec,
         )
@@ -477,21 +467,27 @@ def _eval_one_trial(
 
         # Run portfolio fast stats if available, else full run
         port = PortfolioEngine(port_cfg)
-        # Try fast-path stats-only if it exists AND actually returns something usable
+
+        # FAST path: for single-symbol optimization, avoid slicing/reindexing MarketData per trial.
         used_fast = False
         if hasattr(port, "run_stats_only"):
             try:
-                stats = port.run_stats_only(md_slice, sf, symbols=symbols)  # type: ignore[attr-defined]
-                if stats is not None and all(hasattr(stats, k) for k in ("pnl", "traded_notional", "n_fills")):
-                    pnl = float(stats.pnl)
-                    traded = float(stats.traded_notional)
-                    n_fills = int(stats.n_fills)
-                    used_fast = True
+                if len(symbols) == 1:
+                    stats = port.run_stats_only(md, sf, symbols=symbols)  # type: ignore[attr-defined]
+                else:
+                    md_slice = _slice_marketdata(md, symbols, index)
+                    stats = port.run_stats_only(md_slice, sf, symbols=symbols)  # type: ignore[attr-defined]
+
+                pnl = float(stats.pnl)
+                traded = float(stats.traded_notional)
+                n_fills = int(stats.n_fills)
+                used_fast = True
             except Exception:
                 used_fast = False
 
         # Fallback to full portfolio run (always works)
         if not used_fast:
+            md_slice = _slice_marketdata(md, symbols, index)
             pres = port.run(md_slice, sf, symbols=symbols)
             pnl = float(pres.equity_curve.iloc[-1]) - float(port_cfg.initial_cash) if len(pres.equity_curve) else 0.0
             traded = float(pres.trades["notional"].sum()) if (not pres.trades.empty and "notional" in pres.trades.columns) else 0.0
@@ -648,37 +644,9 @@ def _align_marketdata_inner(md: MarketData, symbols: List[str]) -> MarketData:
 
 
 def _slice_marketdata(md: MarketData, symbols: List[str], index: pd.DatetimeIndex) -> MarketData:
-    """Slice MarketData to a given DatetimeIndex.
-
-    Optimization hot loop calls this only when you optimize data.window.
-    Prefer a cheap .loc[start:end] slice when possible; fall back to reindex
-    only if the slice doesn't exactly match the requested index.
-    """
     bars: Dict[str, pd.DataFrame] = {}
-
-    if len(index) == 0:
-        for s in symbols:
-            bars[s] = md.bars[s].iloc[0:0].reindex(index)
-        return MarketData(
-            bars=bars,
-            source=md.source,
-            timezone=md.timezone,
-            interval=md.interval,
-            meta=dict(md.meta),
-        )
-
-    start = index[0]
-    end = index[-1]
-
     for s in symbols:
-        df = md.bars[s]
-        df_span = df.loc[start:end]
-        # If df_span already has the exact index, keep it; else reindex
-        if df_span.index.equals(index):
-            bars[s] = df_span
-        else:
-            bars[s] = df.reindex(index)
-
+        bars[s] = md.bars[s].reindex(index)
     return MarketData(
         bars=bars,
         source=md.source,
@@ -686,6 +654,7 @@ def _slice_marketdata(md: MarketData, symbols: List[str], index: pd.DatetimeInde
         interval=md.interval,
         meta=dict(md.meta),
     )
+
 
 def _slice_index(index: pd.DatetimeIndex, start: Optional[str], end: Optional[str]) -> Optional[pd.DatetimeIndex]:
     if start is None and end is None:

@@ -348,193 +348,186 @@ class PortfolioEngine:
             trades=trades,
             meta=meta,
         )
-
+    
     def run_stats_only(
         self,
-        market_data: Any,
-        signal_frame: Any,
+        market_data: Any,   # MarketDataLike
+        signal_frame: Any,  # SignalFrame
         symbols: Optional[Sequence[str]] = None,
     ) -> PortfolioStats:
-        """Fast path for optimization (single-asset).
-
-        Returns only:
-          - final_equity
-          - pnl (= final_equity - initial_cash)
-          - traded_notional (sum |qty|*price across fills)
-          - n_fills
-
-        Semantics match run():
-          decide at t = idx[i] using signals, execute at open(t+1), MTM at close(t+1).
-
-        Notes:
-          - Supports both sizing_mode:
-              * target_weight (signal interpreted as target weight in [-1,1])
-              * pct_cash_shares (signal interpreted as action: +1 buy, -1 sell, 0 hold)
-          - Applies rebalance_policy == on_change
-          - Applies cooldown_bars
-          - Applies transaction costs via cfg.cost_model
-          - Shares are integers; no fractional shares.
         """
-        symbols = list(symbols) if symbols is not None else list(getattr(signal_frame, "signals").columns)
+        FAST path for optimization.
+
+        Design goal: be *fast and functional*, not feature-complete.
+
+        Assumptions:
+          - Best performance for single-symbol optimization.
+          - Uses next-open execution (t -> trade at Open[t+1]) and MTM at Close[t+1] like run().
+          - Costs are linear in notional (CostModel), so we compute them cheaply.
+
+        Falls back to the slow full run() if:
+          - multiple symbols are provided, or
+          - required columns are missing, or
+          - not enough bars.
+        """
+        symbols = list(symbols) if symbols is not None else list(signal_frame.signals.columns)
         if len(symbols) != 1:
-            # keep correctness for multi-asset: fall back to full run()
+            # Keep behavior correct for multi-asset: use the existing full engine
             pres = self.run(market_data, signal_frame, symbols=symbols)
-            final_eq = float(pres.equity_curve.iloc[-1]) if len(pres.equity_curve) else float(self.cfg.initial_cash)
-            traded = float(pres.trades["notional"].sum()) if ("notional" in pres.trades.columns) else 0.0
-            pnl = final_eq - float(self.cfg.initial_cash)
+            pnl = float(pres.equity_curve.iloc[-1]) - float(self.cfg.initial_cash) if len(pres.equity_curve) else 0.0
+            traded = float(pres.trades["notional"].sum()) if (not pres.trades.empty and "notional" in pres.trades.columns) else 0.0
             n_fills = int(len(pres.trades))
+            final_eq = float(pres.equity_curve.iloc[-1]) if len(pres.equity_curve) else float(self.cfg.initial_cash)
             return PortfolioStats(final_equity=final_eq, pnl=pnl, traded_notional=traded, n_fills=n_fills)
 
-        s = symbols[0]
-        bars = market_data.bars[s]
+        sym = symbols[0]
+        if sym not in market_data.bars:
+            raise KeyError(f"MarketData missing symbol '{sym}'")
 
-        # --- validate required columns ---
+        bars = market_data.bars[sym]
         for col in (self.cfg.open_col, self.cfg.close_col):
             if col not in bars.columns:
-                raise KeyError(f"Bars for '{s}' missing required column '{col}'.")
+                raise KeyError(f"Bars for '{sym}' missing required column '{col}'")
 
-        # --- drive by signal index (t) ---
         idx = pd.Index(signal_frame.signals.index).sort_values()
         if len(idx) < 2:
             raise ValueError("Need at least 2 timestamps to apply t+1 fill semantics.")
+        # Align bars to signals index (this is the only pandas alignment we do here)
+        bars = bars.reindex(idx)
+        open_px = bars[self.cfg.open_col].to_numpy(dtype=np.float64, copy=False)
+        close_px = bars[self.cfg.close_col].to_numpy(dtype=np.float64, copy=False)
 
-        # --- extract arrays once ---
-        sig = signal_frame.signals.reindex(idx)[s].to_numpy(dtype=np.float64)
+        sig = signal_frame.signals[sym].reindex(idx).to_numpy(dtype=np.float64, copy=False)
 
-        if getattr(signal_frame, "validity", None) is not None:
-            valid = signal_frame.validity.reindex(idx)[s].to_numpy(dtype=bool)
-        else:
-            valid = np.ones(len(idx), dtype=bool)
-
-        # invalid -> 0.0 (flat)
-        sig = np.where(valid, sig, 0.0)
-        sig = np.clip(sig, -1.0, 1.0)
-
-        open_px = bars.reindex(idx)[self.cfg.open_col].to_numpy(dtype=np.float64)
-        close_px = bars.reindex(idx)[self.cfg.close_col].to_numpy(dtype=np.float64)
-
-        initial_cash = float(self.cfg.initial_cash)
-        cash = initial_cash
-        pos = 0  # int shares
-        traded_notional = 0.0
-        n_fills = 0
-
-        cooldown = int(getattr(self.cfg, "cooldown_bars", 0) or 0)
-        last_trade_i = -10**9
-
-        prev_target_w: Optional[float] = None
-
-        # helper: compute investable equity at decision time using close(t)
-        def equity_at_i(i: int) -> float:
-            px = float(close_px[i])
-            if np.isnan(px):
-                # if close(t) missing, fall back to open(t+1) as last available proxy (still causal)
-                px = float(open_px[i + 1])
-            return float(cash + pos * px)
-
-        # helper: cap abs shares by max_gross and optional per-asset cap
-        def cap_abs_shares(eq: float, px: float) -> int:
-            if px <= 0 or np.isnan(px):
-                return 0
-            investable = eq * (1.0 - float(self.cfg.cash_buffer))
-            cap_notional = float(self.cfg.max_gross) * investable
-            if self.cfg.max_weight_per_asset is not None:
-                cap_notional = min(cap_notional, float(self.cfg.max_weight_per_asset) * investable)
-            return int(cap_notional / px)
-
-        # loop over bars: decide at i, execute at i+1
-        for i in range(len(idx) - 1):
-            w = float(sig[i])
-
-            # respect allow_short at portfolio layer
-            if not self.cfg.allow_short and w < 0.0:
-                w = 0.0
-
-            # rebalance_policy == on_change shortcut (weight interpretation)
-            if self.cfg.rebalance_policy == "on_change" and prev_target_w is not None:
-                if abs(prev_target_w - w) <= 1e-12:
-                    prev_target_w = w
-                    continue
-
-            px_open_t1 = float(open_px[i + 1])
-            if np.isnan(px_open_t1) or px_open_t1 <= 0:
-                # cannot trade without a valid price
-                prev_target_w = w
-                continue
-
-            eq_t = equity_at_i(i)
-
-            delta = 0  # shares to trade at open(t+1)
-
-            if self.cfg.sizing_mode == "target_weight":
-                # interpret w as target weight
-                w = float(np.clip(w, -1.0, 1.0))
-                if not self.cfg.allow_short and w < 0.0:
-                    w = 0.0
-
-                investable = eq_t * (1.0 - float(self.cfg.cash_buffer))
-                desired_notional = w * investable
-                desired_shares = int(desired_notional / px_open_t1)  # toward zero
-
-                cap_abs = cap_abs_shares(eq_t, px_open_t1)
-                desired_shares = int(np.clip(desired_shares, -cap_abs, cap_abs))
-
-                delta = int(desired_shares - pos)
-
-            else:
-                # pct_cash_shares action mode (long-only by design)
-                # +1 -> buy using buy_pct_cash of available cash
-                # -1 -> sell sell_pct_shares of current long position
-                #  0 -> hold
-                if w == -1.0:
-                    if pos > 0:
-                        q = int(np.ceil(float(self.cfg.sell_pct_shares) * abs(pos)))
-                        q = min(q, abs(pos))
-                        delta = -int(q)
-                elif w == 1.0:
-                    reserve = float(self.cfg.cash_buffer) * float(eq_t)
-                    avail_cash = max(0.0, float(cash) - reserve)
-                    cash_budget = float(self.cfg.buy_pct_cash) * avail_cash
-                    buy_qty = int(cash_budget / px_open_t1)
-                    if buy_qty > 0:
-                        cap_abs = cap_abs_shares(eq_t, px_open_t1)
-                        desired_pos = min(pos + buy_qty, cap_abs)
-                        delta = int(desired_pos - pos)
-                # else w==0 -> delta stays 0
-
-            # cooldown filter
-            if cooldown > 0 and delta != 0:
-                if (i + 1) - last_trade_i < cooldown:
-                    delta = 0
-
-            # execute trade if needed
-            if delta != 0:
-                notional = float(abs(delta) * px_open_t1)
-                cost, _ = self.cfg.cost_model.estimate_cost(notional)
-
-                # cash flow: buy (delta>0) decreases cash; sell increases cash; then subtract costs
-                cash += (-float(delta) * px_open_t1) - float(cost)
-                pos += int(delta)
-
-                traded_notional += notional
-                n_fills += 1
-                last_trade_i = i + 1
-
-            prev_target_w = w
-
-        # final MTM at last close
-        px_last = float(close_px[-1])
-        if np.isnan(px_last):
-            px_last = float(open_px[-1])
-        final_equity = float(cash + pos * px_last)
-        pnl = final_equity - float(initial_cash)
+        pnl, traded, n_fills, final_eq = self._run_stats_fast_single(open_px, close_px, sig)
 
         return PortfolioStats(
-            final_equity=final_equity,
-            pnl=pnl,
-            traded_notional=float(traded_notional),
+            final_equity=float(final_eq),
+            pnl=float(pnl),
+            traded_notional=float(traded),
             n_fills=int(n_fills),
         )
+
+    def _run_stats_fast_single(
+        self,
+        open_px: np.ndarray,
+        close_px: np.ndarray,
+        sig: np.ndarray,
+    ) -> Tuple[float, float, int, float]:
+        """
+        Tight numpy loop (no pandas, no dicts, no object allocations).
+        Returns: (pnl, traded_notional, n_fills, final_equity)
+        """
+        n = int(len(open_px))
+        if n < 2:
+            return 0.0, 0.0, 0, float(self.cfg.initial_cash)
+
+        cash = float(self.cfg.initial_cash)
+        pos = 0.0
+
+        traded = 0.0
+        n_fills = 0
+
+        cm = self.cfg.cost_model
+        # total linear cost rate
+        k = ((cm.brokerage_bps + cm.exchange_bps + cm.settlement_bps) / 10000.0) * (1.0 + cm.vat_rate) + (cm.slippage_bps / 10000.0)
+
+        cooldown = int(self.cfg.cooldown_bars or 0)
+        last_trade_i = -10**9
+
+        allow_short = bool(self.cfg.allow_short)
+        sizing_mode = str(self.cfg.sizing_mode)
+
+        buy_pct_cash = float(self.cfg.buy_pct_cash)
+        sell_pct_shares = float(self.cfg.sell_pct_shares)
+
+        cash_buffer = float(self.cfg.cash_buffer)
+        max_gross = float(self.cfg.max_gross)
+
+        allow_frac = bool(self.cfg.allow_fractional_shares)
+
+        prev_desired = 0.0
+
+        for i in range(n - 1):
+            s = sig[i]
+            if not np.isfinite(s):
+                desired = 0.0
+            else:
+                if allow_short:
+                    desired = -1.0 if s < 0 else (1.0 if s > 0 else 0.0)
+                else:
+                    desired = 1.0 if s > 0 else 0.0
+
+            # cooldown gate
+            if cooldown > 0 and (i - last_trade_i) < cooldown:
+                prev_desired = desired
+                continue
+
+            px = float(open_px[i + 1])
+            if not np.isfinite(px) or px <= 0.0:
+                prev_desired = desired
+                continue
+
+            qty = 0.0
+            if sizing_mode == "target_weight":
+                equity = cash + pos * px
+                investable = max(0.0, equity * (1.0 - cash_buffer))
+                target_w = desired
+                if not allow_short:
+                    target_w = max(0.0, target_w)
+                target_w = max(-max_gross, min(max_gross, target_w))
+                target_pos = target_w * investable / px
+                if not allow_frac:
+                    target_pos = np.floor(target_pos) if target_pos >= 0 else -np.floor(abs(target_pos))
+                qty = float(target_pos - pos)
+
+                if self.cfg.rebalance_policy == "on_change":
+                    # if desired hasn't changed and we'd barely trade, skip
+                    if desired == prev_desired and abs(qty) < 1e-12:
+                        prev_desired = desired
+                        continue
+
+            else:
+                # pct_cash_shares: if desired > 0 -> buy pct of cash; else -> sell pct of shares
+                if desired > 0.0:
+                    spend = cash * buy_pct_cash
+                    buy_shares = spend / px
+                    if not allow_frac:
+                        buy_shares = np.floor(buy_shares)
+                    qty = float(buy_shares)
+                else:
+                    sell_shares = abs(pos) * sell_pct_shares
+                    if not allow_frac:
+                        sell_shares = np.floor(sell_shares)
+                    qty = float(-sell_shares if pos > 0 else (sell_shares if pos < 0 else 0.0))
+
+                if self.cfg.rebalance_policy == "on_change":
+                    if desired == prev_desired and abs(qty) < 1e-12:
+                        prev_desired = desired
+                        continue
+
+            if qty == 0.0 or not np.isfinite(qty):
+                prev_desired = desired
+                continue
+
+            notional = abs(qty) * px
+            cost = notional * k
+
+            if qty > 0:
+                cash -= (notional + cost)
+            else:
+                cash += (notional - cost)
+
+            pos += qty
+            traded += notional
+            n_fills += 1
+            last_trade_i = i
+            prev_desired = desired
+
+        final_eq = cash + float(pos) * float(close_px[-1])
+        pnl = final_eq - float(self.cfg.initial_cash)
+        return float(pnl), float(traded), int(n_fills), float(final_eq)
+
 
     # ---------- internals ----------
     def _signals_to_target_weights(self, sig_row: pd.Series, symbols: List[str]) -> Dict[str, float]:
