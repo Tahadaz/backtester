@@ -153,8 +153,7 @@ class ResultsAnalyzer:
                 ind_df = feats_sym[cols].reindex(bars0.index)
         
         # trades payload (fills)
-        init_cash = float(portfolio_result.meta.get("config", {}).get("initial_cash", 0.0))
-        trades = self._prepare_trades_table(portfolio_result.trades, initial_cash=init_cash)
+        trades = self._prepare_trades_table(portfolio_result.trades)
         trade_ledger = self._trade_ledger_from_fills(trades)
         trade_perf = self._trade_performance_summary(trade_ledger)
         # --- benchmark series (optional) ---
@@ -378,54 +377,17 @@ class ResultsAnalyzer:
     # =============================
     # Trades / fills
     # =============================
-    def _prepare_trades_table(self, trades: pd.DataFrame, initial_cash: float) -> pd.DataFrame:
-        """Normalize fills and enrich with a running net_invested ledger.
-
-        This is a *fills ledger* (one row per execution), not a round-trip ledger.
-        - qty is signed (buy>0, sell<0)
-        - notional is absolute (|qty| * price)
-        - net_invested is cumulative signed notional: +notional for buys, -notional for sells
-        """
-        cols = [
-            "timestamp", "symbol", "qty", "side", "price", "notional", "cost",
-            "commission_ht", "vat", "slippage",
-            "signed_notional", "net_invested", "cash_after",
-        ]
+    def _prepare_trades_table(self, trades: pd.DataFrame) -> pd.DataFrame:
         if trades is None or trades.empty:
-            return pd.DataFrame(columns=cols)
+            return pd.DataFrame(columns=["timestamp", "symbol", "qty", "side", "price", "notional", "cost"])
+
         df = trades.copy()
         df["timestamp"] = pd.to_datetime(df["timestamp"])
-
-        # Ensure numeric
-        for c in ["qty", "price", "notional", "cost"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce").astype(float)
-
         if "side" not in df.columns:
-            # qty is signed
             df["side"] = np.where(df["qty"].astype(float) > 0, "BUY", "SELL")
 
-        # Make sure cost exists
-        if "cost" not in df.columns:
-            df["cost"] = 0.0
-
-        # notional is expected to be absolute; derive signed notional from signed qty
-        df["signed_notional"] = np.where(df["qty"].astype(float) >= 0, df["notional"].astype(float), -df["notional"].astype(float))
-
-        keep = [c for c in [
-            "timestamp", "symbol", "qty", "side", "price", "notional", "cost",
-            "commission_ht", "vat", "slippage",
-            "signed_notional",
-        ] if c in df.columns]
+        keep = [c for c in ["timestamp", "symbol", "qty", "side", "price", "notional", "cost", "commission_ht", "vat", "slippage"] if c in df.columns]
         df = df[keep].sort_values(["timestamp", "symbol"]).reset_index(drop=True)
-
-        # Running net invested across all fills (account-level)
-        df["net_invested"] = df["signed_notional"].cumsum()
-
-        # Reconstruct cash path using the same convention as PortfolioState.apply_fill
-        # cash_{t} = initial_cash + cumsum( -signed_notional - cost )
-        df["cash_after"] = float(initial_cash) + (-df["signed_notional"] - df["cost"].fillna(0.0)).cumsum()
-
         return df
 
     def _round_trips_from_fills(self, fills: pd.DataFrame) -> pd.DataFrame:

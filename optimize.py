@@ -295,7 +295,7 @@ def run_optimization(
     base_spec: EngineSpec,
     active_params: List[ParamDef],
     cfg: OptimizeConfig,
-) -> Tuple[TrialResult, pd.DataFrame, Dict[str, Any], EngineSpec, pd.DataFrame]:
+) -> Tuple[TrialResult, pd.DataFrame, Dict[str, Any], EngineSpec]:
     """
     Fast optimizer:
       - load MarketData once
@@ -329,40 +329,33 @@ def run_optimization(
     if len(common_index) < 2:
         raise ValueError("Not enough bars after alignment; need at least 2 timestamps.")
 
-    # 3) Precompute arrays once (ALWAYS) + SMA bank (IF NEEDED)
+    # 3) Precompute union features once
     sma_windows = adapter.required_sma_windows(base_spec, active_params)
 
-    def _sma_bank_numpy(close: np.ndarray, windows: List[int]) -> Dict[str, np.ndarray]:
-        n = close.size
-        csum = np.cumsum(np.insert(close.astype(np.float64, copy=False), 0, 0.0))
-        out: Dict[str, np.ndarray] = {}
-        for w0 in windows:
-            w = int(w0)
-            sma = np.full(n, np.nan, dtype=np.float64)
-            if 0 < w <= n:
-                sma[w - 1 :] = (csum[w:] - csum[:-w]) / w
-            out[f"sma_{w}"] = sma
-        return out
-
-    # --- aligned price arrays ONCE ---
-    bars_open: Dict[str, np.ndarray] = {}
-    bars_close: Dict[str, np.ndarray] = {}
-
-    for s in symbols:
-        b = md.bars[s].reindex(common_index)  # aligned already; reindex ok & explicit
-        bars_open[s] = b["Open"].to_numpy(dtype=np.float64, copy=False)
-        bars_close[s] = b["Close"].to_numpy(dtype=np.float64, copy=False)
-
-    # --- SMA bank (optional) ---
+    feats: Optional[FeaturesData] = None
     bank: Dict[str, Dict[str, np.ndarray]] = {s: {} for s in symbols}
+
     if sma_windows:
-        uniq = sorted(set(int(w) for w in sma_windows))
-        bank = {s: _sma_bank_numpy(bars_close[s], uniq) for s in symbols}
+        specs = [
+            FeatureSpec(indicator="sma", params={"window": int(w)}, inputs=("Close",), warmup=int(w))
+            for w in sma_windows
+        ]
+        ind = IndicatorEngine(
+            cache_dir=cfg.feature_cache_dir,
+            enable_disk_cache=cfg.enable_disk_cache,
+            enable_memory_cache=cfg.enable_memory_cache,
+            engine_version="v1",
+        )
+        feats = ind.compute(md, specs=specs, symbols=symbols)
 
-
-        
-
-
+        # Convert features to numpy arrays (hot loop wants arrays)
+        for s in symbols:
+            fdf = feats.features[s].reindex(common_index)  # ensure aligned
+            for w in sma_windows:
+                col = f"sma_{int(w)}"
+                if col not in fdf.columns:
+                    raise KeyError(f"Missing feature column '{col}' for symbol '{s}'. Have: {list(fdf.columns)[:10]} ...")
+                bank[s][col] = fdf[col].to_numpy(dtype=np.float64)
 
     # bars close arrays (needed for sma_price; also convenient)
     bars_close: Dict[str, np.ndarray] = {}
@@ -386,12 +379,10 @@ def run_optimization(
             md=md,
             common_index=common_index,
             bank=bank,
-            bars_open=bars_open,      # NEW
             bars_close=bars_close,
             adapter=adapter,
             params=params,
         )
-
         results.append(r)
 
     df = pd.DataFrame([{
@@ -406,15 +397,13 @@ def run_optimization(
     # rank valid rows by (pnl desc, efficiency desc)
     df_valid = df[df["error"].isna()].copy()
     if df_valid.empty:
-        ranked_df = df.sort_values(["pnl", "efficiency"], ascending=[False, False]).reset_index(drop=True)
-        top_df = ranked_df.head(int(cfg.top_k)).reset_index(drop=True)
-        best = ranked_df.iloc[0]
+        top_df = df.sort_values(["pnl", "efficiency"], ascending=[False, False]).head(int(cfg.top_k)).reset_index(drop=True)
+        best = results[0]
         best_spec = _apply_params_to_spec(base_spec, best.params)
         return best, top_df, best.params, best_spec
 
-    ranked_df = df_valid.sort_values(["pnl", "efficiency"], ascending=[False, False]).reset_index(drop=True)
     df_valid = df_valid.sort_values(["pnl", "efficiency"], ascending=[False, False])
-    top_df = ranked_df.head(int(cfg.top_k)).reset_index(drop=True)
+    top_df = df_valid.head(int(cfg.top_k)).reset_index(drop=True)
 
     best_row = top_df.iloc[0].to_dict()
     best_params = {k: best_row[k] for k in best_row.keys() if k not in ("pnl", "traded_notional", "efficiency", "n_fills", "error")}
@@ -427,150 +416,93 @@ def run_optimization(
         error=None,
     )
     best_spec = _apply_params_to_spec(base_spec, best.params)
-    return best, top_df, best_params, best_spec, ranked_df
+    return best, top_df, best_params, best_spec
 
 
-def build_spec_from_result_row(base_spec: EngineSpec, row: Any) -> EngineSpec:
-    if isinstance(row, pd.Series):
-        d = row.to_dict()
-    else:
-        d = dict(row)
-
-    metric_cols = {"pnl", "traded_notional", "efficiency", "n_fills", "error"}
-    params = {k: v for k, v in d.items() if k not in metric_cols}
-    return _apply_params_to_spec(base_spec, params)
 # ============================================================
 # Trial evaluation
 # ============================================================
+
 def _eval_one_trial(
     base_spec: EngineSpec,
     md: MarketData,
     common_index: pd.DatetimeIndex,
     bank: Dict[str, Dict[str, np.ndarray]],
-    bars_open: Dict[str, np.ndarray],
     bars_close: Dict[str, np.ndarray],
     adapter: StrategyAdapter,
     params: Dict[str, Any],
 ) -> TrialResult:
+
+
+    # Validate strategy constraints early (fast<slow, etc.)
+    ok, err = adapter.validate_params(params, base_spec)
+    if not ok:
+        return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, error=err)
+
     try:
-        symbols = list(base_spec.data.symbols)
-        if len(symbols) != 1:
-            # Fallback to your old logic (multi-symbol) for now
-            return _eval_one_trial_slow_pandas(
-                base_spec=base_spec,
-                md=md,
-                common_index=common_index,
-                bank=bank,
-                bars_close=bars_close,
-                adapter=adapter,
-                params=params,
-            )
-
-        sym = symbols[0]
-
-        # ----------------------------
-        # A) Select the backtest window (optional)
-        # ----------------------------
-        # If you have a param like params["data.window"] = ("2020-01-01","2022-12-31")
-        # Otherwise just use the full aligned arrays.
-        idx_pos = None
-        if "data.window" in params and params["data.window"] is not None:
-            start, end = params["data.window"]
-            idx_slice = common_index
-            if start is not None:
-                idx_slice = idx_slice[idx_slice >= pd.to_datetime(start)]
-            if end is not None:
-                idx_slice = idx_slice[idx_slice <= pd.to_datetime(end)]
-            if len(idx_slice) < 2:
-                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, error="window too small")
-            idx_pos = common_index.get_indexer_for(idx_slice)
-
-        open_px = bars_open[sym] if idx_pos is None else bars_open[sym][idx_pos]
-        close_px = bars_close[sym] if idx_pos is None else bars_close[sym][idx_pos]
-
-        # ----------------------------
-        # B) Build numpy signals from SMA bank (no pandas)
-        # ----------------------------
-        sk = base_spec.strategy.kind.lower()
-
-        # Pull allow_short / etc from params (or base_spec)
-        allow_short = bool(params.get("strategy.allow_short", base_spec.strategy.params.get("allow_short", False)))
-
-        if sk == "sma_price":
-            w = int(params.get("strategy.window", base_spec.strategy.params.get("window", 50)))
-            sma = bank[sym].get(f"sma_{w}")
-            if sma is None:
-                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, error=f"missing sma_{w} in bank")
-            if idx_pos is not None:
-                sma = sma[idx_pos]
-
-            valid = np.isfinite(close_px) & np.isfinite(sma)
-            if allow_short:
-                sig = np.zeros(close_px.size, dtype=np.float64)
-                sig[valid & (close_px > sma)] = 1.0
-                sig[valid & (close_px < sma)] = -1.0
-                sig[~valid] = 0.0
-            else:
-                # long/flat
-                sig = np.where(valid & (close_px > sma), 1.0, 0.0).astype(np.float64)
-
-        elif sk == "ma_cross":
-            f = int(params.get("strategy.fast_window", base_spec.strategy.params.get("fast_window", 15)))
-            s = int(params.get("strategy.slow_window", base_spec.strategy.params.get("slow_window", 50)))
-            sma_f = bank[sym].get(f"sma_{f}")
-            sma_s = bank[sym].get(f"sma_{s}")
-            if sma_f is None or sma_s is None:
-                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, error=f"missing sma_{f} or sma_{s} in bank")
-            if idx_pos is not None:
-                sma_f = sma_f[idx_pos]
-                sma_s = sma_s[idx_pos]
-
-            valid = np.isfinite(sma_f) & np.isfinite(sma_s)
-            if allow_short:
-                sig = np.zeros(sma_f.size, dtype=np.float64)
-                sig[valid & (sma_f > sma_s)] = 1.0
-                sig[valid & (sma_f < sma_s)] = -1.0
-                sig[~valid] = 0.0
-            else:
-                sig = np.where(valid & (sma_f > sma_s), 1.0, 0.0).astype(np.float64)
-
+        # Optional date-window slicing
+        win = params.get("data.window", None)
+        if win is not None:
+            start, end = win
+            idx_slice = _slice_index(common_index, start, end)
+            if idx_slice is None or len(idx_slice) < 2:
+                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, error="date window too small/empty")
+            index = idx_slice
         else:
-            return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, error=f"unknown strategy kind {sk}")
+            index = common_index
 
-        # ----------------------------
-        # C) Build portfolio config for this trial (apply params)
-        # ----------------------------
-        port_cfg = _apply_portfolio_params(base_spec.portfolio, params)
-        port = PortfolioEngine(port_cfg)
+        symbols = list(base_spec.data.symbols)        # Signals from feature bank (fast, no indicator recompute)
+        # IMPORTANT: avoid per-trial indexer/reindex work when not slicing a date window.
+        if win is None:
+            bars_close_arg = bars_close
+            md_slice = md
+        else:
+            idx_pos = common_index.get_indexer_for(index)
+            bars_close_arg = {s: bars_close[s][idx_pos] for s in symbols}
+            # We must pass MarketData whose bars align with 'index'
+            md_slice = _slice_marketdata(md, symbols, index)
 
-        # IMPORTANT: call your NEW arrays fast path
-        stats = port.run_stats_only_arrays(open_px=open_px, close_px=close_px, sig=sig)
-
-        pnl = float(stats.pnl)
-        traded = float(stats.traded_notional)
-        n_fills = int(stats.n_fills)
-        eff = pnl / traded if traded > 0 else float("-inf")
-
-        return TrialResult(
+        sf = adapter.make_signals_from_bank(
+            symbols=symbols,
+            index=index,
+            bank=bank,
+            bars_close=bars_close_arg,
             params=params,
-            pnl=pnl,
-            traded_notional=traded,
-            efficiency=eff,
-            n_fills=n_fills,
-            error=None,
+            base_spec=base_spec,
         )
+
+        # Portfolio config patched per trial (cooldown + sizing knobs)
+        port_cfg = base_spec.portfolio
+        port_cfg = _apply_portfolio_params(port_cfg, params)
+
+        # Run portfolio fast stats if available, else full run
+        port = PortfolioEngine(port_cfg)
+        # Try fast-path stats-only if it exists AND actually returns something usable
+        used_fast = False
+        if hasattr(port, "run_stats_only"):
+            try:
+                stats = port.run_stats_only(md_slice, sf, symbols=symbols)  # type: ignore[attr-defined]
+                if stats is not None and all(hasattr(stats, k) for k in ("pnl", "traded_notional", "n_fills")):
+                    pnl = float(stats.pnl)
+                    traded = float(stats.traded_notional)
+                    n_fills = int(stats.n_fills)
+                    used_fast = True
+            except Exception:
+                used_fast = False
+
+        # Fallback to full portfolio run (always works)
+        if not used_fast:
+            pres = port.run(md_slice, sf, symbols=symbols)
+            pnl = float(pres.equity_curve.iloc[-1]) - float(port_cfg.initial_cash) if len(pres.equity_curve) else 0.0
+            traded = float(pres.trades["notional"].sum()) if (not pres.trades.empty and "notional" in pres.trades.columns) else 0.0
+            n_fills = int(len(pres.trades))
+
+
+        eff = pnl / traded if traded > 0 else float("-inf")
+        return TrialResult(params=params, pnl=pnl, traded_notional=traded, efficiency=eff, n_fills=n_fills)
 
     except Exception as e:
-        return TrialResult(
-            params=params,
-            pnl=float("-inf"),
-            traded_notional=0.0,
-            efficiency=float("-inf"),
-            n_fills=0,
-            error=str(e),
-        )
-
-
+        return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, error=str(e))
 
 
 # ============================================================

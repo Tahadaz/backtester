@@ -1,8 +1,6 @@
+# app.py (Streamlit entrypoint) — FIXED to match your optimize.py API
+
 from __future__ import annotations
-
-import streamlit as st
-st.set_page_config(page_title="Backtester", layout="wide")
-
 
 import os
 import tempfile
@@ -14,8 +12,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-from optimize import build_spec_from_result_row
-
+import streamlit as st
 import plotly.graph_objects as go
 
 # ---- Project imports ----
@@ -31,13 +28,13 @@ from optimize import (
 from data import BMCEDataSource, YahooFinanceDataSource
 from results import ResultsAnalyzer
 
-
-
-
 import optimize as _opt_mod
-st.title("Backtester (TA) — Backtest / Optimize")
 st.sidebar.caption(f"optimize.py loaded from: {_opt_mod.__file__}")
 st.sidebar.caption(f"run_optimization: {_opt_mod.run_optimization.__module__}.{_opt_mod.run_optimization.__name__}")
+
+st.set_page_config(page_title="Backtester", layout="wide")
+st.title("Backtester (TA) — Backtest / Optimize")
+
 # ============================================================
 # Upload persistence (FIXES caching + speed)
 #   - Streamlit reruns were writing uploads to a NEW temp path each run,
@@ -983,6 +980,7 @@ with tab_opt:
 
     st.markdown("### Optimization method")
     method = st.selectbox("Method", ["random", "grid"], index=0, key="opt_method")
+    seed = st.number_input("Seed", min_value=0, value=42, step=1, key="opt_seed")
     top_k = st.number_input("Show top K", min_value=5, value=30, step=5, key="opt_topk")
 
     if method == "random":
@@ -1073,22 +1071,19 @@ with tab_opt:
 
             opt_cfg = OptimizeConfig(
                 method=str(method),
-                seed=42,
+                seed=int(seed),
                 n_trials=int(n_trials) if method == "random" else 0,
                 top_k=int(top_k),
                 # NOTE: no "objective" field in your OptimizeConfig
             )
 
             with st.spinner("Running optimization..."):
-                best, top_df, best_params, best_spec, ranked_df = run_optimization(
+                best, top_df, best_params, best_spec = run_optimization(
                     base_spec=base_spec,
                     active_params=active_params,
                     cfg=opt_cfg,
                 )
-            st.session_state["opt_best"] = best
-            st.session_state["opt_top_df"] = top_df
-            st.session_state["opt_best_params"] = best_params
-            st.session_state["opt_best_spec"] = best_spec
+
             st.success("Optimization finished (ranked by pnl then efficiency).")
 
             st.subheader("Best result")
@@ -1107,96 +1102,52 @@ with tab_opt:
                         [c for c in top_df.columns if c not in ("pnl","efficiency","traded_notional","n_fills","error")]
             st.dataframe(top_df[show_cols], use_container_width=True)
 
-            if ranked_df is not None and isinstance(ranked_df, pd.DataFrame) and (not ranked_df.empty):
-                best5_df = ranked_df.head(5)
-                worst5_df = ranked_df.tail(5).sort_values(["pnl","efficiency"], ascending=[True, True]).reset_index(drop=True)
-                mid_start = max(0, (len(ranked_df) // 2) - 2)
-                mid5_df = ranked_df.iloc[mid_start: mid_start + 5].reset_index(drop=True)
-
-                tab_best, tab_best5, tab_mid5, tab_worst5 = st.tabs(["Best", "Best 5", "Mid 5", "Worst 5"])
-
-                def _candidate_selector(df_in: pd.DataFrame, label: str, key_prefix: str):
-                    st.dataframe(df_in, use_container_width=True)
-                    picked = st.selectbox(
-                        f"Select candidate row ({label})",
-                        options=list(range(len(df_in))),
-                        index=0,
-                        key=f"{key_prefix}_pick",
-                    )
-                    row = df_in.iloc[int(picked)]
-                    spec_i = build_spec_from_result_row(base_spec, row)
-
-                    if st.button(f"Run backtest + ledger for {label} #{int(picked)+1}", key=f"{key_prefix}_run"):
-                        bndl = BacktestEngine(spec_i).run()
-                        st.dataframe(bndl.report.tables.get("trade_ledger", pd.DataFrame()), use_container_width=True)
-                        st.dataframe(bndl.report.tables.get("trades", pd.DataFrame()), use_container_width=True)
-                        st.dataframe(bndl.report.tables.get("trade_performance", pd.DataFrame()), use_container_width=True)
-
-                with tab_best:
-                    _candidate_selector(ranked_df.head(1).reset_index(drop=True), "Best", "opt_best")
-                with tab_best5:
-                    _candidate_selector(best5_df, "Best 5", "opt_best5")
-                with tab_mid5:
-                    _candidate_selector(mid5_df, "Mid 5", "opt_mid5")
-                with tab_worst5:
-                    _candidate_selector(worst5_df, "Worst 5", "opt_worst5")
-
-            
             st.divider()
-            # Auto-run the best configuration backtest (no extra button)
-            with st.spinner("Running best backtest..."):
-                bundle = BacktestEngine(best_spec).run()
-                # ============================================================
-                # Optional: rebuild report with benchmark (no engine changes)
-                # ============================================================
-                if use_benchmark and bench_source_key and bench_symbol:
-                    try:
-                        bench_md = load_benchmark_market_data_cached(
-                            bench_source_key=bench_source_key,
-                            bench_symbol=bench_symbol,
-                            timezone=timezone,
-                            interval=interval,
-                            bmce_path=bench_tmp_path if bench_source_key == "bmce" else None,
-                            start=start_str,
-                            end=end_str,
-                            yf_period=bench_yf_period,
-                            yf_interval=bench_yf_interval,
-                            yf_auto_adjust=bench_yf_auto_adjust,
-                        )
+            if st.button("Run best configuration backtest", key="run_best_backtest_btn"):
+                with st.spinner("Running best backtest..."):
+                    bundle = BacktestEngine(best_spec).run()
+                    # ============================================================
+                    # Optional: rebuild report with benchmark (no engine changes)
+                    # ============================================================
+                    if use_benchmark and bench_source_key and bench_symbol:
+                        try:
+                            bench_md = load_benchmark_market_data_cached(
+                                bench_source_key=bench_source_key,
+                                bench_symbol=bench_symbol,
+                                timezone=timezone,
+                                interval=interval,
+                                bmce_path=bench_tmp_path if bench_source_key == "bmce" else None,
+                                start=start_str,
+                                end=end_str,
+                                yf_period=bench_yf_period,
+                                yf_interval=bench_yf_interval,
+                                yf_auto_adjust=bench_yf_auto_adjust,
+                            )
 
-                        analyzer = ResultsAnalyzer(periods_per_year=252, rf_annual=0.0)
+                            analyzer = ResultsAnalyzer(periods_per_year=252, rf_annual=0.0)
 
-                        # robust attribute fetch (adjust once you confirm exact bundle field names)
-                        portfolio_result = getattr(bundle, "portfolio_result", None) or getattr(bundle, "portfolio", None) or getattr(bundle, "pres", None)
-                        if portfolio_result is None:
-                            raise AttributeError("Bundle has no portfolio result attribute (expected portfolio_result/portfolio/pres).")
-                        report = analyzer.analyze(
-                            portfolio_result=portfolio_result,
-                            market_data=bundle.md,
-                            symbols=bundle.md.symbols(),
-                            features_data=getattr(bundle, "feats", None),
-                            plot_indicators=getattr(bundle.report.plots.get("price_panel", {}), "indicator_cols", None) if hasattr(bundle, "report") else None,
-                            benchmark_market_data=bench_md,
-                            benchmark_symbol=bench_symbol,
-                        )
+                            # robust attribute fetch (adjust once you confirm exact bundle field names)
+                            portfolio_result = getattr(bundle, "portfolio_result", None) or getattr(bundle, "portfolio", None) or getattr(bundle, "pres", None)
+                            if portfolio_result is None:
+                                raise AttributeError("Bundle has no portfolio result attribute (expected portfolio_result/portfolio/pres).")
 
-                        # overwrite bundle.report so render_bundle() stays unchanged
-                        bundle.report = report
+                            report = analyzer.analyze(
+                                portfolio_result=portfolio_result,
+                                market_data=bundle.md,
+                                symbols=bundle.md.symbols(),
+                                features_data=getattr(bundle, "feats", None),
+                                plot_indicators=getattr(bundle.report.plots.get("price_panel", {}), "indicator_cols", None) if hasattr(bundle, "report") else None,
+                                benchmark_market_data=bench_md,
+                                benchmark_symbol=bench_symbol,
+                            )
 
-                    except Exception as e:
-                        st.warning(f"Benchmark could not be applied: {e}")
+                            # overwrite bundle.report so render_bundle() stays unchanged
+                            bundle.report = report
 
-            # Persist bundle so UI doesn't 'lose' it on rerun
-            st.session_state["opt_best_bundle"] = bundle
+                        except Exception as e:
+                            st.warning(f"Benchmark could not be applied: {e}")
 
-            # Show the fills ledger (one row per execution) with net_invested
-            fills_df = getattr(bundle, "report", None).tables.get("trades", pd.DataFrame()) if getattr(bundle, "report", None) is not None else pd.DataFrame()
-            if fills_df is not None and not fills_df.empty and "net_invested" in fills_df.columns:
-                st.subheader("Best strategy fills ledger (net_invested)")
-                show_cols = [c for c in ["timestamp","symbol","side","qty","price","notional","cost","net_invested","cash_after"] if c in fills_df.columns]
-                st.dataframe(fills_df[show_cols], use_container_width=True)
-
-            render_bundle(bundle)
+                render_bundle(bundle)
 
         finally:
             if bench_is_temp and bench_tmp_path and os.path.exists(bench_tmp_path):
@@ -1219,36 +1170,3 @@ with tab_opt:
                     os.rmdir(tmp_dir)
                 except OSError:
                     pass
-    # ------------------------------------------------------------
-    # Persisted optimization display (survives Streamlit reruns)
-    # ------------------------------------------------------------
-    if (not run_opt) and (st.session_state.get("opt_best_bundle") is not None):
-        best = st.session_state.get("opt_best", None)
-        top_df = st.session_state.get("opt_top_df", None)
-        bundle = st.session_state.get("opt_best_bundle")
-
-        st.success("Optimization finished (loaded from session cache).")
-
-        if best is not None:
-            st.subheader("Best result")
-            st.json({
-                "pnl": getattr(best, "pnl", None),
-                "efficiency": getattr(best, "efficiency", None),
-                "traded_notional": getattr(best, "traded_notional", None),
-                "n_fills": getattr(best, "n_fills", None),
-                "params": getattr(best, "params", None),
-                "error": getattr(best, "error", None),
-            })
-
-        if isinstance(top_df, pd.DataFrame):
-            st.subheader("Top candidates")
-            show_cols = [c for c in top_df.columns if c in ("pnl","efficiency","traded_notional","n_fills","error")] + \
-                        [c for c in top_df.columns if c not in ("pnl","efficiency","traded_notional","n_fills","error")]
-            st.dataframe(top_df[show_cols], use_container_width=True)
-            fills_df = getattr(bundle, "report", None).tables.get("trades", pd.DataFrame()) if getattr(bundle, "report", None) is not None else pd.DataFrame()
-            if fills_df is not None and not fills_df.empty and "net_invested" in fills_df.columns:
-                st.subheader("Best strategy fills ledger (net_invested)")
-                show_cols = [c for c in ["timestamp","symbol","side","qty","price","notional","cost","net_invested","cash_after"] if c in fills_df.columns]
-                st.dataframe(fills_df[show_cols], use_container_width=True)
-
-            render_bundle(bundle)

@@ -22,7 +22,7 @@ import json
 import pandas as pd
 
 
-CANONICAL_COLS = ["Open", "High", "Low", "Close", "Volume"]
+CANONICAL_COLS = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
 
 
 # ----------------------------

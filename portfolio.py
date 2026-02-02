@@ -348,31 +348,6 @@ class PortfolioEngine:
             trades=trades,
             meta=meta,
         )
-    # portfolio.py  (inside class PortfolioEngine)
-
-    def run_stats_only_arrays(
-        self,
-        open_px: np.ndarray,
-        close_px: np.ndarray,
-        sig: np.ndarray,
-    ) -> PortfolioStats:
-        """
-        Ultra-fast stats-only path:
-        - open_px, close_px: aligned arrays (same length)
-        - sig: aligned signal array values in {-1,0,1} or {0,1}
-        """
-        pnl, traded, n_fills, final_eq = self._run_stats_fast_single(
-            np.asarray(open_px, dtype=np.float64),
-            np.asarray(close_px, dtype=np.float64),
-            np.asarray(sig, dtype=np.float64),
-        )
-        return PortfolioStats(
-            final_equity=float(final_eq),
-            pnl=float(pnl),
-            traded_notional=float(traded),
-            n_fills=int(n_fills),
-        )
-
     
     def run_stats_only(
         self,
