@@ -797,7 +797,7 @@ What this optimize.py does (fast + robust):
 
 5) Objective:
    - Primary: pnl = final_equity - initial_cash
-   - Secondary: efficiency = pnl / traded_notional (if traded_notional>0 else -inf)
+   - Secondary: efficiency = pnl / net_inv (if net_inv>0 else -inf)
    - Ranking: sort by pnl desc, efficiency desc.
 
 Return values:

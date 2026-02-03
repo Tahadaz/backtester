@@ -1095,7 +1095,6 @@ with tab_opt:
             st.json({
                 "pnl": best.pnl,
                 "efficiency": best.efficiency,
-                "traded_notional": best.traded_notional,
                 "n_fills": best.n_fills,
                 "params": best.params,
                 "error": best.error,
@@ -1103,8 +1102,8 @@ with tab_opt:
 
             st.subheader("Top candidates")
             # Ensure pnl + efficiency visible even if many params
-            show_cols = [c for c in top_df.columns if c in ("pnl","efficiency","traded_notional","n_fills","error")] + \
-                        [c for c in top_df.columns if c not in ("pnl","efficiency","traded_notional","n_fills","error")]
+            show_cols = [c for c in top_df.columns if c in ("pnl","n_fills","error")] + \
+                        [c for c in top_df.columns if c not in ("pnl","n_fills","error")]
             st.dataframe(top_df[show_cols], use_container_width=True)
 
             if ranked_df is not None and isinstance(ranked_df, pd.DataFrame) and (not ranked_df.empty):
@@ -1233,8 +1232,6 @@ with tab_opt:
             st.subheader("Best result")
             st.json({
                 "pnl": getattr(best, "pnl", None),
-                "efficiency": getattr(best, "efficiency", None),
-                "traded_notional": getattr(best, "traded_notional", None),
                 "n_fills": getattr(best, "n_fills", None),
                 "params": getattr(best, "params", None),
                 "error": getattr(best, "error", None),
@@ -1242,8 +1239,8 @@ with tab_opt:
 
         if isinstance(top_df, pd.DataFrame):
             st.subheader("Top candidates")
-            show_cols = [c for c in top_df.columns if c in ("pnl","efficiency","traded_notional","n_fills","error")] + \
-                        [c for c in top_df.columns if c not in ("pnl","efficiency","traded_notional","n_fills","error")]
+            show_cols = [c for c in top_df.columns if c in ("pnl","n_fills","error")] + \
+                        [c for c in top_df.columns if c not in ("pnl","n_fills","error")]
             st.dataframe(top_df[show_cols], use_container_width=True)
             fills_df = getattr(bundle, "report", None).tables.get("trades", pd.DataFrame()) if getattr(bundle, "report", None) is not None else pd.DataFrame()
             if fills_df is not None and not fills_df.empty and "net_invested" in fills_df.columns:
