@@ -132,12 +132,9 @@ EXPLAIN = {
         "why": "You rank candidates by PnL first, then Efficiency. Turnover proxy is traded notional. n_fills is trade count.",
         "latex": (
             r"\mathrm{PnL}=E_T-E_0"
-            "\n"
-            r"\mathrm{TradedNotional}=\sum_k |\mathrm{qty}_k|\cdot \mathrm{price}_k"
-            "\n"
-            r"\mathrm{Efficiency}=\frac{\mathrm{PnL}}{\mathrm{TradedNotional}}"
-        ),
-        "notes": "Ranking rule: sort by (PnL desc, Efficiency desc).",
+r"\mathrm{VolumeInv}=\sum_m \left(\sum_{k\in m}^{\le \mathrm{lastSELL}(m)} \mathrm{signed\_notional}_k\right)"
+r"\mathrm{Efficiency}=\begin{cases}1,&\mathrm{VolumeInv}\le 0\\ \frac{\mathrm{PnL}}{\mathrm{VolumeInv}},&\mathrm{VolumeInv}>0\end{cases}"),
+        "notes": "Ranking rule: sort by (PnL desc, Efficiency desc). VolumeInv is computed from fills (BUY:+notional, SELL:-notional) with a reset after the last SELL of each month.",
     },
 }
 
@@ -186,10 +183,12 @@ INFO = {
     ),
     # optimization
     "opt.pnl": "Optimization PnL: final_equity - initial_cash.",
-    "opt.traded_notional": "Traded notional: Σ |qty|×price across fills (activity / turnover proxy).",
     "opt.efficiency": (
-        "Efficiency = PnL / traded_notional.\n"
-        "Secondary objective after PnL: prefers profit per unit of turnover."
+        "Efficiency (performance) is defined as:\n"
+        "If VolumeInv <= 0: Efficiency = 100%\n"
+        "Else: Efficiency = PnL / VolumeInv\n\n"
+        "VolumeInv = (cash bought) - (cash sold) = Σ signed_notional, where BUY:+notional and SELL:-notional.\n"
+        "Reset rule: VolumeInv is reset right after the last SELL fill of each calendar month (so months are treated independently)."
     ),
     "opt.n_fills": "Number of fills executed (proxy for trade frequency).",
 }
@@ -759,6 +758,22 @@ else:
 
 tab_backtest, tab_opt = st.tabs(["Backtest", "Optimize"])
 
+# ---- Global date range used by BOTH Backtest and Optimize ----
+use_date_range = st.sidebar.checkbox("Use date range", value=False)
+
+c1, c2 = st.sidebar.columns(2)
+with c1:
+    start_date = st.date_input("Start date", value=None, disabled=not use_date_range)
+with c2:
+    end_date = st.date_input("End date", value=None, disabled=not use_date_range)
+
+start_str = start_date.isoformat() if (use_date_range and start_date) else None
+end_str = end_date.isoformat() if (use_date_range and end_date) else None
+
+if use_date_range and start_str and end_str and start_str > end_str:
+    st.sidebar.error("Start date must be <= End date")
+    st.stop()
+
 
 # ============================================================
 # Backtest Tab (FORM)
@@ -768,16 +783,6 @@ with tab_backtest:
     st.subheader("Backtest")
 
     with st.form("backtest_form", clear_on_submit=False):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            use_date_range = st.checkbox("Use date range", value=False)
-        with c2:
-            start_date = st.date_input("Start date", value=None, disabled=(not use_date_range))
-        with c3:
-            end_date = st.date_input("End date", value=None, disabled=(not use_date_range))
-
-        start_str = start_date.isoformat() if (use_date_range and start_date) else None
-        end_str = end_date.isoformat() if (use_date_range and end_date) else None
 
         st.markdown("### Strategy parameters")
         nan_policy = "flat"
@@ -892,7 +897,6 @@ with tab_backtest:
 
 with tab_opt:
     st.subheader("Optimize (rank by pnl then efficiency)")
-
     # Baseline fixed values (used when NOT optimized)
     with st.expander("Fixed baseline (used when NOT optimized)", expanded=False):
         initial_cash0 = st.number_input("Initial cash (baseline)", min_value=1_000.0, value=1_000_000.0, step=10_000.0, key="opt_initial_cash")
@@ -1054,8 +1058,8 @@ with tab_opt:
                 timezone=timezone,
                 interval=interval,
                 bmce_tmp_path=tmp_path,
-                start=None,
-                end=None,
+                start=start_str,
+                end=end_str,
                 yf_period=yf_period,
                 yf_interval=yf_interval,
                 yf_auto_adjust=yf_auto_adjust,
@@ -1102,8 +1106,11 @@ with tab_opt:
 
             st.subheader("Top candidates")
             # Ensure pnl + efficiency visible even if many params
-            show_cols = [c for c in top_df.columns if c in ("pnl","n_fills","error")] + \
-                        [c for c in top_df.columns if c not in ("pnl","n_fills","error")]
+            show_cols = [c for c in ["pnl","efficiency","n_fills","error"] if c in top_df.columns] + \
+                        [c for c in top_df.columns if c not in ("pnl","efficiency","n_fills","error","traded_notional")]
+            # Hide traded_notional from UI if present
+            if "traded_notional" in top_df.columns:
+                top_df = top_df.drop(columns=["traded_notional"])
             st.dataframe(top_df[show_cols], use_container_width=True)
 
             if ranked_df is not None and isinstance(ranked_df, pd.DataFrame) and (not ranked_df.empty):
@@ -1239,8 +1246,11 @@ with tab_opt:
 
         if isinstance(top_df, pd.DataFrame):
             st.subheader("Top candidates")
-            show_cols = [c for c in top_df.columns if c in ("pnl","n_fills","error")] + \
-                        [c for c in top_df.columns if c not in ("pnl","n_fills","error")]
+            show_cols = [c for c in ["pnl","efficiency","n_fills","error"] if c in top_df.columns] + \
+                        [c for c in top_df.columns if c not in ("pnl","efficiency","n_fills","error","traded_notional")]
+            # Hide traded_notional from UI if present
+            if "traded_notional" in top_df.columns:
+                top_df = top_df.drop(columns=["traded_notional"])
             st.dataframe(top_df[show_cols], use_container_width=True)
             fills_df = getattr(bundle, "report", None).tables.get("trades", pd.DataFrame()) if getattr(bundle, "report", None) is not None else pd.DataFrame()
             if fills_df is not None and not fills_df.empty and "net_invested" in fills_df.columns:

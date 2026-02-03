@@ -82,10 +82,15 @@ class ResultsAnalyzer:
                 notes="Equity includes cash + marked-to-market positions."
             ),
             "metric.efficiency": ExplainItem(
-                title="Efficiency (PnL per traded notional)",
-                why="Secondary objective: prefers strategies with less turnover.",
-                latex=r"\mathrm{Eff}=\frac{\mathrm{PnL}}{\sum_k |\text{qty}_k|\cdot \text{price}_k}",
-                notes="If traded_notional = 0 → efficiency is undefined."
+                title="Efficiency (PnL / volume invested)",
+                why=("Normalizes PnL by net cash invested (buys - sells). "
+                     "The invested volume is reset after the last SELL of each calendar month."),
+                latex=(
+                    r"\mathrm{VolumeInv}=\sum_{m}\left(\sum_{k\in m} \mathrm{signed\_notional}_k\right)\;\text{(reset at last SELL of month)}"
+                    "\n"
+                    r"\mathrm{Eff}=\begin{cases}1,&\mathrm{VolumeInv}\le 0\\ \frac{\mathrm{PnL}}{\mathrm{VolumeInv}},&\mathrm{VolumeInv}>0\end{cases}"
+                ),
+                notes="signed_notional = +notional for BUY, -notional for SELL. If VolumeInv <= 0 → set efficiency to 100% (1.0)."
             ),
             "metric.total_return": ExplainItem(
                 title="Total return",
@@ -157,6 +162,11 @@ class ResultsAnalyzer:
         trades = self._prepare_trades_table(portfolio_result.trades, initial_cash=init_cash)
         trade_ledger = self._trade_ledger_from_fills(trades)
         trade_perf = self._trade_performance_summary(trade_ledger)
+
+        # --- efficiency denominator: monthly-reset net invested volume ---
+        volume_inv = self._volume_invested_reset_last_sell_monthly(trades)
+        pnl_total = float(equity.iloc[-1] - equity.iloc[0]) if len(equity) else 0.0
+        efficiency = 1.0 if volume_inv <= 0 else float(pnl_total / volume_inv)
         # --- benchmark series (optional) ---
         bench_rets = None
         bench_cum = None
@@ -197,6 +207,9 @@ class ResultsAnalyzer:
 
         # --- headline metrics (for quick display) ---
         metrics = self._headline_metrics(rets, dd, bench_rets)
+        metrics["PnL"] = float(pnl_total)
+        metrics["VolumeInv"] = float(volume_inv)
+        metrics["Efficiency"] = float(efficiency)
 
         # --- time series table ---
         ts = pd.DataFrame(
@@ -426,8 +439,123 @@ class ResultsAnalyzer:
         # cash_{t} = initial_cash + cumsum( -signed_notional - cost )
         df["cash_after"] = float(initial_cash) + (-df["signed_notional"] - df["cost"].fillna(0.0)).cumsum()
 
+        # -------------------------------
+        # Monthly VolumeInv reset markers
+        # -------------------------------
+        # These columns make the Efficiency denominator auditable from the fills ledger.
+        # - month_net_invested: cumulative signed_notional within each calendar month
+        # - is_last_sell_in_month: True on the last SELL fill of each month (if any)
+        # - month_volumeinv_at_last_sell: month_net_invested value on that last SELL row (else NaN)
+        # Overall VolumeInv (used for Efficiency) equals:
+        #   sum(month_volumeinv_at_last_sell over months with sells) + sum(month_net_invested end-of-month for months with no sells)
+        df["_month"] = df["timestamp"].dt.to_period("M")
+
+        # Cumulative signed notional within month
+        df["month_net_invested"] = df.groupby("_month")["signed_notional"].cumsum()
+
+        # Identify last SELL timestamp per month (if any)
+        sell_mask = df["side"].astype(str).str.upper().eq("SELL")
+        last_sell_ts = (
+            df.loc[sell_mask]
+              .groupby("_month")["timestamp"]
+              .max()
+        )
+
+        df["is_last_sell_in_month"] = df["_month"].map(last_sell_ts).eq(df["timestamp"])
+
+        # Put the month_net_invested value only on the last sell row
+        df["month_volumeinv_at_last_sell"] = np.where(
+            df["is_last_sell_in_month"],
+            df["month_net_invested"],
+            np.nan,
+        )
+
+        # Human-readable month label
+        df["month"] = df["_month"].astype(str)
+
+        # Cleanup internal
+        df = df.drop(columns=["_month"])
+
         return df
 
+
+    def _volume_invested_reset_last_sell_monthly(self, fills: pd.DataFrame) -> float:
+        """Compute VolumeInv with a monthly reset at the *last* SELL of each month.
+
+        Definition requested:
+          VolumeInv = (cash bought with) - (cash sold with)
+                    = Σ signed_notional, where signed_notional = +notional for BUY, -notional for SELL.
+
+        Reset rule:
+          For each calendar month, we treat the last SELL fill in that month as a reset point.
+          Operationally, we compute the net invested *per month* (using fills up to and including
+          that last SELL when it exists), then sum across months.
+
+        Notes:
+          - If a month has no SELL fills, we use the whole month's Σ signed_notional.
+          - This is a backtest-level scalar (used as the denominator for Efficiency).
+        """
+        if fills is None or fills.empty:
+            return 0.0
+
+        f = fills.copy()
+        if "timestamp" not in f.columns:
+            return 0.0
+
+        f["timestamp"] = pd.to_datetime(f["timestamp"], errors="coerce")
+        f = f.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+        # Prefer signed_notional if present (comes from _prepare_trades_table).
+        if "signed_notional" in f.columns:
+            sn = pd.to_numeric(f["signed_notional"], errors="coerce").fillna(0.0).astype(float)
+        else:
+            # Fallback: infer from qty/price/notional if needed.
+            if "notional" in f.columns:
+                notional = pd.to_numeric(f["notional"], errors="coerce").fillna(0.0).astype(float)
+            elif ("qty" in f.columns) and ("price" in f.columns):
+                q = pd.to_numeric(f["qty"], errors="coerce").fillna(0.0).astype(float)
+                p = pd.to_numeric(f["price"], errors="coerce").fillna(0.0).astype(float)
+                notional = (q.abs() * p).astype(float)
+            else:
+                return 0.0
+
+            # Determine side: prefer explicit 'side', else sign of qty.
+            if "side" in f.columns:
+                side = f["side"].astype(str).str.upper()
+                sn = np.where(side == "SELL", -notional, notional).astype(float)
+                sn = pd.Series(sn, index=f.index)
+            elif "qty" in f.columns:
+                q = pd.to_numeric(f["qty"], errors="coerce").fillna(0.0).astype(float)
+                sn = np.where(q < 0, -notional, notional).astype(float)
+                sn = pd.Series(sn, index=f.index)
+            else:
+                return 0.0
+
+        f["_signed_notional"] = sn
+
+        # SELL mask
+        if "side" in f.columns:
+            sell_mask = f["side"].astype(str).str.upper().eq("SELL")
+        elif "qty" in f.columns:
+            sell_mask = pd.to_numeric(f["qty"], errors="coerce").fillna(0.0).astype(float) < 0
+        else:
+            sell_mask = pd.Series(False, index=f.index)
+
+        f["_month"] = f["timestamp"].dt.to_period("M")
+
+        vol_total = 0.0
+        for m, g in f.groupby("_month", sort=True):
+            g = g.sort_values("timestamp")
+            g_sells = g[sell_mask.loc[g.index]]
+            if not g_sells.empty:
+                last_sell_ts = g_sells["timestamp"].max()
+                g_use = g[g["timestamp"] <= last_sell_ts]
+            else:
+                g_use = g
+
+            vol_total += float(g_use["_signed_notional"].sum())
+
+        return float(vol_total)
     def _round_trips_from_fills(self, fills: pd.DataFrame) -> pd.DataFrame:
         """
         Build round-trip trades from fills.
