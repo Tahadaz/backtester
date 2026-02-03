@@ -62,6 +62,7 @@ class ParamDef:
 class TrialResult:
     params: Dict[str, Any]
     pnl: float
+    traded_notional: float
     efficiency: float
     n_fills: int
     error: Optional[str] = None
@@ -389,6 +390,7 @@ def run_optimization(
     df = pd.DataFrame([{
         **r.params,
         "pnl": r.pnl,
+        "traded_notional": r.traded_notional,
         "efficiency": r.efficiency,
         "n_fills": r.n_fills,
         "error": r.error,
@@ -399,19 +401,30 @@ def run_optimization(
     if df_valid.empty:
         ranked_df = df.sort_values(["pnl", "efficiency"], ascending=[False, False]).reset_index(drop=True)
         top_df = ranked_df.head(int(cfg.top_k)).reset_index(drop=True)
-        best = ranked_df.iloc[0]
+
+        best_row = top_df.iloc[0].to_dict()
+        best_params = {k: best_row[k] for k in best_row.keys() if k not in ("pnl", "traded_notional", "efficiency", "n_fills", "error")}
+        best = TrialResult(
+            params=best_params,
+            pnl=float(best_row["pnl"]),
+            traded_notional=float(best_row.get("traded_notional", 0.0)),
+            efficiency=float(best_row.get("efficiency", float("-inf"))),
+            n_fills=int(best_row.get("n_fills", 0)),
+            error=str(best_row.get("error")) if best_row.get("error") is not None else None,
+        )
         best_spec = _apply_params_to_spec(base_spec, best.params)
-        return best, top_df, best.params, best_spec
+        return best, top_df, best_params, best_spec, ranked_df
 
     ranked_df = df_valid.sort_values(["pnl", "efficiency"], ascending=[False, False]).reset_index(drop=True)
     df_valid = df_valid.sort_values(["pnl", "efficiency"], ascending=[False, False])
     top_df = ranked_df.head(int(cfg.top_k)).reset_index(drop=True)
 
     best_row = top_df.iloc[0].to_dict()
-    best_params = {k: best_row[k] for k in best_row.keys() if k not in ("pnl", "efficiency", "n_fills", "error")}
+    best_params = {k: best_row[k] for k in best_row.keys() if k not in ("pnl", "traded_notional", "efficiency", "n_fills", "error")}
     best = TrialResult(
         params=best_params,
         pnl=float(best_row["pnl"]),
+        traded_notional=float(best_row["traded_notional"]),
         efficiency=float(best_row["efficiency"]),
         n_fills=int(best_row["n_fills"]),
         error=None,
@@ -426,9 +439,19 @@ def build_spec_from_result_row(base_spec: EngineSpec, row: Any) -> EngineSpec:
     else:
         d = dict(row)
 
-    metric_cols = {"pnl", "efficiency", "n_fills", "error"}
+    metric_cols = {"pnl", "traded_notional", "efficiency", "n_fills", "error"}
     params = {k: v for k, v in d.items() if k not in metric_cols}
     return _apply_params_to_spec(base_spec, params)
+
+def _eval_one_trial_slow_pandas(*args, **kwargs) -> TrialResult:
+    """Fallback path for multi-symbol trials.
+
+    Not implemented in this project snapshot. If you hit this, either:
+      - restrict optimization to a single symbol, or
+      - implement a multi-symbol portfolio simulation + stats extraction.
+    """
+    return TrialResult(params=kwargs.get("params", {}), pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, error="multi-symbol optimize not implemented")
+
 # ============================================================
 # Trial evaluation
 # ============================================================
@@ -472,7 +495,7 @@ def _eval_one_trial(
             if end is not None:
                 idx_slice = idx_slice[idx_slice <= pd.to_datetime(end)]
             if len(idx_slice) < 2:
-                return TrialResult(params=params, pnl=float("-inf"), efficiency=float("-inf"), n_fills=0, error="window too small")
+                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, error="window too small")
             idx_pos = common_index.get_indexer_for(idx_slice)
 
         open_px = bars_open[sym] if idx_pos is None else bars_open[sym][idx_pos]
@@ -490,7 +513,7 @@ def _eval_one_trial(
             w = int(params.get("strategy.window", base_spec.strategy.params.get("window", 50)))
             sma = bank[sym].get(f"sma_{w}")
             if sma is None:
-                return TrialResult(params=params, pnl=float("-inf"), efficiency=float("-inf"), n_fills=0, error=f"missing sma_{w} in bank")
+                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, error=f"missing sma_{w} in bank")
             if idx_pos is not None:
                 sma = sma[idx_pos]
 
@@ -510,7 +533,7 @@ def _eval_one_trial(
             sma_f = bank[sym].get(f"sma_{f}")
             sma_s = bank[sym].get(f"sma_{s}")
             if sma_f is None or sma_s is None:
-                return TrialResult(params=params, pnl=float("-inf"), efficiency=float("-inf"), n_fills=0, error=f"missing sma_{f} or sma_{s} in bank")
+                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, error=f"missing sma_{f} or sma_{s} in bank")
             if idx_pos is not None:
                 sma_f = sma_f[idx_pos]
                 sma_s = sma_s[idx_pos]
@@ -525,7 +548,7 @@ def _eval_one_trial(
                 sig = np.where(valid & (sma_f > sma_s), 1.0, 0.0).astype(np.float64)
 
         else:
-            return TrialResult(params=params, pnl=float("-inf"), efficiency=float("-inf"), n_fills=0, error=f"unknown strategy kind {sk}")
+            return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, error=f"unknown strategy kind {sk}")
 
         # ----------------------------
         # C) Build portfolio config for this trial (apply params)
@@ -537,12 +560,28 @@ def _eval_one_trial(
         stats = port.run_stats_only_arrays(open_px=open_px, close_px=close_px, sig=sig)
 
         pnl = float(stats.pnl)
+        traded = float(stats.traded_notional)
         n_fills = int(stats.n_fills)
-        eff = pnl / traded if traded > 0 else float("-inf")
+        # Efficiency (performance) requested:
+        #   if volume_inv <= 0: efficiency = 1.0 (100%)
+        #   else: efficiency = pnl / volume_inv
+        # NOTE: To fully implement the *monthly reset at last SELL*, the portfolio stats layer
+        # must expose per-fill cashflows with timestamps. If unavailable, we fall back to using
+        # traded_notional as a proxy denominator (keeps optimizer runnable).
+        volume_inv = (
+            getattr(stats, "volume_inv", None)
+            or getattr(stats, "volume_invested", None)
+            or getattr(stats, "volumeinv", None)
+        )
+        if volume_inv is None:
+            volume_inv = traded
+        volume_inv = float(volume_inv)
+        eff = 1.0 if volume_inv <= 0 else float(pnl / volume_inv)
 
         return TrialResult(
             params=params,
             pnl=pnl,
+            traded_notional=traded,
             efficiency=eff,
             n_fills=n_fills,
             error=None,
@@ -552,6 +591,7 @@ def _eval_one_trial(
         return TrialResult(
             params=params,
             pnl=float("-inf"),
+            traded_notional=0.0,
             efficiency=float("-inf"),
             n_fills=0,
             error=str(e),
