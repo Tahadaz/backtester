@@ -277,9 +277,6 @@ def default_param_catalog(strategy_kind: str) -> Dict[str, ParamDef]:
     cat["portfolio.buy_pct_cash"] = ParamDef("portfolio.buy_pct_cash", "float", (0.05, 1.0, 0.05), float)
     cat["portfolio.sell_pct_shares"] = ParamDef("portfolio.sell_pct_shares", "float", (0.05, 1.0, 0.05), float)
 
-    # date-window optimization
-    cat["data.window"] = ParamDef("data.window", "date_window", [], lambda x: x)
-
     return cat
 
 
