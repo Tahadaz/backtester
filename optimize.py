@@ -267,14 +267,11 @@ def default_param_catalog(strategy_kind: str) -> Dict[str, ParamDef]:
     if strategy_kind == "ma_cross":
         cat["strategy.fast_window"] = ParamDef("strategy.fast_window", "int", (5, 60, 1), int)
         cat["strategy.slow_window"] = ParamDef("strategy.slow_window", "int", (20, 250, 1), int)
-        # optional strategy flags if you expose them
-        cat["strategy.allow_short"] = ParamDef("strategy.allow_short", "choice", [False, True], bool)
-        cat["strategy.nan_policy"] = ParamDef("strategy.nan_policy", "choice", ["flat", "nan"], str)
+     
 
     elif strategy_kind == "sma_price":
         cat["strategy.window"] = ParamDef("strategy.window", "int", (10, 250, 1), int)
-        cat["strategy.allow_short"] = ParamDef("strategy.allow_short", "choice", [False, True], bool)
-        cat["strategy.nan_policy"] = ParamDef("strategy.nan_policy", "choice", ["flat", "nan"], str)
+
 
     # portfolio knobs you mentioned
     cat["portfolio.cooldown_bars"] = ParamDef("portfolio.cooldown_bars", "int", (0, 30, 1), int)
