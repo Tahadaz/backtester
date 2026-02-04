@@ -207,7 +207,7 @@ class ResultsAnalyzer:
 
         # --- headline metrics (for quick display) ---
         metrics = self._headline_metrics(rets, dd, bench_rets)
-        metrics["PnL"] = float(pnl_total)
+        metrics["Net PnL"] = float(pnl_total)
         metrics["VolumeInv"] = float(volume_inv)
         metrics["Efficiency"] = float(efficiency)
 
@@ -624,7 +624,7 @@ class ResultsAnalyzer:
                         "entry_price": entry_price,
                         "exit_price": exit_price,
                         "qty": qty0,
-                        "pnl": pnl_net,
+                        "net_pnl": pnl_net,
                         "ret": ret,
                         "days": days,
                     })

@@ -1,6 +1,7 @@
 # portfolio.py
 from __future__ import annotations
 from typing import Literal
+import math
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Literal, Any, Tuple
@@ -83,7 +84,7 @@ class CostModel:
 class PortfolioConfig:
     # Portfolio semantics
     allow_short: bool = True
-    initial_cash: float = 1_000_000.0
+    initial_cash: float = 100_000.0
 
     # Exposure / constraints (optional)
     max_gross: float = 1.0
@@ -94,6 +95,30 @@ class PortfolioConfig:
     rebalance_policy: RebalancePolicy = "on_change"
     fill_price_model: FillPriceModel = "next_open"
     mtm_model: MarkToMarketModel = "close_t1"
+
+    # -----------------------------
+    # Liquidity / Volume constraints
+    # -----------------------------
+    volume_col: str = "Volume"
+
+    # Layer 3: execution cap (participation)
+    use_participation_cap: bool = False
+    participation_rate: float = 0.05   # 5% of volume (typical research default)
+    participation_basis: str = "bar"    # "bar" or "adv"
+    adv_window: int = 20               # used if participation_basis == "adv"
+
+    # What to do with unfilled remainder:
+    # - If False: cancel remainder (simple, your current behavior)
+    # - If True: carry remainder forward (more realistic, more code)
+    carry_unfilled: bool = False
+
+    # Layer 1: optional gate (see section B)
+    use_volume_gate: bool = False
+    volume_gate_kind: str = "min_abs"  # "min_abs" or "min_ratio_adv"
+    min_volume_abs: float = 0.0        # e.g., 50_000 shares
+    min_volume_ratio_adv: float = 0.3  # e.g., Volume >= 0.3 * ADV
+    volume_gate_adv_window: int = 20
+
 
     # --- NEW: per-trade sizing ---
     sizing_mode: SizingMode = "target_weight"
@@ -120,6 +145,24 @@ class PortfolioConfig:
             raise ValueError("sell_pct_shares must be in (0, 1].")
         if not (0.0 <= self.cash_buffer < 1.0):
             raise ValueError("cash_buffer must be in [0,1).")
+        if not (0.0 < float(self.participation_rate) <= 1.0):
+            raise ValueError("participation_rate must be in (0, 1].")
+
+        if str(self.participation_basis) not in ("bar", "adv"):
+            raise ValueError("participation_basis must be 'bar' or 'adv'.")
+
+        if int(self.adv_window) < 1:
+            raise ValueError("adv_window must be >= 1.")
+
+        if str(self.volume_gate_kind) not in ("min_abs", "min_ratio_adv"):
+            raise ValueError("volume_gate_kind must be 'min_abs' or 'min_ratio_adv'.")
+
+        if int(self.volume_gate_adv_window) < 1:
+            raise ValueError("volume_gate_adv_window must be >= 1.")
+
+        if float(self.min_volume_ratio_adv) < 0.0:
+            raise ValueError("min_volume_ratio_adv must be >= 0.")
+
 
 
 # -----------------------------
@@ -225,6 +268,47 @@ class PortfolioEngine:
         last_trade_i: Dict[str, int] = {s: -10**9 for s in symbols}  # bar index of last executed trade per symbol
         cooldown = int(getattr(self.cfg, "cooldown_bars", 0) or 0)
 
+        # -----------------------------
+        # Precompute volume and any ADV series we need
+        # -----------------------------
+        need_volume = bool(self.cfg.use_participation_cap or self.cfg.use_volume_gate)
+
+        vol_series: Dict[str, pd.Series] = {}
+        adv_by_window: Dict[int, Dict[str, pd.Series]] = {}  # window -> (symbol -> ADV series)
+
+        if need_volume:
+            # Determine which ADV windows are required
+            adv_windows: List[int] = []
+
+            if self.cfg.use_participation_cap and str(self.cfg.participation_basis) == "adv":
+                adv_windows.append(int(self.cfg.adv_window))
+
+            if self.cfg.use_volume_gate and str(self.cfg.volume_gate_kind) == "min_ratio_adv":
+                adv_windows.append(int(self.cfg.volume_gate_adv_window))
+
+            # Unique + sorted windows
+            adv_windows = sorted(set(w for w in adv_windows if w >= 1))
+
+            for s in symbols:
+                bars = market_data.bars[s]
+                if self.cfg.volume_col not in bars.columns:
+                    raise KeyError(
+                        f"Bars for '{s}' missing required volume column '{self.cfg.volume_col}'. "
+                        f"Columns: {list(bars.columns)}"
+                    )
+
+                v = pd.to_numeric(bars[self.cfg.volume_col], errors="coerce").astype("float64")
+                v = v.reindex(idx).fillna(0.0)
+                vol_series[s] = v
+
+            # Precompute all ADV series needed (per window, per symbol)
+            for w in adv_windows:
+                adv_by_window[w] = {}
+                for s in symbols:
+                    adv_by_window[w][s] = vol_series[s].rolling(w, min_periods=1).mean()
+
+
+
         # iterate up to second last timestamp because we fill at t+1
         for i in range(len(idx) - 1):
             t = pd.Timestamp(idx[i])
@@ -291,11 +375,70 @@ class PortfolioEngine:
                         continue  # skip trade for this symbol due to cooldown
                     filtered.append((s, delta))
                 orders = filtered
+            # -----------------------------
+            # Layer 1: volume gate (option)
+            # -----------------------------
+            if self.cfg.use_volume_gate and orders:
+                gated = []
+                for s, delta in orders:
+                    if delta == 0:
+                        continue
+
+                    # ENTRY-ONLY gating:
+                    # - If delta increases exposure in the direction of the signal, treat as entry.
+                    # - Simpler proxy: gate buys only (delta > 0) for long-only.
+                    is_entry = (delta > 0)  # adjust if you allow short entries too
+
+                    if not is_entry:
+                        gated.append((s, delta))
+                        continue
+
+                    v_t1 = float(vol_series[s].loc[t1])
+
+                    ok = True
+                    if self.cfg.volume_gate_kind == "min_abs":
+                        ok = v_t1 >= float(self.cfg.min_volume_abs)
+                    else:
+                        w = int(self.cfg.volume_gate_adv_window)
+                        adv_t1 = float(adv_by_window[w][s].loc[t1])
+                        ok = v_t1 >= float(self.cfg.min_volume_ratio_adv) * adv_t1
+
+                    if ok:
+                        gated.append((s, delta))
+                    # else: skip this order entirely
+
+                orders = gated
+
 
             # Execute orders at open(t+1)
             for s, delta in orders:
                 if delta == 0:
                     continue
+                # -----------------------------
+                # Layer 3: participation cap (volume-constrained fills)
+                # -----------------------------
+                if self.cfg.use_participation_cap:
+                    # determine liquidity basis at t1
+                    if self.cfg.participation_basis == "bar":
+                        liq_vol = float(vol_series[s].loc[t1])
+                    else:
+                        w = int(self.cfg.adv_window)
+                        liq_vol = float(adv_by_window[w][s].loc[t1])
+
+                    max_fill = int(max(0.0, float(self.cfg.participation_rate) * liq_vol))
+
+                    # If max_fill is 0, you cannot trade this bar
+                    if max_fill <= 0:
+                        continue
+
+                    # Cap absolute shares
+                    abs_delta = abs(int(delta))
+                    if abs_delta > max_fill:
+                        # Simple mode: cancel remainder
+                        # (carry_unfilled will be handled later if you choose)
+                        delta = int(np.sign(delta) * max_fill)
+                        if delta == 0:
+                            continue
 
                 fill_price = float(open_t1[s])
                 notional = abs(delta) * fill_price
@@ -355,6 +498,9 @@ class PortfolioEngine:
         open_px: np.ndarray,
         close_px: np.ndarray,
         sig: np.ndarray,
+        vol_px: Optional[np.ndarray] = None,
+        adv_cap_px: Optional[np.ndarray] = None,
+        adv_gate_px: Optional[np.ndarray] = None,
     ) -> PortfolioStats:
         """
         Ultra-fast stats-only path:
@@ -365,6 +511,9 @@ class PortfolioEngine:
             np.asarray(open_px, dtype=np.float64),
             np.asarray(close_px, dtype=np.float64),
             np.asarray(sig, dtype=np.float64),
+            np.asarray(vol_px, dtype=np.float64) if vol_px is not None else None,
+            np.asarray(adv_cap_px, dtype=np.float64) if adv_cap_px is not None else None,
+            np.asarray(adv_gate_px, dtype=np.float64) if adv_gate_px is not None else None,
         )
         return PortfolioStats(
             final_equity=float(final_eq),
@@ -424,7 +573,7 @@ class PortfolioEngine:
 
         sig = signal_frame.signals[sym].reindex(idx).to_numpy(dtype=np.float64, copy=False)
 
-        pnl, traded, n_fills, final_eq = self._run_stats_fast_single(open_px, close_px, sig)
+        pnl, traded, n_fills, final_eq = self._run_stats_fast_single(open_px, close_px, sig, vol_px=None, adv_cap_px=None, adv_gate_px=None)
 
         return PortfolioStats(
             final_equity=float(final_eq),
@@ -438,14 +587,19 @@ class PortfolioEngine:
         open_px: np.ndarray,
         close_px: np.ndarray,
         sig: np.ndarray,
+        vol_px: Optional[np.ndarray] = None,
+        adv_cap_px: Optional[np.ndarray] = None,
+        adv_gate_px: Optional[np.ndarray] = None,
     ) -> Tuple[float, float, int, float]:
         """
-        Tight numpy loop (no pandas, no dicts, no object allocations).
+        Tight numpy loop (no pandas, no dicts, minimal allocations).
+        Semantics: decide at i using sig[i], execute at open[i+1], MTM at close[-1].
         Returns: (pnl, traded_notional, n_fills, final_equity)
         """
         n = int(len(open_px))
         if n < 2:
-            return 0.0, 0.0, 0, float(self.cfg.initial_cash)
+            final_eq = float(self.cfg.initial_cash)
+            return 0.0, 0.0, 0, final_eq
 
         cash = float(self.cfg.initial_cash)
         pos = 0.0
@@ -454,11 +608,13 @@ class PortfolioEngine:
         n_fills = 0
 
         cm = self.cfg.cost_model
-        # total linear cost rate
-        k = ((cm.brokerage_bps + cm.exchange_bps + cm.settlement_bps) / 10000.0) * (1.0 + cm.vat_rate) + (cm.slippage_bps / 10000.0)
+        k = (
+            ((cm.brokerage_bps + cm.exchange_bps + cm.settlement_bps) / 10000.0) * (1.0 + cm.vat_rate)
+            + (cm.slippage_bps / 10000.0)
+        )
 
         cooldown = int(self.cfg.cooldown_bars or 0)
-        last_trade_i = -10**9
+        last_exec_i = -10**9  # store execution index (i+1) when trade happened
 
         allow_short = bool(self.cfg.allow_short)
         sizing_mode = str(self.cfg.sizing_mode)
@@ -468,12 +624,23 @@ class PortfolioEngine:
 
         cash_buffer = float(self.cfg.cash_buffer)
         max_gross = float(self.cfg.max_gross)
-
         allow_frac = bool(self.cfg.allow_fractional_shares)
 
+        on_change = (str(self.cfg.rebalance_policy) == "on_change")
         prev_desired = 0.0
 
+        use_gate = bool(self.cfg.use_volume_gate)
+        gate_kind = str(self.cfg.volume_gate_kind)
+
+        use_cap = bool(self.cfg.use_participation_cap)
+        cap_basis = str(self.cfg.participation_basis)
+        prate = float(self.cfg.participation_rate)
+
+        min_abs = float(self.cfg.min_volume_abs)
+        min_ratio = float(self.cfg.min_volume_ratio_adv)
+
         for i in range(n - 1):
+            # --- desired position direction from signal ---
             s = sig[i]
             if not np.isfinite(s):
                 desired = 0.0
@@ -483,58 +650,140 @@ class PortfolioEngine:
                 else:
                     desired = 1.0 if s > 0 else 0.0
 
-            # cooldown gate
-            if cooldown > 0 and (i - last_trade_i) < cooldown:
+            exec_i = i + 1  # execution happens at open[i+1]
+
+            # cooldown gate (based on execution index)
+            if cooldown > 0 and (exec_i - last_exec_i) < cooldown:
                 prev_desired = desired
                 continue
 
-            px = float(open_px[i + 1])
+            px = float(open_px[exec_i])
             if not np.isfinite(px) or px <= 0.0:
                 prev_desired = desired
                 continue
 
+            # --- compute order qty ---
             qty = 0.0
+
             if sizing_mode == "target_weight":
                 equity = cash + pos * px
                 investable = max(0.0, equity * (1.0 - cash_buffer))
+
                 target_w = desired
                 if not allow_short:
                     target_w = max(0.0, target_w)
+                # clamp gross for single-asset
                 target_w = max(-max_gross, min(max_gross, target_w))
-                target_pos = target_w * investable / px
+
+                target_pos = (target_w * investable) / px
                 if not allow_frac:
-                    target_pos = np.floor(target_pos) if target_pos >= 0 else -np.floor(abs(target_pos))
+                    target_pos = math.floor(target_pos) if target_pos >= 0 else -math.floor(abs(target_pos))
+
                 qty = float(target_pos - pos)
 
-                if self.cfg.rebalance_policy == "on_change":
-                    # if desired hasn't changed and we'd barely trade, skip
-                    if desired == prev_desired and abs(qty) < 1e-12:
-                        prev_desired = desired
-                        continue
+                if on_change and desired == prev_desired and abs(qty) < 1e-12:
+                    prev_desired = desired
+                    continue
 
             else:
-                # pct_cash_shares: if desired > 0 -> buy pct of cash; else -> sell pct of shares
+                # pct_cash_shares ACTION MODE:
+                # +1 => buy using buy_pct_cash of cash
+                #  0 => hold (do nothing)
+                # -1 => sell sell_pct_shares of current position
                 if desired > 0.0:
                     spend = cash * buy_pct_cash
                     buy_shares = spend / px
                     if not allow_frac:
-                        buy_shares = np.floor(buy_shares)
+                        buy_shares = math.floor(buy_shares)
                     qty = float(buy_shares)
-                else:
+
+                elif desired < 0.0:
+                    # sell fraction of existing (long or short)
                     sell_shares = abs(pos) * sell_pct_shares
                     if not allow_frac:
-                        sell_shares = np.floor(sell_shares)
-                    qty = float(-sell_shares if pos > 0 else (sell_shares if pos < 0 else 0.0))
+                        sell_shares = math.floor(sell_shares)
+                    if pos > 0:
+                        qty = float(-sell_shares)
+                    elif pos < 0:
+                        qty = float(sell_shares)  # buy-to-cover
+                    else:
+                        qty = 0.0
 
-                if self.cfg.rebalance_policy == "on_change":
-                    if desired == prev_desired and abs(qty) < 1e-12:
-                        prev_desired = desired
-                        continue
+                else:
+                    # HOLD
+                    qty = 0.0
+
+                if on_change and desired == prev_desired and abs(qty) < 1e-12:
+                    prev_desired = desired
+                    continue
 
             if qty == 0.0 or not np.isfinite(qty):
                 prev_desired = desired
                 continue
 
+            # ENTRY-ONLY proxy for gate: only gate when increasing absolute exposure
+            is_entry = (abs(pos + qty) > abs(pos) + 1e-12)
+
+            # --- Layer 1: volume / adv gate ---
+            if use_gate and is_entry:
+                if gate_kind == "min_abs":
+                    if vol_px is None:
+                        prev_desired = desired
+                        continue
+                    v = float(vol_px[exec_i])
+                    if (not np.isfinite(v)) or (v < min_abs):
+                        prev_desired = desired
+                        continue
+
+                elif gate_kind == "min_ratio_adv":
+                    if (vol_px is None) or (adv_gate_px is None):
+                        prev_desired = desired
+                        continue
+                    v = float(vol_px[exec_i])
+                    adv = float(adv_gate_px[exec_i])
+                    if (not np.isfinite(v)) or (not np.isfinite(adv)) or adv <= 0.0:
+                        prev_desired = desired
+                        continue
+                    if v < (min_ratio * adv):
+                        prev_desired = desired
+                        continue
+
+                else:
+                    # unknown gate kind -> safest is no-trade
+                    prev_desired = desired
+                    continue
+
+            # --- Layer 3: participation cap (bar or adv) ---
+            if use_cap:
+                liq = None
+                if cap_basis == "bar":
+                    if vol_px is None:
+                        prev_desired = desired
+                        continue
+                    liq = float(vol_px[exec_i])
+                else:
+                    if adv_cap_px is None:
+                        prev_desired = desired
+                        continue
+                    liq = float(adv_cap_px[exec_i])
+
+                if (liq is None) or (not np.isfinite(liq)) or liq <= 0.0:
+                    prev_desired = desired
+                    continue
+
+                max_fill = prate * liq
+                if max_fill <= 0.0:
+                    prev_desired = desired
+                    continue
+
+                abs_qty = abs(qty)
+                if abs_qty > max_fill:
+                    qty = float(math.copysign(math.floor(max_fill), qty))
+                    if qty == 0.0:
+                        prev_desired = desired
+                        continue
+
+            # --- execute ---
             notional = abs(qty) * px
             cost = notional * k
 
@@ -546,13 +795,12 @@ class PortfolioEngine:
             pos += qty
             traded += notional
             n_fills += 1
-            last_trade_i = i
+            last_exec_i = exec_i
             prev_desired = desired
 
         final_eq = cash + float(pos) * float(close_px[-1])
         pnl = final_eq - float(self.cfg.initial_cash)
         return float(pnl), float(traded), int(n_fills), float(final_eq)
-
 
     # ---------- internals ----------
     def _signals_to_target_weights(self, sig_row: pd.Series, symbols: List[str]) -> Dict[str, float]:

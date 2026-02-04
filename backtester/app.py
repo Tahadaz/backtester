@@ -3,6 +3,7 @@ from __future__ import annotations
 import streamlit as st
 st.set_page_config(page_title="Backtester", layout="wide")
 
+from plotly.subplots import make_subplots
 
 import os
 import tempfile
@@ -45,6 +46,83 @@ st.sidebar.caption(f"run_optimization: {_opt_mod.run_optimization.__module__}.{_
 #   - We persist uploads to a deterministic path based on file content hash.
 # ============================================================
 import hashlib
+import json, hashlib
+def _spec_key(spec: EngineSpec) -> str:
+    d = {
+        "data": spec.data.__dict__,
+        "strategy": {"kind": spec.strategy.kind, "params": spec.strategy.params},
+        "portfolio": spec.portfolio.__dict__,
+        "interval": spec.data.interval,
+    }
+    s = json.dumps(d, sort_keys=True, default=str).encode()
+    return hashlib.sha1(s).hexdigest()
+
+def parse_int_list(s: str) -> list[int]:
+    """
+    Parse '5,10, 20 50' into [5,10,20,50]. Ignores blanks.
+    Raises ValueError on invalid tokens.
+    """
+    if s is None:
+        return []
+    s = str(s).strip()
+    if not s:
+        return []
+    # allow commas or spaces
+    tokens = [t.strip() for t in s.replace(",", " ").split()]
+    out = []
+    for t in tokens:
+        if not t:
+            continue
+        out.append(int(float(t)))  # lets user type "20.0" too
+    # dedupe while preserving order
+    seen = set()
+    uniq = []
+    for x in out:
+        if x not in seen:
+            uniq.append(x)
+            seen.add(x)
+    return uniq
+
+def add_volume_to_trades_table(
+    trades: pd.DataFrame,
+    md,  # MarketData
+    *,
+    volume_col: str = "Volume",
+    out_col: str = "volume",
+) -> pd.DataFrame:
+    """
+    Adds bar volume to each fill row using (timestamp, symbol) lookup.
+    trades must have columns: ['timestamp','symbol'].
+    """
+    if trades is None or trades.empty:
+        return trades
+    if "timestamp" not in trades.columns or "symbol" not in trades.columns:
+        return trades
+
+    tdf = trades.copy()
+    tdf["timestamp"] = pd.to_datetime(tdf["timestamp"], errors="coerce")
+    tdf = tdf.dropna(subset=["timestamp", "symbol"])
+
+    # Build a lookup table: (timestamp, symbol) -> volume
+    parts = []
+    for sym, bars in md.bars.items():
+        if volume_col not in bars.columns:
+            continue
+        b = bars[[volume_col]].copy()
+        b = b.sort_index()
+        b = b.reset_index().rename(columns={b.index.name or "index": "timestamp", volume_col: out_col})
+        b["timestamp"] = pd.to_datetime(b["timestamp"], errors="coerce")
+        b["symbol"] = sym
+        parts.append(b[["timestamp", "symbol", out_col]])
+
+    if not parts:
+        return tdf
+
+    vol_df = pd.concat(parts, ignore_index=True)
+    # Exact join on timestamp+symbol (your fills timestamp should match bars index)
+    tdf = tdf.merge(vol_df, on=["timestamp", "symbol"], how="left")
+
+    return tdf
 
 def _persist_upload_to_cache(uploaded_file, tag: str, symbol: str) -> tuple[str, str]:
     """
@@ -62,25 +140,8 @@ def _persist_upload_to_cache(uploaded_file, tag: str, symbol: str) -> tuple[str,
         out_path.write_bytes(data)
     return str(out_path), h
 
-def info_popover(key: str):
-    e = EXPLAIN.get(key)
-    if not e:
-        st.write("")
-        return
-    with st.popover("ℹ️"):
-        st.markdown(f"**{e['title']}**")
-        st.write(e["why"])
-        if e.get("latex"):
-            st.latex(e["latex"])
-        if e.get("notes"):
-            st.caption(e["notes"])
 
-def metric_with_info(label: str, value: str, explain_key: str):
-    c1, c2 = st.columns([6, 1], vertical_alignment="center")
-    with c1:
-        st.metric(label, value)
-    with c2:
-        info_popover(explain_key)
+
 
 # ============================================================
 # Metric explanations (only what you asked for)
@@ -270,18 +331,37 @@ def load_benchmark_market_data_cached(
     )
     return md
 
+
+
+from plotly.subplots import make_subplots
+
 def plot_price_indicators_trades_line(
     bars: pd.DataFrame,
     indicators: pd.DataFrame | None,
     trades: pd.DataFrame | None,
     indicator_cols: list[str] | None = None,
+    *,
+    port_cfg: PortfolioConfig | None = None,
 ) -> go.Figure:
     df = bars.copy().sort_index()
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df.index, y=df["Close"].astype(float), mode="lines", name="Close"))
+    # --- subplot layout: price on top, volume below ---
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        row_heights=[0.72, 0.28],
+    )
+
+    # =========================
+    # Row 1: Price + Indicators
+    # =========================
+    fig.add_trace(
+        go.Scatter(x=df.index, y=df["Close"].astype(float), mode="lines", name="Close"),
+        row=1, col=1
+    )
 
     if indicators is not None and not indicators.empty:
         ind = indicators.copy()
@@ -291,17 +371,23 @@ def plot_price_indicators_trades_line(
 
         cols = [c for c in (indicator_cols or list(ind.columns)) if c in ind.columns]
         for c in cols:
-            s = ind[c].astype(float)
+            s = pd.to_numeric(ind[c], errors="coerce")
             if s.notna().any():
-                fig.add_trace(go.Scatter(x=df.index, y=s, mode="lines", name=c))
+                fig.add_trace(
+                    go.Scatter(x=df.index, y=s, mode="lines", name=c),
+                    row=1, col=1
+                )
 
+    # =========================
+    # Row 1: Trades markers
+    # =========================
     if trades is not None and not trades.empty:
         t = trades.copy()
         t["timestamp"] = pd.to_datetime(t["timestamp"], errors="coerce")
         t = t.dropna(subset=["timestamp"]).sort_values("timestamp")
 
         if "side" not in t.columns:
-            t["side"] = np.where(t["qty"].astype(float) > 0, "BUY", "SELL")
+            t["side"] = np.where(pd.to_numeric(t["qty"], errors="coerce").fillna(0) > 0, "BUY", "SELL")
 
         # y at fill price if exists else close
         if "price" in t.columns:
@@ -325,8 +411,10 @@ def plot_price_indicators_trades_line(
                     text="BUY",
                     textposition="top center",
                     name="BUY",
-                )
+                ),
+                row=1, col=1
             )
+
         if not sells.empty:
             fig.add_trace(
                 go.Scatter(
@@ -337,15 +425,92 @@ def plot_price_indicators_trades_line(
                     text="SELL",
                     textposition="bottom center",
                     name="SELL",
-                )
+                ),
+                row=1, col=1
             )
 
+    # =========================
+    # Row 2: Volume + Gate/Cap
+    # =========================
+    if port_cfg is not None:
+        vcol = getattr(port_cfg, "volume_col", "Volume")
+    else:
+        vcol = "Volume"
+
+    if vcol in df.columns:
+        vol = pd.to_numeric(df[vcol], errors="coerce").fillna(0.0).astype(float)
+
+        # volume bars
+        fig.add_trace(
+            go.Bar(x=df.index, y=vol.values, name="Volume"),
+            row=2, col=1
+        )
+
+        # --- compute ADV series only if needed ---
+        def _adv(series: pd.Series, w: int) -> pd.Series:
+            w = int(max(1, w))
+            return series.rolling(w, min_periods=1).mean()
+
+        if port_cfg is not None:
+            # Gate line (Layer 1)
+            if bool(getattr(port_cfg, "use_volume_gate", False)):
+                kind = str(getattr(port_cfg, "volume_gate_kind", "min_abs"))
+                if kind == "min_abs":
+                    gate_val = float(getattr(port_cfg, "min_volume_abs", 0.0))
+                    gate_line = pd.Series(gate_val, index=df.index)
+                else:
+                    ratio = float(getattr(port_cfg, "min_volume_ratio_adv", 0.0))
+                    w = int(getattr(port_cfg, "volume_gate_adv_window", 20))
+                    gate_line = ratio * _adv(vol, w)
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=df.index, y=gate_line.values,
+                        mode="lines",
+                        name="Gate",
+                        line=dict(width=3),
+                        showlegend=True,
+                    ),
+                    row=2, col=1
+                )
+
+
+            # Cap line (Layer 3)
+            if bool(getattr(port_cfg, "use_participation_cap", False)):
+                pr = float(getattr(port_cfg, "participation_rate", 0.05))
+                basis = str(getattr(port_cfg, "participation_basis", "bar"))
+                if basis == "bar":
+                    liq = vol
+                else:
+                    w = int(getattr(port_cfg, "adv_window", 20))
+                    liq = _adv(vol, w)
+
+                cap_line = pr * liq
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=df.index, y=cap_line.values,
+                        mode="lines",
+                        name="Cap",
+                        line=dict(width=3, dash="dash"),
+                        showlegend=True,
+                    ),
+                    row=2, col=1
+                )
+
+    fig.update_traces(selector=dict(type="scatter"), row=2, col=1)
+
+    # layout polish
     fig.update_layout(
         xaxis_title="Date",
         yaxis_title="Price",
         legend=dict(orientation="h"),
         margin=dict(l=40, r=20, t=60, b=40),
+        bargap=0.0,
     )
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="Volume", row=2, col=1)
+
     return fig
 
 
@@ -467,7 +632,7 @@ def plot_with_info(title: str, fig, report, explain_key: str):
 # Render bundle
 # ============================================================
 
-def render_bundle(bundle):
+def render_bundle(bundle, *, port_cfg: PortfolioConfig | None = None):
     rep = bundle.report
     plots = rep.plots
     tables = rep.tables
@@ -482,6 +647,7 @@ def render_bundle(bundle):
         indicators=pp.get("indicators"),
         trades=pp.get("trades"),
         indicator_cols=pp.get("indicator_cols"),
+        port_cfg=port_cfg,
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -503,7 +669,20 @@ def render_bundle(bundle):
 
     st.subheader("Trades (fills)")
     if "trades" in tables:
-        st.dataframe(tables["trades"], use_container_width=True)
+        trades_df = tables["trades"]
+
+        # pick the right volume column name
+        vcol = getattr(port_cfg, "volume_col", "Volume") if port_cfg is not None else "Volume"
+
+        trades_df = add_volume_to_trades_table(trades_df, bundle.md, volume_col=vcol, out_col="volume")
+
+        # optional: choose visible columns order
+        cols_first = [c for c in ["timestamp","symbol","side","qty","price","notional","cost","volume"] if c in trades_df.columns]
+        cols_rest = [c for c in trades_df.columns if c not in cols_first]
+        trades_df = trades_df[cols_first + cols_rest]
+
+        st.dataframe(trades_df, use_container_width=True)
+
 
     st.subheader("Trade Ledger (PnL per closed trade)")
     if "trade_ledger" in tables:
@@ -540,6 +719,15 @@ def make_base_spec(
     sell_pct_shares: float,
     cooldown_bars: int,
     cost_model: CostModel,
+    use_volume_gate: bool,
+    volume_gate_kind: str,
+    min_volume_abs: float,
+    min_volume_ratio_adv: float,
+    volume_gate_adv_window: int,
+    use_participation_cap: bool,
+    participation_rate: float,
+    participation_basis: str,
+    adv_window: int,
 ) -> EngineSpec:
 
     if source_key == "bmce":
@@ -577,6 +765,17 @@ def make_base_spec(
         buy_pct_cash=float(buy_pct_cash),
         sell_pct_shares=float(sell_pct_shares),
         cooldown_bars=int(cooldown_bars),
+        use_volume_gate=bool(use_volume_gate),
+        volume_gate_kind=str(volume_gate_kind),
+        min_volume_abs=float(min_volume_abs),
+        min_volume_ratio_adv=float(min_volume_ratio_adv),
+        volume_gate_adv_window=int(volume_gate_adv_window),
+
+        use_participation_cap=bool(use_participation_cap),
+        participation_rate=float(participation_rate),
+        participation_basis=str(participation_basis),
+        adv_window=int(adv_window),
+
     )
 
     return EngineSpec(
@@ -809,6 +1008,21 @@ with tab_backtest:
         buy_pct_cash = st.slider("Buy % of cash per entry", 0.01, 1.00, 0.25, 0.01)
         sell_pct_shares = st.slider("Sell % of shares per exit", 0.01, 1.00, 1.00, 0.01)
 
+        st.markdown("### Liquidity / Volume")
+
+        use_volume_gate = st.checkbox("Enable volume gate (Layer 1)", value=False)
+        volume_gate_kind = st.selectbox("Gate type", ["min_abs", "min_ratio_adv"], index=0, disabled=not use_volume_gate)
+
+        min_volume_abs = st.number_input("Min Volume (abs shares)", min_value=0.0, value=0.0, step=10_000.0, disabled=(not use_volume_gate or volume_gate_kind != "min_abs"))
+        min_volume_ratio_adv = st.slider("Min Volume / ADV ratio", 0.0, 2.0, 0.3, 0.05, disabled=(not use_volume_gate or volume_gate_kind != "min_ratio_adv"))
+        volume_gate_adv_window = st.number_input("ADV window for gate", min_value=1, value=20, step=1, disabled=(not use_volume_gate or volume_gate_kind != "min_ratio_adv"))
+
+        use_participation_cap = st.checkbox("Enable participation cap (Layer 3)", value=False)
+        participation_rate = st.slider("Participation rate", 0.001, 0.50, 0.05, 0.001, disabled=not use_participation_cap)
+        participation_basis = st.selectbox("Participation basis", ["bar", "adv"], index=0, disabled=not use_participation_cap)
+        adv_window = st.number_input("ADV window (for cap)", min_value=1, value=20, step=1, disabled=(not use_participation_cap or participation_basis != "adv"))
+
+
         st.markdown("### Costs")
         apply_costs = st.checkbox("Apply costs", value=False)
         if apply_costs:
@@ -866,17 +1080,26 @@ with tab_backtest:
                 sell_pct_shares=float(sell_pct_shares),
                 cooldown_bars=int(cooldown_bars),
                 cost_model=cost_model,
+                use_volume_gate=use_volume_gate,
+                volume_gate_kind=volume_gate_kind,
+                min_volume_abs=min_volume_abs,
+                min_volume_ratio_adv=min_volume_ratio_adv,
+                volume_gate_adv_window=volume_gate_adv_window,
+                use_participation_cap=use_participation_cap,
+                participation_rate=participation_rate,
+                participation_basis=participation_basis,
+                adv_window=adv_window,
             )
 
             # Cache bundle by spec signature (simple)
-            key = ("bundle", str(base_spec))
+            key = ("bundle",  _spec_key(base_spec))
             cached = st.session_state.get(key)
             if cached is None:
                 with st.spinner("Running backtest..."):
                     cached = BacktestEngine(base_spec).run()
                 st.session_state[key] = cached
 
-            render_bundle(cached)
+            render_bundle(cached, port_cfg=base_spec.portfolio)
 
         finally:
             if tmp_is_temp and tmp_path and os.path.exists(tmp_path):
@@ -907,6 +1130,7 @@ with tab_opt:
         sell0 = st.slider("sell_pct_shares (baseline)", 0.01, 1.00, 1.00, 0.01, key="opt_sell0")
 
         nan_policy0 = "flat"
+        st.markdown("### Strategy parameters (baseline)")
         if strategy_kind == "ma_cross":
             fast0 = st.number_input("fast_window (baseline)", min_value=2, max_value=500, value=20, step=1, key="opt_fast0")
             slow0 = st.number_input("slow_window (baseline)", min_value=3, max_value=500, value=50, step=1, key="opt_slow0")
@@ -918,6 +1142,63 @@ with tab_opt:
             w0 = st.number_input("window (baseline)", min_value=2, max_value=500, value=50, step=1, key="opt_w0")
             strategy_params0 = {"window": int(w0), "allow_short": bool(allow_short), "nan_policy": nan_policy0}
 
+        st.markdown("### Liquidity / Volume (baseline)")
+        use_volume_gate0 = st.checkbox("Enable volume gate (baseline)", value=False, key="opt_use_volume_gate")
+        volume_gate_kind0 = st.selectbox(
+            "Gate type (baseline)",
+            ["min_abs", "min_ratio_adv"],
+            index=0,
+            disabled=not use_volume_gate0,
+            key="opt_volume_gate_kind",
+        )
+
+        min_volume_abs0 = st.number_input(
+            "Min Volume (abs shares) baseline",
+            min_value=0.0,
+            value=0.0,
+            step=10_000.0,
+            disabled=(not use_volume_gate0 or volume_gate_kind0 != "min_abs"),
+            key="opt_min_volume_abs",
+        )
+        min_volume_ratio_adv0 = st.slider(
+            "Min Volume / ADV ratio baseline",
+            0.0, 2.0, 0.3, 0.05,
+            disabled=(not use_volume_gate0 or volume_gate_kind0 != "min_ratio_adv"),
+            key="opt_min_volume_ratio_adv",
+        )
+        volume_gate_adv_window0 = st.number_input(
+            "ADV window for gate baseline",
+            min_value=1,
+            value=20,
+            step=1,
+            disabled=(not use_volume_gate0 or volume_gate_kind0 != "min_ratio_adv"),
+            key="opt_volume_gate_adv_window",
+        )
+        use_participation_cap0 = st.checkbox("Enable participation cap (baseline)", value=False, key="opt_use_participation_cap")
+        participation_rate0 = st.slider(
+            "Participation rate baseline",
+            0.001, 0.50, 0.05, 0.001,
+            disabled=not use_participation_cap0,
+            key="opt_participation_rate",
+        )
+        participation_basis0 = st.selectbox(
+            "Participation basis baseline",
+            ["bar", "adv"],
+            index=0,
+            disabled=not use_participation_cap0,
+            key="opt_participation_basis",
+        )
+        adv_window0 = st.number_input(
+            "ADV window (for cap) baseline",
+            min_value=1,
+            value=20,
+            step=1,
+            disabled=(not use_participation_cap0 or participation_basis0 != "adv"),
+            key="opt_adv_window",
+        )
+
+
+        st.markdown("### Costs (baseline)")
         apply_costs0 = st.checkbox("Apply costs", value=False, key="opt_apply_costs")
         if apply_costs0:
             brokerage_bps0 = st.number_input("Brokerage (bps)", value=60.0, step=1.0, key="opt_brok")
@@ -950,14 +1231,45 @@ with tab_opt:
 
         if pdef.kind == "int":
             lo, hi, step = pdef.domain
-            c1, c2, c3 = st.columns(3)
-            lo2 = c1.number_input(f"{k} min", value=int(lo), step=1, key=f"{k}_min")
-            hi2 = c2.number_input(f"{k} max", value=int(hi), step=1, key=f"{k}_max")
-            step2 = c3.number_input(f"{k} step", value=int(step), step=1, key=f"{k}_step")
-            if lo2 > hi2:
-                st.error(f"{k}: min must be <= max")
-                st.stop()
-            edited_catalog[k] = replace(pdef, domain=(int(lo2), int(hi2), int(step2)))
+
+            mode = st.radio(
+                "Domain mode",
+                ["range", "manual list"],
+                index=0,
+                horizontal=True,
+                key=f"{k}_mode",
+            )
+
+            if mode == "range":
+                c1, c2, c3 = st.columns(3)
+                lo2 = c1.number_input(f"{k} min", value=int(lo), step=1, key=f"{k}_min")
+                hi2 = c2.number_input(f"{k} max", value=int(hi), step=1, key=f"{k}_max")
+                step2 = c3.number_input(f"{k} step", value=int(step), step=1, key=f"{k}_step")
+                if lo2 > hi2:
+                    st.error(f"{k}: min must be <= max")
+                    st.stop()
+                edited_catalog[k] = replace(pdef, domain=(int(lo2), int(hi2), int(step2)))
+
+            else:
+                # manual list -> we convert to a CHOICE domain so optimizer uses exactly those values
+                default_txt = f"{int(lo)},{int((lo+hi)//2)},{int(hi)}"
+                txt = st.text_input(
+                    f"{k} values (comma/space separated)",
+                    value=st.session_state.get(f"{k}_manual", default_txt),
+                    key=f"{k}_manual",
+                )
+                try:
+                    vals = parse_int_list(txt)
+                except Exception as e:
+                    st.error(f"{k}: invalid list: {e}")
+                    st.stop()
+
+                if not vals:
+                    st.error(f"{k}: please provide at least one value.")
+                    st.stop()
+
+                edited_catalog[k] = replace(pdef, kind="choice", domain=vals)
+
 
         elif pdef.kind == "float":
             lo, hi, step = pdef.domain
@@ -1072,6 +1384,16 @@ with tab_opt:
                 buy_pct_cash=float(buy0),
                 sell_pct_shares=float(sell0),
                 cooldown_bars=int(cooldown0),
+                use_volume_gate=bool(use_volume_gate0),
+                volume_gate_kind=str(volume_gate_kind0),
+                min_volume_abs=float(min_volume_abs0),
+                min_volume_ratio_adv=float(min_volume_ratio_adv0),
+                volume_gate_adv_window=int(volume_gate_adv_window0),
+
+                use_participation_cap=bool(use_participation_cap0),
+                participation_rate=float(participation_rate0),
+                participation_basis=str(participation_basis0),
+                adv_window=int(adv_window0),
                 cost_model=cost_model,
             )
 
@@ -1202,7 +1524,7 @@ with tab_opt:
                 show_cols = [c for c in ["timestamp","symbol","side","qty","price","notional","cost","net_invested","cash_after"] if c in fills_df.columns]
                 st.dataframe(fills_df[show_cols], use_container_width=True)
 
-            render_bundle(bundle)
+            render_bundle(bundle, port_cfg=base_spec.portfolio)
 
         finally:
             if bench_is_temp and bench_tmp_path and os.path.exists(bench_tmp_path):
@@ -1258,4 +1580,4 @@ with tab_opt:
                 show_cols = [c for c in ["timestamp","symbol","side","qty","price","notional","cost","net_invested","cash_after"] if c in fills_df.columns]
                 st.dataframe(fills_df[show_cols], use_container_width=True)
 
-            render_bundle(bundle)
+            render_bundle(bundle, port_cfg=best_spec.portfolio)

@@ -340,11 +340,48 @@ def run_optimization(
     # --- aligned price arrays ONCE ---
     bars_open: Dict[str, np.ndarray] = {}
     bars_close: Dict[str, np.ndarray] = {}
+    bars_vol: Dict[str, np.ndarray] = {}
+    need_volume = bool(base_spec.portfolio.use_participation_cap or base_spec.portfolio.use_volume_gate)
+    adv_by_window_np: Dict[int, Dict[str, np.ndarray]] = {}
 
     for s in symbols:
         b = md.bars[s].reindex(common_index)  # aligned already; reindex ok & explicit
         bars_open[s] = b["Open"].to_numpy(dtype=np.float64, copy=False)
         bars_close[s] = b["Close"].to_numpy(dtype=np.float64, copy=False)
+        if need_volume:
+            vcol = base_spec.portfolio.volume_col
+            if vcol not in b.columns:
+                raise KeyError(f"Missing volume column '{vcol}' for {s}. Available: {list(b.columns)}")
+            bars_vol[s] = b[vcol].to_numpy(dtype=np.float64, copy=False)
+            
+
+        
+    if need_volume:
+        adv_windows: List[int] = []
+        if base_spec.portfolio.use_participation_cap and str(base_spec.portfolio.participation_basis) == "adv":
+            adv_windows.append(int(base_spec.portfolio.adv_window))
+        if base_spec.portfolio.use_volume_gate and str(base_spec.portfolio.volume_gate_kind) == "min_ratio_adv":
+            adv_windows.append(int(base_spec.portfolio.volume_gate_adv_window))
+        adv_windows = sorted(set(w for w in adv_windows if w >= 1))
+
+        for w in adv_windows:
+            adv_by_window_np[w] = {}
+            for s in symbols:
+                v = bars_vol[s]
+                # fast rolling mean via cumsum
+                c = np.cumsum(np.insert(v, 0, 0.0))
+                adv = np.empty_like(v)
+                # min_periods=1 behavior
+                c = np.cumsum(np.insert(v, 0, 0.0))
+                adv = np.empty_like(v)
+                # first part: min_periods=1
+                idx = np.arange(v.size)
+                lo = np.maximum(0, idx - (w - 1))
+                den = (idx - lo + 1).astype(np.float64)
+                adv[:] = (c[idx + 1] - c[lo]) / den
+                adv_by_window_np[w][s] = adv
+
+    
 
     # --- SMA bank (optional) ---
     bank: Dict[str, Dict[str, np.ndarray]] = {s: {} for s in symbols}
@@ -352,15 +389,6 @@ def run_optimization(
         uniq = sorted(set(int(w) for w in sma_windows))
         bank = {s: _sma_bank_numpy(bars_close[s], uniq) for s in symbols}
 
-
-        
-
-
-
-    # bars close arrays (needed for sma_price; also convenient)
-    bars_close: Dict[str, np.ndarray] = {}
-    for s in symbols:
-        bars_close[s] = md.bars[s]["Close"].reindex(common_index).to_numpy(dtype=np.float64)
 
     # 4) Candidate iterator
     method = cfg.method.lower()
@@ -374,6 +402,18 @@ def run_optimization(
     # 5) Evaluate
     results: List[TrialResult] = []
     for params in candidates:
+        ok, err = adapter.validate_params(params, base_spec)
+        if not ok:
+            results.append(TrialResult(
+                params=params,
+                pnl=float("-inf"),
+                traded_notional=0.0,
+                efficiency=float("-inf"),
+                n_fills=0,
+                error=err or "invalid params",
+            ))
+            continue
+
         r = _eval_one_trial(
             base_spec=base_spec,
             md=md,
@@ -381,6 +421,8 @@ def run_optimization(
             bank=bank,
             bars_open=bars_open,      # NEW
             bars_close=bars_close,
+            bars_vol=bars_vol,
+            adv_by_window_np=adv_by_window_np,
             adapter=adapter,
             params=params,
         )
@@ -462,6 +504,8 @@ def _eval_one_trial(
     bank: Dict[str, Dict[str, np.ndarray]],
     bars_open: Dict[str, np.ndarray],
     bars_close: Dict[str, np.ndarray],
+    bars_vol: Dict[str, np.ndarray],
+    adv_by_window_np: Dict[int, Dict[str, np.ndarray]],
     adapter: StrategyAdapter,
     params: Dict[str, Any],
 ) -> TrialResult:
@@ -500,6 +544,31 @@ def _eval_one_trial(
 
         open_px = bars_open[sym] if idx_pos is None else bars_open[sym][idx_pos]
         close_px = bars_close[sym] if idx_pos is None else bars_close[sym][idx_pos]
+        need_volume = bool(base_spec.portfolio.use_participation_cap or base_spec.portfolio.use_volume_gate)
+        vol_px = (bars_vol[sym] if idx_pos is None else bars_vol[sym][idx_pos]) if need_volume else None
+        adv_cap_px = None
+        adv_gate_px = None
+
+        port_base = base_spec.portfolio
+
+        if port_base.use_participation_cap and str(port_base.participation_basis) == "adv":
+            w = int(port_base.adv_window)
+            a = adv_by_window_np.get(w, {}).get(sym)
+            if a is None:
+                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0,
+                                error=f"missing ADV cap series for window={w}")
+            adv_cap_px = a if idx_pos is None else a[idx_pos]
+
+        if port_base.use_volume_gate and str(port_base.volume_gate_kind) == "min_ratio_adv":
+            w = int(port_base.volume_gate_adv_window)
+            a = adv_by_window_np.get(w, {}).get(sym)
+            if a is None:
+                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0,
+                                error=f"missing ADV gate series for window={w}")
+            adv_gate_px = a if idx_pos is None else a[idx_pos]
+
+
+
 
         # ----------------------------
         # B) Build numpy signals from SMA bank (no pandas)
@@ -557,7 +626,7 @@ def _eval_one_trial(
         port = PortfolioEngine(port_cfg)
 
         # IMPORTANT: call your NEW arrays fast path
-        stats = port.run_stats_only_arrays(open_px=open_px, close_px=close_px, sig=sig)
+        stats = port.run_stats_only_arrays(open_px=open_px, close_px=close_px, sig=sig, vol_px=vol_px, adv_cap_px=adv_cap_px, adv_gate_px=adv_gate_px)
 
         pnl = float(stats.pnl)
         traded = float(stats.traded_notional)
