@@ -1580,4 +1580,4 @@ with tab_opt:
                 show_cols = [c for c in ["timestamp","symbol","side","qty","price","notional","cost","net_invested","cash_after"] if c in fills_df.columns]
                 st.dataframe(fills_df[show_cols], use_container_width=True)
 
-            render_bundle(bundle, port_cfg=best_spec.portfolio)
+            render_bundle(bundle, port_cfg=base_spec.portfolio)
