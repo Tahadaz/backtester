@@ -1,3 +1,4 @@
+
 # engine.py
 from __future__ import annotations
 
@@ -40,11 +41,12 @@ class DataConfig:
     interval: str = "1d"
     start: Optional[str] = None
     end: Optional[str] = None
-        # Period filters (multi-window)
+
+
+    # Optional multi-window filters (applied after data load).
+    # Windows are (start,end) strings parseable by pandas.Timestamp.
     include_windows: Optional[List[tuple[str, str]]] = None
     exclude_windows: Optional[List[tuple[str, str]]] = None
-
-
     # BMCE inputs:
     # - for single symbol: str/Path
     # - for multi symbols: dict {symbol: str/Path}
@@ -101,10 +103,7 @@ class EngineSpec:
     plot_indicators: List[str] = field(default_factory=list)
     periods_per_year: int = 252
     rf_annual: float = 0.0
-    # Period filters (multi-window)
-    include_windows: Optional[List[tuple[str, str]]] = None
-    exclude_windows: Optional[List[tuple[str, str]]] = None
-
+    
 
 
 
@@ -116,81 +115,6 @@ class BacktestBundle:
     portfolio_result: PortfolioResult
     report: BacktestReport
     meta: Dict[str, Any] = field(default_factory=dict)
-
-
-def _apply_time_windows_to_df(
-    df: Any,
-    include_windows: Optional[List[tuple[str, str]]],
-    exclude_windows: Optional[List[tuple[str, str]]],
-):
-    import pandas as pd
-    if df is None or len(df) == 0:
-        return df
-
-    out = df.copy()
-    if not isinstance(out.index, pd.DatetimeIndex):
-        out.index = pd.to_datetime(out.index, errors="coerce")
-    out = out.sort_index()
-    out = out[~out.index.isna()]
-
-    idx = out.index
-    idx_tz = getattr(idx, "tz", None)
-
-    def _coerce_ts(x):
-        ts = pd.to_datetime(x)
-        if idx_tz is None:
-            # index is tz-naive -> make boundary tz-naive
-            if getattr(ts, "tzinfo", None) is not None:
-                ts = ts.tz_convert(None)
-            return ts
-        else:
-            # index is tz-aware -> make boundary tz-aware in same tz
-            if getattr(ts, "tzinfo", None) is None:
-                ts = ts.tz_localize(idx_tz)
-            else:
-                ts = ts.tz_convert(idx_tz)
-            return ts
-
-    # include mask
-    if include_windows:
-        m_inc = pd.Series(False, index=idx)
-        for s, e in include_windows:
-            s_dt = _coerce_ts(s)
-            e_dt = _coerce_ts(e)
-            m_inc |= (idx >= s_dt) & (idx <= e_dt)
-
-    else:
-        m_inc = pd.Series(True, index=idx)
-
-    # exclude mask
-    if exclude_windows:
-        m_exc = pd.Series(False, index=idx)
-        for s, e in exclude_windows:
-            s_dt = pd.to_datetime(s)
-            e_dt = pd.to_datetime(e)
-            m_exc |= (idx >= s_dt) & (idx <= e_dt)
-    else:
-        m_exc = pd.Series(False, index=idx)
-
-    final_mask = m_inc & (~m_exc)
-    return out.loc[final_mask.values]
-
-
-def apply_period_filters(md: MarketData, cfg: DataConfig) -> MarketData:
-    # apply multi-window slicing per symbol
-    if (not cfg.include_windows) and (not cfg.exclude_windows):
-        return md
-
-    new_bars = {}
-    for sym, bars in md.bars.items():
-        new_bars[sym] = _apply_time_windows_to_df(bars, cfg.include_windows, cfg.exclude_windows)
-
-    return MarketData(
-        bars=new_bars,
-        source=md.source,
-        timezone=md.timezone,
-        interval=md.interval,
-    )
 
 
 # -----------------------------
@@ -222,6 +146,72 @@ def sma_specs_for_ma_cross(fast_window: int, slow_window: int) -> List[FeatureSp
             output_mode="series",
         ),
     ]
+
+def _coerce_ts_for_index(ts, idx_tz):
+    """Coerce ts into a pandas Timestamp compatible with an index tz."""
+    t = pd.Timestamp(ts)
+    if idx_tz is None:
+        # make naive
+        if getattr(t, "tzinfo", None) is not None:
+            t = t.tz_convert(None)
+        return t
+    # idx is tz-aware
+    if getattr(t, "tzinfo", None) is None:
+        return t.tz_localize(idx_tz)
+    return t.tz_convert(idx_tz)
+
+
+def apply_window_filters(
+    md: MarketData,
+    include_windows: Optional[List[tuple[str, str]]] = None,
+    exclude_windows: Optional[List[tuple[str, str]]] = None,
+) -> MarketData:
+    """
+    Apply include/exclude date windows to each symbol's bars.
+    Works with trading-day gaps because it masks by DatetimeIndex membership.
+    Handles tz-aware indices by coercing window endpoints to the same tz.
+    """
+    if (not include_windows) and (not exclude_windows):
+        return md
+
+    new_bars: Dict[str, pd.DataFrame] = {}
+    for sym, df in md.bars.items():
+        if df is None or df.empty:
+            new_bars[sym] = df
+            continue
+
+        idx = df.index
+        idx_tz = getattr(idx, "tz", None)
+
+        # Start from either "all" or "none" depending on includes
+        if include_windows:
+            mask = np.zeros(len(idx), dtype=bool)
+            for a, b in include_windows:
+                ta = _coerce_ts_for_index(a, idx_tz)
+                tb = _coerce_ts_for_index(b, idx_tz)
+                if ta > tb:
+                    ta, tb = tb, ta
+                mask |= (idx >= ta) & (idx <= tb)
+        else:
+            mask = np.ones(len(idx), dtype=bool)
+
+        if exclude_windows:
+            for a, b in exclude_windows:
+                ta = _coerce_ts_for_index(a, idx_tz)
+                tb = _coerce_ts_for_index(b, idx_tz)
+                if ta > tb:
+                    ta, tb = tb, ta
+                mask &= ~((idx >= ta) & (idx <= tb))
+
+        new_bars[sym] = df.loc[mask].copy()
+
+    return MarketData(
+        bars=new_bars,
+        source=md.source,
+        timezone=md.timezone,
+        interval=md.interval,
+        meta=dict(md.meta),
+    )
 
 
 def resolve_specs(ind_cfg: IndicatorsConfig, strat_cfg: StrategyConfig) -> List[FeatureSpec]:
@@ -363,8 +353,9 @@ class BacktestEngine:
     def run(self) -> BacktestBundle:
         # 1) Data
         md = load_marketdata(self.spec.data)
-        md = apply_period_filters(md, self.spec.data)
+        md = apply_window_filters(md, self.spec.data.include_windows, self.spec.data.exclude_windows)
         symbols = self.spec.data.symbols
+        
         # 2) Indicators
         specs = resolve_specs(self.spec.indicators, self.spec.strategy)
         ind = IndicatorEngine(

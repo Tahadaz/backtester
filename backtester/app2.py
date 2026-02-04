@@ -33,28 +33,11 @@ from data import BMCEDataSource, YahooFinanceDataSource
 from results import ResultsAnalyzer
 
 
-# -----------------------------
-# Period catalogs (edit freely)
-# -----------------------------
-MASI_PERIODS: dict[str, tuple[str, str]] = {
-    "Pre-2008 (2005-2007)": ("2005-01-01", "2007-12-31"),
-    "Crise (2008-2009)": ("2008-01-01", "2009-12-31"),
-    "Mid-crisis recovery (2010)": ("2010-01-01", "2010-12-31"),
-    "Primtemps arabe / Eurozone (2011-2013)": ("2011-01-01", "2013-12-31"),
-    "Normalization (2014-2019)": ("2014-01-01", "2019-12-31"),
-    "COVID shock (2020)": ("2020-01-01", "2020-12-31"),
-    "Inflation / rates shock (2022-mid2023)": ("2022-01-01", "2023-06-01"),
-    "Post-2024 (2024-06-25+)": ("2023-06-02", "2025-12-31"),
-}
-
-IAM_PERIODS: dict[str, tuple[str, str]] = {
-   "Etisalat control transition (2013-2015)": ("2013-01-01", "2015-12-31"),
-    "Affaire Inwi (2024-01-29 to 2025-03-01)": ("2024-01-29", "2025-03-01"),
-    "Changement Leadership (2025-03-01+)": ("2025-03-01", "2026-12-31"),
-}
 
 
 import optimize as _opt_mod
+
+import periods
 st.title("Backtester (TA) — Backtest / Optimize")
 st.sidebar.caption(f"optimize.py loaded from: {_opt_mod.__file__}")
 st.sidebar.caption(f"run_optimization: {_opt_mod.run_optimization.__module__}.{_opt_mod.run_optimization.__name__}")
@@ -725,8 +708,8 @@ def make_base_spec(
     bmce_tmp_path: Optional[str],
     start: Optional[str],
     end: Optional[str],
-    include_windows: Optional[list[tuple[str, str]]],
-    exclude_windows: Optional[list[tuple[str, str]]],
+    include_windows: Optional[List[Tuple[str, str]]],
+    exclude_windows: Optional[List[Tuple[str, str]]],
     yf_period: Optional[str],
     yf_interval: Optional[str],
     yf_auto_adjust: Optional[bool],
@@ -759,9 +742,9 @@ def make_base_spec(
             interval=interval,
             start=start,
             end=end,
+            bmce_paths=bmce_tmp_path,
             include_windows=include_windows,
             exclude_windows=exclude_windows,
-            bmce_paths=bmce_path,
         )
     else:
         data_cfg = DataConfig(
@@ -771,8 +754,6 @@ def make_base_spec(
             interval=interval,
             start=start,
             end=end,
-            include_windows=include_windows,
-            exclude_windows=exclude_windows,
             yf_period=yf_period or "max",
             yf_interval=yf_interval or "1d",
             yf_auto_adjust=bool(yf_auto_adjust),
@@ -867,10 +848,10 @@ def ss_get(key: str, default):
 # ============================================================
 
 st.sidebar.header("Data source")
-source = st.sidebar.selectbox("Source", ["(upload)", "yfinance","(local file)"], index=0)
-source_key = "bmce" if source.startswith("(") else "yfinance"
+source = st.sidebar.selectbox("Source", ["bmce (local file)", "bmce (upload)"], index=0)
+source_key = "bmce"
 
-symbol = st.sidebar.text_input("Symbol", value="IAM" if source_key == "bmce" else "AAPL")
+symbol = st.sidebar.text_input("Symbol", value="IAM")
 timezone = st.sidebar.text_input("Timezone", value="GMT")
 interval = st.sidebar.selectbox("Interval", ["1d"], index=0)
 
@@ -879,27 +860,18 @@ yf_period = yf_interval = None
 yf_auto_adjust = None
 
 if source_key == "bmce":
-    bmce_file = None
-    bmce_path = None  # <- this is what we will pass into DataConfig.bmce_paths
-
-    if source == "(local file)":
-        # Put your default IAM file somewhere in your project, e.g. ./data/IAM.xlsx
-        default_path = str((Path(__file__).parent / "data" / "Data IAM.xlsx").resolve())
-        bmce_path = st.sidebar.text_input("Local BMCE file path (CSV/XLSX)", value=default_path)
-
-    else:  # bmce (upload)
+    if source == "bmce (local file)":
+        local_path = st.sidebar.text_input("Local BMCE CSV/XLSX path", value="IAM.xlsx")
+        # Store for later execution blocks (backtest/optimization)
+        st.session_state["bmce_cached_path"] = local_path
+        if local_path and (not Path(local_path).exists()):
+            st.sidebar.warning("Local file not found yet (path does not exist).")
+    else:
         bmce_file = st.sidebar.file_uploader("Upload BMCE CSV/XLSX", type=["csv", "xlsx"])
         if bmce_file is not None:
             bmce_cached_path, bmce_file_hash = _persist_upload_to_cache(bmce_file, tag="bmce", symbol=symbol)
             st.session_state["bmce_cached_path"] = bmce_cached_path
             st.session_state["bmce_file_hash"] = bmce_file_hash
-            bmce_path = bmce_cached_path
-
-else:
-    st.sidebar.caption("yfinance needs internet + yfinance in requirements.txt")
-    yf_period = st.sidebar.text_input("yfinance period", value="5y")
-    yf_interval = st.sidebar.selectbox("yfinance interval", ["1d"], index=0)
-    yf_auto_adjust = st.sidebar.checkbox("auto_adjust", value=False)
 
 st.sidebar.header("Strategy")
 strategy_kind = st.sidebar.selectbox("Strategy kind", ["ma_cross", "sma_price"], index=0)
@@ -912,8 +884,6 @@ if prev_kind != strategy_kind:
         if k.endswith("_min") or k.endswith("_max") or k.endswith("_step") or k.endswith("_choices"):
             del st.session_state[k]
     st.session_state["prev_strategy_kind"] = strategy_kind
-
-
 
 # ============================================================
 # Sidebar: Benchmark (optional)
@@ -963,99 +933,26 @@ if use_benchmark:
             st.session_state["bench_cached_path"] = bench_cached_path
             st.session_state["bench_file_hash"] = bench_file_hash
 
-st.sidebar.header("Periods (include/exclude)")
-
-use_period_filters = st.sidebar.checkbox("Enable period filters", value=False)
-
-include_windows: list[tuple[str, str]] | None = None
-exclude_windows: list[tuple[str, str]] | None = None
-
-if use_period_filters:
-    st.sidebar.subheader("Market periods (MASI-level)")
-
-    market_include = st.sidebar.multiselect(
-        "Include market periods",
-        options=list(MASI_PERIODS.keys()),
-        default=list(MASI_PERIODS.keys()),
-    )
-    market_exclude = st.sidebar.multiselect(
-        "Exclude market periods",
-        options=list(MASI_PERIODS.keys()),
-        default=[],
-        key="market_exclude",
-    )
-
-    # Build include windows from selection (if user unselects all, treat as "no include restriction")
-    inc = [MASI_PERIODS[k] for k in market_include] if market_include else []
-    exc = [MASI_PERIODS[k] for k in market_exclude] if market_exclude else []
-
-    st.sidebar.subheader("Stock-specific overlays")
-
-    if symbol.upper() == "IAM":
-        iam_include = st.sidebar.multiselect(
-            "Include IAM periods (optional)",
-            options=list(IAM_PERIODS.keys()),
-            default=[],
-            key="iam_include",
-        )
-        iam_exclude = st.sidebar.multiselect(
-            "Exclude IAM periods",
-            options=list(IAM_PERIODS.keys()),
-            default=[],
-            key="iam_exclude",
-        )
-
-        inc_i = [IAM_PERIODS[k] for k in iam_include] if iam_include else []
-        exc_i = [IAM_PERIODS[k] for k in iam_exclude] if iam_exclude else []
-
-        # Methodology:
-        # 1) include = market includes (if any were selected)
-        # 2) if IAM include selected, we further restrict by intersecting -> easiest way is to add to include_windows
-        #    and let engine do union-of-includes; to get true intersection you either:
-        #      - do it in engine (more complex), or
-        #      - choose to interpret "IAM include" as an additional allowed window set.
-        # Here we implement "IAM include" as additional includes; if you want strict intersection later, we can upgrade.
-        inc = inc + inc_i
-        exc = exc + exc_i
-
-    include_windows = inc if inc else None
-    exclude_windows = exc if exc else None
-
-
 # ============================================================
 # Main preview (BMCE)
 # ============================================================
 
 preview_df = None
 if source_key == "bmce":
-    st.subheader("BMCE data")
-
-    if source == "(upload)" and bmce_file is None:
+    st.subheader("BMCE upload")
+    if bmce_file is None:
         st.info("Upload a BMCE CSV/XLSX.")
         st.stop()
-
-    if bmce_path is None:
-        st.error("No BMCE path provided.")
-        st.stop()
-
     try:
-        p = Path(bmce_path)
-        if not p.exists():
-            st.error(f"Local file not found: {bmce_path}")
-            st.stop()
-
-        if p.suffix.lower() == ".csv":
-            preview_df = pd.read_csv(bmce_path)
+        if bmce_file.name.lower().endswith(".csv"):
+            preview_df = pd.read_csv(bmce_file)
         else:
-            preview_df = pd.read_excel(bmce_path, engine="openpyxl")
-
+            preview_df = pd.read_excel(bmce_file, engine="openpyxl")
         st.caption("File preview (first rows)")
         st.dataframe(preview_df.head(30), use_container_width=True)
-
     except Exception as e:
         st.error(f"Could not preview file: {e}")
         st.stop()
-
 else:
     st.subheader("yfinance mode")
     st.caption("This requires `yfinance` in requirements.txt. BMCE is recommended for your desk data.")
@@ -1079,6 +976,54 @@ with c2:
 start_str = start_date.isoformat() if (use_date_range and start_date) else None
 end_str = end_date.isoformat() if (use_date_range and end_date) else None
 
+# ----------------------------
+# Periods (Market regimes + stock overlays)
+# ----------------------------
+st.sidebar.header("Periods (Regimes)")
+
+market_labels = list(periods.MASI_PERIODS.keys())
+include_market = st.sidebar.multiselect(
+    "Include market periods (union)",
+    options=market_labels,
+    default=market_labels,
+)
+exclude_market = st.sidebar.multiselect(
+    "Exclude market periods",
+    options=market_labels,
+    default=[],
+)
+
+include_windows = periods.windows_from_labels(periods.MASI_PERIODS, include_market)
+exclude_windows = periods.windows_from_labels(periods.MASI_PERIODS, exclude_market)
+
+# Stock-specific overlays (IAM for now)
+sym_upper = (symbol or "").strip().upper()
+if sym_upper in periods.STOCK_PERIODS:
+    st.sidebar.subheader(f"{sym_upper} overlays")
+    stock_reg = periods.STOCK_PERIODS[sym_upper]
+    stock_labels = list(stock_reg.keys())
+
+    include_stock = st.sidebar.multiselect(
+        f"Include {sym_upper} periods (intersection inside market selection)",
+        options=stock_labels,
+        default=[],
+    )
+    exclude_stock = st.sidebar.multiselect(
+        f"Exclude {sym_upper} periods",
+        options=stock_labels,
+        default=[],
+    )
+
+    inc_stock_w = periods.windows_from_labels(stock_reg, include_stock)
+    exc_stock_w = periods.windows_from_labels(stock_reg, exclude_stock)
+
+    if inc_stock_w:
+        include_windows = periods.intersect_windows(include_windows, inc_stock_w)
+
+    exclude_windows = exclude_windows + exc_stock_w
+
+include_windows = periods.normalize_windows(include_windows)
+exclude_windows = periods.normalize_windows(exclude_windows)
 if use_date_range and start_str and end_str and start_str > end_str:
     st.sidebar.error("Start date must be <= End date")
     st.stop()
@@ -1666,7 +1611,6 @@ with tab_opt:
     # ------------------------------------------------------------
     if (not run_opt) and (st.session_state.get("opt_best_bundle") is not None):
         best = st.session_state.get("opt_best", None)
-        best_spec = st.session_state.get("opt_best_spec", None)
         top_df = st.session_state.get("opt_top_df", None)
         bundle = st.session_state.get("opt_best_bundle")
 
@@ -1695,4 +1639,4 @@ with tab_opt:
                 show_cols = [c for c in ["timestamp","symbol","side","qty","price","notional","cost","net_invested","cash_after"] if c in fills_df.columns]
                 st.dataframe(fills_df[show_cols], use_container_width=True)
 
-            render_bundle(bundle, port_cfg=(best_spec.portfolio if best_spec is not None else None))
+            render_bundle(bundle, port_cfg=best_spec.portfolio)
