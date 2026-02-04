@@ -1695,8 +1695,5 @@ with tab_opt:
                 show_cols = [c for c in ["timestamp","symbol","side","qty","price","notional","cost","net_invested","cash_after"] if c in fills_df.columns]
                 st.dataframe(fills_df[show_cols], use_container_width=True)
 
-<<<<<<< HEAD
             render_bundle(bundle, port_cfg=(best_spec.portfolio if best_spec is not None else None))
-=======
-            render_bundle(bundle, port_cfg=base_spec.portfolio)
->>>>>>> 8789601303f0d9fc911df5332b242aff03a955d5
+
