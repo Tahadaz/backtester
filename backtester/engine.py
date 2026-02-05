@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence, Callable, Literal, Union
 
 from pathlib import Path
 
+
 # ---- Project modules (adapt import paths if you have a package folder) ----
 from data import MarketData
 from data import BMCEDataSource
@@ -19,6 +20,12 @@ from strategy import (
     SignalFrame,
     PriceAboveSMAStrategy,
     PriceAboveSMAParams,
+    RSIStrategy,
+    RSIParams,
+    MACDStrategy,
+    MACDParams,
+    BollingerBandsStrategy,
+    BollingerParams,
 )
 from portfolio import PortfolioEngine, PortfolioConfig, PortfolioResult
 from results import ResultsAnalyzer, BacktestReport
@@ -26,7 +33,7 @@ from strategy import default_plot_indicators  # add import
 
 
 DataSourceKind = Literal["bmce", "yfinance"]
-StrategyKind = Literal["ma_cross","sma_price", ...]
+StrategyKind = Literal["ma_cross","sma_price", "rsi","macd","bollinger"]  # add more as you implement them'"]
 
 # -----------------------------
 # Engine Spec Objects
@@ -236,8 +243,8 @@ def resolve_specs(ind_cfg: IndicatorsConfig, strat_cfg: StrategyConfig) -> List[
             raise ValueError("IndicatorsConfig.spec_builder returned empty specs list.")
         return specs
 
-    # ✅ Generic: build the strategy and ask it
-    strat = build_strategy(strat_cfg)
+    # Generic: build the strategy and ask it
+    strat = build_strategy(strat_cfg.kind, strat_cfg.params)
     specs = strat.required_features()
     if not specs:
         raise ValueError("Strategy.required_features returned empty list.")
@@ -247,28 +254,59 @@ def resolve_specs(ind_cfg: IndicatorsConfig, strat_cfg: StrategyConfig) -> List[
 # -----------------------------
 # Strategy registry
 # -----------------------------
-def build_strategy(cfg) -> BaseStrategy:
-    kind = cfg.kind.lower()
-    p = cfg.params or {}
+def build_strategy(kind: str, params: Dict[str, Any]):
+    k = (kind or "").lower()
 
-    if kind in ("ma_cross", "moving_average_cross"):
-        params = MovingAverageCrossParams(
-            fast_window=int(p.get("fast_window", 15)),
-            slow_window=int(p.get("slow_window", 50)),
-            allow_short=bool(p.get("allow_short", False)),
-            nan_policy=str(p.get("nan_policy", "flat")),
+    if k == "ma_cross":
+        p = MovingAverageCrossParams(
+            fast_window=int(params.get("sma_fast_window", params.get("fast_window", 20))),
+            slow_window=int(params.get("sma_slow_window", params.get("slow_window", 50))),
+            allow_short=bool(params.get("allow_short", False)),
+            nan_policy=str(params.get("nan_policy", "flat")),
         )
-        return MovingAverageCrossStrategy(params)
+        return MovingAverageCrossStrategy(p)
 
-    if kind in ("sma_price", "price_sma", "price_above_sma"):
-        params = PriceAboveSMAParams(
-            window=int(p.get("window", 50)),
-            allow_short=bool(p.get("allow_short", False)),
-            nan_policy=str(p.get("nan_policy", "flat")),
+    if k == "sma_price":
+        p = PriceAboveSMAParams(
+            window=int(params.get("sma_window", params.get("window", 50))),
+            allow_short=bool(params.get("allow_short", False)),
+            nan_policy=str(params.get("nan_policy", "flat")),
         )
-        return PriceAboveSMAStrategy(params)
+        return PriceAboveSMAStrategy(p)
 
-    raise ValueError(f"Unknown strategy kind: {cfg.kind}")
+    if k == "rsi":
+        p = RSIParams(
+            period=int(params.get("rsi_window", params.get("period", 14))),
+            low=float(params.get("rsi_oversold", params.get("low", 30.0))),
+            high=float(params.get("rsi_overbought", params.get("high", 70.0))),
+            mode=str(params.get("mode", "reversal")),
+            allow_short=bool(params.get("allow_short", False)),
+            nan_policy=str(params.get("nan_policy", "flat")),
+        )
+        return RSIStrategy(p)
+
+    if k == "macd":
+        p = MACDParams(
+            fast=int(params.get("macd_fast_window", params.get("fast", 12))),
+            slow=int(params.get("macd_slow_window", params.get("slow", 26))),
+            signal=int(params.get("macd_signal_window", params.get("signal", 9))),
+            trigger=str(params.get("trigger", "cross")),
+            allow_short=bool(params.get("allow_short", False)),
+            nan_policy=str(params.get("nan_policy", "flat")),
+        )
+        return MACDStrategy(p)
+
+    if k == "bollinger":
+        p = BollingerParams(
+            bb_window=int(params.get("bb_window", params.get("bbands_window", 20))),
+            bb_k=float(params.get("bb_k", params.get("bbands_num_stddev", 2.0))),
+            allow_short=bool(params.get("allow_short", False)),
+            nan_policy=str(params.get("nan_policy", "flat")),
+        )
+        return BollingerBandsStrategy(p)
+
+    raise ValueError(f"Unknown strategy kind: {kind}")
+
 
 
 # -----------------------------
@@ -376,7 +414,7 @@ class BacktestEngine:
         feats = ind.compute(md, specs=specs, symbols=symbols)
 
         # 3) Strategy
-        strat = build_strategy(self.spec.strategy)
+        strat = build_strategy(self.spec.strategy.kind, self.spec.strategy.params)
         sf = strat.generate_signals(md, feats, symbols=symbols)
 
         # 4) Portfolio

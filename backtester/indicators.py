@@ -59,6 +59,20 @@ class FeatureSpec:
         if self.indicator == "sma":
             w = p.get("window", p.get("period", p.get("n")))
             return f"sma_{w}" if w is not None else "sma"
+        
+        if self.indicator == "rsi":
+            n = p.get("period", p.get("window", p.get("n")))
+            return f"rsi_{n}" if n is not None else "rsi"
+
+        if self.indicator == "macd":
+            fast = p.get("fast", 12)
+            slow = p.get("slow", 26)
+            sig  = p.get("signal", 9)
+            return f"macd_{fast}_{slow}_{sig}"
+        
+        if self.indicator in ("rolling_std", "std", "stdev", "vol"):
+            w = p.get("window", p.get("period", p.get("n")))
+            return f"std_{w}" if w is not None else "std"
 
         # generic fallback
         # you can expand this per-indicator later for nicer naming
@@ -295,3 +309,53 @@ def returns(bars: pd.DataFrame, params: Dict[str, Any]) -> pd.Series:
     if method == "simple":
         return px.pct_change()
     return np.log(px).diff()
+
+@register_indicator("rsi")
+def rsi(bars: pd.DataFrame, params: Dict[str, Any]) -> pd.Series:
+    """
+    Wilder RSI using exponential smoothing (alpha = 1/period).
+    Output: RSI in [0, 100].
+    """
+    period = int(params.get("period", params.get("window", 14)))
+    close = bars["Close"].astype(float)
+
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+
+    # Wilder's smoothing is an EMA with alpha=1/period
+    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi
+
+
+@register_indicator("macd")
+def macd(bars: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
+    """
+    MACD line = EMA(close, fast) - EMA(close, slow)
+    Signal    = EMA(MACD line, signal)
+    Hist      = MACD line - Signal
+    Output: DataFrame with columns: line, signal, hist
+    """
+    fast = int(params.get("fast", 12))
+    slow = int(params.get("slow", 26))
+    sig  = int(params.get("signal", 9))
+
+    close = bars["Close"].astype(float)
+    ema_fast = close.ewm(span=fast, adjust=False, min_periods=fast).mean()
+    ema_slow = close.ewm(span=slow, adjust=False, min_periods=slow).mean()
+
+    line = ema_fast - ema_slow
+    signal = line.ewm(span=sig, adjust=False, min_periods=sig).mean()
+    hist = line - signal
+
+    return pd.DataFrame({"line": line, "signal": signal, "hist": hist}, index=bars.index)
+
+@register_indicator("rolling_std")
+def rolling_std(df: pd.DataFrame, params: Dict[str, Any]) -> pd.Series:
+    w = int(params["window"])
+    s = pd.to_numeric(df["Close"], errors="coerce")
+    return s.rolling(w, min_periods=w).std().rename(f"std_{w}")

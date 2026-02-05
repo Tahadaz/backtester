@@ -416,23 +416,339 @@ class PriceAboveSMAStrategy(BaseStrategy):
         sf.assert_well_formed(symbols)
         return sf
 
+@dataclass(frozen=True)
+class RSIParams:
+    period: int = 14
+    low: float = 30.0
+    high: float = 70.0
+    mode: str = "reversal"   # "reversal" or "momentum"
+    allow_short: bool = False
+    nan_policy: str = "flat"
+
+    def __post_init__(self) -> None:
+        if self.period <= 0:
+            raise ValueError("period must be positive")
+        if not (0.0 <= self.low < self.high <= 100.0):
+            raise ValueError("Require 0 <= low < high <= 100")
+        if self.mode not in ("reversal", "momentum"):
+            raise ValueError("mode must be 'reversal' or 'momentum'")
+        if self.nan_policy not in ("flat", "nan"):
+            raise ValueError("nan_policy must be 'flat' or 'nan'")
+
+
+class RSIStrategy(BaseStrategy):
+    def __init__(self, params: RSIParams) -> None:
+        self.params = params
+        self._rsi_name = f"rsi_{params.period}"
+
+    @property
+    def spec(self) -> StrategySpec:
+        return StrategySpec(name="RSIStrategy", params=asdict(self.params))
+
+    def required_features(self) -> List[FeatureSpec]:
+        return [
+            FeatureSpec(
+                indicator="rsi",
+                params={"period": self.params.period},
+                inputs=("Close",),
+                warmup=self.params.period,
+            )
+        ]
+
+    def generate_signals(
+        self,
+        market_data: MarketDataLike,
+        features_data: FeaturesDataLike,
+        symbols: Optional[Sequence[str]] = None,
+    ) -> SignalFrame:
+        symbols = list(symbols) if symbols is not None else list(market_data.bars.keys())
+
+        all_indexes = [market_data.bars[s].index for s in symbols]
+        common_index = all_indexes[0]
+        for idx in all_indexes[1:]:
+            common_index = common_index.union(idx)
+        common_index = common_index.sort_values()
+
+        sig_df = pd.DataFrame(index=common_index, columns=symbols, dtype="float64")
+        valid_df = pd.DataFrame(index=common_index, columns=symbols, dtype="bool")
+
+        for s in symbols:
+            r = features_data.features[s][self._rsi_name].reindex(common_index).astype(float)
+            valid = r.notna()
+
+            signal = pd.Series(0.0, index=common_index, dtype=float)
+
+            if self.params.mode == "reversal":
+                # long when oversold, exit when overbought
+                signal[r < self.params.low] = 1.0
+                signal[r > self.params.high] = -1.0
+            else:  # momentum
+                # long when strong, exit when weak
+                signal[r > self.params.high] = 1.0
+                signal[r < self.params.low] = -1.0
+
+            if self.params.nan_policy == "flat":
+                signal = signal.where(valid, 0.0)
+            else:
+                signal = signal.where(valid, np.nan)
+
+            sig_df[s] = signal
+            valid_df[s] = valid
+
+        meta = {
+            "strategy_signature": self.spec.signature(),
+            "strategy_name": self.spec.name,
+            "strategy_params": self.spec.params,
+            "required_features": [fs.canonical_name() for fs in self.required_features()],
+        }
+
+        sf = SignalFrame(signals=sig_df, validity=valid_df, meta=meta)
+        sf.assert_well_formed(symbols)
+        return sf
+
+@dataclass(frozen=True)
+class MACDParams:
+    fast: int = 12
+    slow: int = 26
+    signal: int = 9
+    trigger: str = "cross"   # "cross" or "zero"
+    allow_short: bool = False
+    nan_policy: str = "flat"
+
+    def __post_init__(self) -> None:
+        if self.fast <= 0 or self.slow <= 0 or self.signal <= 0:
+            raise ValueError("fast/slow/signal must be positive")
+        if self.fast >= self.slow:
+            raise ValueError("Require fast < slow")
+        if self.trigger not in ("cross", "zero"):
+            raise ValueError("trigger must be 'cross' or 'zero'")
+        if self.nan_policy not in ("flat", "nan"):
+            raise ValueError("nan_policy must be 'flat' or 'nan'")
+
+
+class MACDStrategy(BaseStrategy):
+    def __init__(self, params: MACDParams) -> None:
+        self.params = params
+        self._base = f"macd_{params.fast}_{params.slow}_{params.signal}"
+        self._line_col = f"{self._base}__line"
+        self._sig_col = f"{self._base}__signal"
+
+    @property
+    def spec(self) -> StrategySpec:
+        return StrategySpec(name="MACDStrategy", params=asdict(self.params))
+
+    def required_features(self) -> List[FeatureSpec]:
+        warmup = int(self.params.slow + self.params.signal)  # conservative
+        return [
+            FeatureSpec(
+                indicator="macd",
+                params={"fast": self.params.fast, "slow": self.params.slow, "signal": self.params.signal},
+                inputs=("Close",),
+                warmup=warmup,
+            )
+        ]
+
+    def generate_signals(
+        self,
+        market_data: MarketDataLike,
+        features_data: FeaturesDataLike,
+        symbols: Optional[Sequence[str]] = None,
+    ) -> SignalFrame:
+        symbols = list(symbols) if symbols is not None else list(market_data.bars.keys())
+
+        all_indexes = [market_data.bars[s].index for s in symbols]
+        common_index = all_indexes[0]
+        for idx in all_indexes[1:]:
+            common_index = common_index.union(idx)
+        common_index = common_index.sort_values()
+
+        sig_df = pd.DataFrame(index=common_index, columns=symbols, dtype="float64")
+        valid_df = pd.DataFrame(index=common_index, columns=symbols, dtype="bool")
+
+        for s in symbols:
+            feats = features_data.features[s]
+            line = feats[self._line_col].reindex(common_index).astype(float)
+            sigl = feats[self._sig_col].reindex(common_index).astype(float)
+
+            valid = line.notna() & sigl.notna()
+            out = pd.Series(0.0, index=common_index, dtype=float)
+
+            if self.params.trigger == "cross":
+                out[line > sigl] = 1.0
+                out[line < sigl] = -1.0
+            else:  # "zero"
+                out[line > 0.0] = 1.0
+                out[line < 0.0] = -1.0
+
+            if self.params.nan_policy == "flat":
+                out = out.where(valid, 0.0)
+            else:
+                out = out.where(valid, np.nan)
+
+            sig_df[s] = out
+            valid_df[s] = valid
+
+        meta = {
+            "strategy_signature": self.spec.signature(),
+            "strategy_name": self.spec.name,
+            "strategy_params": self.spec.params,
+            "required_features": [fs.canonical_name() for fs in self.required_features()],
+        }
+
+        sf = SignalFrame(signals=sig_df, validity=valid_df, meta=meta)
+        sf.assert_well_formed(symbols)
+        return sf
+
+# =============================================================================
+# Concrete strategy: Bollinger Bands (mean reversion)
+# =============================================================================
+
+@dataclass(frozen=True)
+class BollingerParams:
+    bb_window: int = 20
+    bb_k: float = 2.0
+    allow_short: bool = False
+    nan_policy: str = "flat"
+
+    def __post_init__(self) -> None:
+        if self.bb_window <= 0:
+            raise ValueError("bb_window must be positive")
+        if self.bb_k <= 0:
+            raise ValueError("bb_k must be positive")
+        if self.nan_policy not in ("flat", "nan"):
+            raise ValueError("nan_policy must be 'flat' or 'nan'")
+
+
+
+class BollingerBandsStrategy(BaseStrategy):
+    def __init__(self, params: BollingerParams) -> None:
+        self.params = params
+        w = int(params.bb_window)
+        self._mid = f"sma_{w}"
+        self._std = f"std_{w}"
+
+    @property
+    def spec(self) -> StrategySpec:
+        return StrategySpec(name="BollingerBandsStrategy", params=asdict(self.params))
+
+    def required_features(self) -> List[FeatureSpec]:
+        w = int(self.params.bb_window)
+        return [
+            FeatureSpec(
+                indicator="sma",
+                params={"window": w},
+                inputs=("Close",),
+                name=f"sma_{w}",     # explicit column name
+                warmup=w,
+                output_mode="series",
+            ),
+            FeatureSpec(
+                indicator="rolling_std",          # ✅ MUST match your registry key
+                params={"window": w},
+                inputs=("Close",),
+                name=f"std_{w}",                  # explicit column name
+                warmup=w,
+                output_mode="series",
+            ),
+        ]
+
+    def generate_signals(
+        self,
+        market_data: MarketDataLike,
+        features_data: FeaturesDataLike,
+        symbols: Optional[Sequence[str]] = None,
+    ) -> SignalFrame:
+
+        symbols = list(symbols) if symbols is not None else list(market_data.bars.keys())
+
+        # common index
+        all_indexes = [market_data.bars[s].index for s in symbols]
+        common_index = all_indexes[0]
+        for idx in all_indexes[1:]:
+            common_index = common_index.union(idx)
+        common_index = common_index.sort_values()
+
+        sig_df = pd.DataFrame(index=common_index, columns=symbols, dtype="float64")
+        valid_df = pd.DataFrame(index=common_index, columns=symbols, dtype="bool")
+
+        w = int(self.params.bb_window)
+        k = float(self.params.bb_k)
+
+        for s in symbols:
+            bars = market_data.bars[s]
+            feats = features_data.features[s].reindex(common_index)
+
+            close = pd.to_numeric(bars["Close"].reindex(common_index), errors="coerce")
+            mid = pd.to_numeric(feats[self._mid], errors="coerce")
+            std = pd.to_numeric(feats[self._std], errors="coerce")
+
+            upper = mid + k * std
+            lower = mid - k * std
+
+            valid = close.notna() & mid.notna() & std.notna()
+
+            out = pd.Series(0.0, index=common_index, dtype=float)
+            out[close < lower] = 1.0
+            out[close > upper] = -1.0
+
+            if not self.params.allow_short:
+                # In long/flat mode, treat -1 as exit/flat intent
+                # (portfolio layer may clamp anyway, but keep intent clean)
+                out[out < 0] = -1.0  # keep as exit signal if you want; or set to 0.0
+                # If you prefer strict flat instead of "exit" semantics, do:
+                # out[out < 0] = 0.0
+
+            if self.params.nan_policy == "flat":
+                out = out.where(valid, 0.0)
+            else:
+                out = out.where(valid, np.nan)
+
+            sig_df[s] = out
+            valid_df[s] = valid
+
+        meta = {
+            "strategy_signature": self.spec.signature(),
+            "strategy_name": self.spec.name,
+            "strategy_params": self.spec.params,
+            "required_features": [fs.canonical_name() for fs in self.required_features()],
+        }
+
+        sf = SignalFrame(signals=sig_df, validity=valid_df, meta=meta)
+        sf.assert_well_formed(symbols)
+        return sf
+
 
 # =============================================================================
 # Helpers for engine/UI: plot overlay indicators per strategy
 # =============================================================================
 
 def default_plot_indicators(cfg_kind: str, cfg_params: Dict[str, Any]) -> List[str]:
-    k = cfg_kind.lower()
+    k = (cfg_kind or "").lower()
     p = cfg_params or {}
 
     if k == "ma_cross":
-        fast = int(p.get("fast_window", 20))
-        slow = int(p.get("slow_window", 50))
+        fast = int(p.get("sma_fast_window", p.get("fast_window", 20)))
+        slow = int(p.get("sma_slow_window", p.get("slow_window", 50)))
         return [f"sma_{fast}", f"sma_{slow}"]
 
     if k in ("sma_price", "price_sma", "price_above_sma"):
-        w = int(p.get("window", 50))
+        w = int(p.get("sma_window", p.get("window", 50)))
         return [f"sma_{w}"]
 
-    # fallback: nothing to overlay
+    if k == "rsi":
+        n = int(p.get("rsi_window", p.get("period", 14)))
+        return [f"rsi_{n}"]
+
+    if k == "macd":
+        fast = int(p.get("macd_fast_window", p.get("fast", 12)))
+        slow = int(p.get("macd_slow_window", p.get("slow", 26)))
+        sig  = int(p.get("macd_signal_window", p.get("signal", 9)))
+        base = f"macd_{fast}_{slow}_{sig}"
+        return [f"{base}__line", f"{base}__signal"]
+
+    if k == "bollinger":
+        w = int(p.get("bb_window", 20))
+        return [f"sma_{w}", f"std_{w}"]
+
     return []
+

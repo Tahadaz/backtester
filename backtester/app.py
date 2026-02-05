@@ -351,95 +351,233 @@ def load_benchmark_market_data_cached(
     )
     return md
 
-def make_spec_for_batch(params: dict, include_windows: list[tuple[str,str]]):
-    # Use your existing UI selections as defaults, override the optimized ones
-    # e.g., window/buy/sell/cooldown get overwritten from params if present.
-
-    window = int(params.get("window", window_ui))
-    buy_pct_cash = float(params.get("buy_pct_cash", buy_pct_cash_ui))
-    sell_pct_shares = float(params.get("sell_pct_shares", sell_pct_shares_ui))
-    cooldown_bars = int(params.get("cooldown_bars", cooldown_ui))
-
-    # build spec using your existing builder
-    return make_base_spec(
-        symbol=symbol,
-        timezone=timezone,
-        interval=interval,
-        bmce_path=bmce_path,
-        start=start_str,
-        end=end_str,
-        include_windows=include_windows,
-        exclude_windows=exclude_windows_ui,   # if you have global excludes; else None
-        strategy_kind=strategy_kind,
-        strategy_params={**strategy_params_ui, "window": window},
-        allow_short=allow_short,
-        initial_cash=initial_cash,
-        rebalance_policy=rebalance_policy,
-        sizing_mode=sizing_mode,
-        buy_pct_cash=buy_pct_cash,
-        sell_pct_shares=sell_pct_shares,
-        cooldown_bars=cooldown_bars,
-        cost_model=cost_model,
-        use_volume_gate=use_volume_gate,
-        volume_gate_kind=volume_gate_kind,
-        min_volume_abs=min_volume_abs,
-        min_volume_ratio_adv=min_volume_ratio_adv,
-        volume_gate_adv_window=volume_gate_adv_window,
-        use_participation_cap=use_participation_cap,
-        participation_rate=participation_rate,
-        participation_basis=participation_basis,
-        adv_window=adv_window,
-    )
 
 
 from plotly.subplots import make_subplots
 
 def plot_price_indicators_trades_line(
     bars: pd.DataFrame,
-    indicators: pd.DataFrame | None,
-    trades: pd.DataFrame | None,
+    strategy_params: dict | None = None,
+    indicators: pd.DataFrame | None = None,
+    trades: pd.DataFrame | None = None,
     indicator_cols: list[str] | None = None,
     *,
     port_cfg: PortfolioConfig | None = None,
+    rsi_low: float = 30.0,
+    rsi_high: float = 70.0,
 ) -> go.Figure:
+    """
+    Price (row 1), RSI and/or MACD panels (middle rows), Volume (last row).
+
+    - RSI is plotted in its own panel with threshold lines + shaded regions.
+    - MACD panel plots EMA_fast, EMA_slow + histogram (EMA_fast-EMA_slow) as bars
+      with per-bar green/red intensity (stronger color as magnitude increases).
+    """
+
     df = bars.copy().sort_index()
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
 
-    # --- subplot layout: price on top, volume below ---
-    fig = make_subplots(
-        rows=2, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.06,
-        row_heights=[0.72, 0.28],
-    )
-
-    # =========================
-    # Row 1: Price + Indicators
-    # =========================
-    fig.add_trace(
-        go.Scatter(x=df.index, y=df["Close"].astype(float), mode="lines", name="Close"),
-        row=1, col=1
-    )
-
+    ind = None
     if indicators is not None and not indicators.empty:
         ind = indicators.copy()
         if not isinstance(ind.index, pd.DatetimeIndex):
             ind.index = pd.to_datetime(ind.index)
         ind = ind.reindex(df.index)
 
-        cols = [c for c in (indicator_cols or list(ind.columns)) if c in ind.columns]
+        if indicator_cols is not None:
+            keep = [c for c in indicator_cols if c in ind.columns]
+            if keep:
+                ind = ind[keep]
+
+    def _maybe_add_bollinger_overlay():
+        nonlocal fig, df, ind, indicator_cols
+
+        if ind is None or ind.empty:
+            return
+
+        cols = list(ind.columns)
+
+        # Try to infer bb_window from indicator_cols first (more deterministic)
+        w = None
+        if indicator_cols:
+            for c in indicator_cols:
+                if c.startswith("std_"):
+                    try:
+                        w = int(c.split("_", 1)[1])
+                        break
+                    except Exception:
+                        pass
+                if c.startswith("sma_") and w is None:
+                    try:
+                        w = int(c.split("_", 1)[1])
+                    except Exception:
+                        pass
+
+        # Fallback: infer from available columns
+        if w is None:
+            for c in cols:
+                if c.startswith("std_"):
+                    try:
+                        w = int(c.split("_", 1)[1])
+                        break
+                    except Exception:
+                        continue
+            if w is None:
+                for c in cols:
+                    if c.startswith("sma_"):
+                        try:
+                            w = int(c.split("_", 1)[1])
+                            break
+                        except Exception:
+                            continue
+
+        if w is None:
+            return  # nothing to plot
+
+        # k: try to read from strategy meta if present, else default
+        k = float((strategy_params or {}).get("bb_k", 2.0))
+        # If your pipeline includes a constant column or meta, adapt here.
+        # For now we keep k=2.0 (you can pass it in later if you want).
+
+        col_mid = f"sma_{w}"
+        col_std = f"std_{w}"
+
+        if col_mid not in ind.columns:
+            return
+
+        mid = pd.to_numeric(ind[col_mid], errors="coerce")
+
+        if col_std in ind.columns:
+            std = pd.to_numeric(ind[col_std], errors="coerce")
+        else:
+            # fallback: compute rolling std from close if not provided
+            std = pd.to_numeric(df["Close"], errors="coerce").rolling(int(w), min_periods=int(w)).std()
+
+        upper = mid + k * std
+        lower = mid - k * std
+
+        # Add mid/upper/lower on PRICE row (row=1)
+        fig.add_trace(
+            go.Scatter(x=df.index, y=mid, mode="lines", name=f"BB mid (SMA{w})", line=dict(width=1)),
+            row=1, col=1
+        )
+        fig.add_trace(
+            go.Scatter(x=df.index, y=upper, mode="lines", name=f"BB upper (k={k})", line=dict(width=1, dash="dash")),
+            row=1, col=1
+        )
+        fig.add_trace(
+            go.Scatter(x=df.index, y=lower, mode="lines", name=f"BB lower (k={k})", line=dict(width=1, dash="dash")),
+            row=1, col=1
+        )
+
+        # Optional fill between upper and lower (nice visual)
+        fig.add_trace(
+            go.Scatter(
+                x=df.index, y=upper,
+                mode="lines",
+                line=dict(width=0),
+                showlegend=False,
+                hoverinfo="skip",
+            ),
+            row=1, col=1
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=df.index, y=lower,
+                mode="lines",
+                fill="tonexty",
+                line=dict(width=0),
+                name="BB band",
+                opacity=0.12,
+                hoverinfo="skip",
+            ),
+            row=1, col=1
+        )
+
+    # ----------------------------
+    # Detect RSI / MACD columns
+    # ----------------------------
+    rsi_cols: list[str] = []
+    macd_bases: list[str] = []
+
+    if ind is not None and not ind.empty:
+        cols = list(ind.columns)
+
+        # RSI columns: rsi_{n}
+        rsi_cols = [c for c in cols if c.startswith("rsi_")]
+
+        # MACD base: macd_{fast}_{slow}_{sig} (but in DF you likely have __line/__signal/__hist)
+        # We'll infer unique "macd_{fast}_{slow}_{sig}" bases from columns.
         for c in cols:
-            s = pd.to_numeric(ind[c], errors="coerce")
-            if s.notna().any():
-                fig.add_trace(
-                    go.Scatter(x=df.index, y=s, mode="lines", name=c),
-                    row=1, col=1
-                )
+            if c.startswith("macd_") and "__" in c:
+                base = c.split("__", 1)[0]
+                if base not in macd_bases:
+                    macd_bases.append(base)
+
+    has_rsi = len(rsi_cols) > 0
+    has_macd = len(macd_bases) > 0
+
+    # If multiple RSI/MACD exist, we plot the first by default (you can drive this via indicator_cols).
+    rsi_col = rsi_cols[0] if has_rsi else None
+    macd_base = macd_bases[0] if has_macd else None
+
+    # ----------------------------
+    # Layout: rows depend on panels
+    # ----------------------------
+    # row 1: price
+    # optional row 2: RSI
+    # optional row 3: MACD
+    # last row: volume
+    n_mid = int(has_rsi) + int(has_macd)
+    n_rows = 2 + n_mid  # price + volume + middle panels
+
+    # heights: price biggest, then mid panels, then volume
+    # normalize later by relative weights
+    row_heights = []
+    row_heights.append(0.58)  # price
+    if has_rsi:
+        row_heights.append(0.20)
+    if has_macd:
+        row_heights.append(0.20)
+    row_heights.append(0.22)  # volume
+
+    # normalize to sum=1
+    s = sum(row_heights)
+    row_heights = [h / s for h in row_heights]
+
+    # Determine which row is MACD row (if present)
+    macd_row = None
+    tmp_row = 2
+    if has_rsi:
+        tmp_row += 1
+    if has_macd:
+        macd_row = tmp_row  # the current row where MACD panel is plotted
+
+    specs = [[{}] for _ in range(n_rows)]
+    if macd_row is not None:
+        specs[macd_row - 1][0] = {"secondary_y": True}  # plotly is 1-indexed rows
+
+    fig = make_subplots(
+        rows=n_rows, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        row_heights=row_heights,
+        specs=specs,
+    )
+
 
     # =========================
-    # Row 1: Trades markers
+    # Row 1: Price + Trades
     # =========================
+    fig.add_trace(
+        go.Scatter(x=df.index, y=df["Close"].astype(float), mode="lines", name="Close"),
+        row=1, col=1
+    )
+    _maybe_add_bollinger_overlay()
+
+
+    # Trades markers on row 1
     if trades is not None and not trades.empty:
         t = trades.copy()
         t["timestamp"] = pd.to_datetime(t["timestamp"], errors="coerce")
@@ -448,7 +586,6 @@ def plot_price_indicators_trades_line(
         if "side" not in t.columns:
             t["side"] = np.where(pd.to_numeric(t["qty"], errors="coerce").fillna(0) > 0, "BUY", "SELL")
 
-        # y at fill price if exists else close
         if "price" in t.columns:
             y = pd.to_numeric(t["price"], errors="coerce")
         else:
@@ -489,8 +626,140 @@ def plot_price_indicators_trades_line(
             )
 
     # =========================
-    # Row 2: Volume + Gate/Cap
+    # Middle panels: RSI / MACD
     # =========================
+    cur_row = 2  # first middle row
+
+    # ---- RSI panel ----
+    if has_rsi and rsi_col is not None:
+        rsi = pd.to_numeric(ind[rsi_col], errors="coerce")
+
+        # main RSI line
+        fig.add_trace(
+            go.Scatter(x=df.index, y=rsi, mode="lines", name=rsi_col),
+            row=cur_row, col=1
+        )
+
+        # threshold lines
+        fig.add_hline(y=rsi_low, line_width=1, line_dash="dash", row=cur_row, col=1)
+        fig.add_hline(y=rsi_high, line_width=1, line_dash="dash", row=cur_row, col=1)
+
+        # shaded regions:
+        # - oversold region: [0, rsi_low]
+        # - overbought region: [rsi_high, 100]
+        # Plotly: rectangle shapes in that subplot's y-domain
+        fig.add_hrect(y0=0, y1=rsi_low, row=cur_row, col=1, opacity=0.12, line_width=0)
+        fig.add_hrect(y0=rsi_high, y1=100, row=cur_row, col=1, opacity=0.12, line_width=0)
+
+        # keep RSI scale consistent
+        fig.update_yaxes(range=[0, 100], title_text="RSI", row=cur_row, col=1)
+
+        cur_row += 1
+
+    # ---- MACD panel ----
+    if has_macd and macd_base is not None:
+        # parse fast/slow/signal from base: macd_{fast}_{slow}_{sig}
+        # defensive parsing (if naming deviates, we still try to plot using available cols)
+        fast = slow = sig = None
+        try:
+            parts = macd_base.split("_")
+            # ["macd", fast, slow, sig]
+            if len(parts) >= 4:
+                fast = int(parts[1])
+                slow = int(parts[2])
+                sig = int(parts[3])
+        except Exception:
+            fast = slow = sig = None
+
+        close = df["Close"].astype(float)
+
+        # compute EMA fast/slow so you can see both EMAs (as requested)
+        if fast is not None and slow is not None and fast > 0 and slow > 0:
+            ema_fast = close.ewm(span=fast, adjust=False, min_periods=fast).mean()
+            ema_slow = close.ewm(span=slow, adjust=False, min_periods=slow).mean()
+            diff = ema_fast - ema_slow
+        else:
+            # fallback: use MACD line as "diff" and plot only what we can
+            ema_fast = ema_slow = None
+            line_col = f"{macd_base}__line"
+            diff = pd.to_numeric(ind[line_col], errors="coerce") if (ind is not None and line_col in ind.columns) else close * np.nan
+
+        # EMA lines (if available)
+        if ema_fast is not None and ema_slow is not None:
+            fig.add_trace(
+                go.Scatter(x=df.index, y=ema_fast, mode="lines", name=f"EMA{fast}"),
+                row=cur_row, col=1, secondary_y=False
+            )
+            fig.add_trace(
+                go.Scatter(x=df.index, y=ema_slow, mode="lines", name=f"EMA{slow}"),
+                row=cur_row, col=1, secondary_y=False
+)
+
+        # Histogram colors with intensity
+        hist = pd.to_numeric(diff, errors="coerce").fillna(0.0).astype(float)
+        max_abs = float(np.nanmax(np.abs(hist.values))) if np.isfinite(hist.values).any() else 1.0
+        if max_abs <= 0:
+            max_abs = 1.0
+
+        def _bar_color(v: float) -> str:
+            """
+            Greenish when positive (more intense for larger positives),
+            red when negative (more intense for larger negatives).
+            Output is rgba string.
+            """
+            a = min(1.0, abs(v) / max_abs)  # 0..1
+            # intensity factor: start light and get darker/stronger
+            # positive -> greener; negative -> redder
+            if v >= 0:
+                # light green -> strong green
+                r = int(220 - 140 * a)
+                g = int(230 - 20 * a)
+                b = int(220 - 160 * a)
+            else:
+                # light red -> strong red
+                r = int(230 - 20 * a)
+                g = int(220 - 150 * a)
+                b = int(220 - 150 * a)
+            return f"rgba({r},{g},{b},0.95)"
+
+        colors = [_bar_color(v) for v in hist.values]
+
+        fig.add_trace(
+            go.Bar(
+                x=df.index,
+                y=hist.values,
+                name=f"{macd_base} hist (EMAfast-EMAslow)",
+                marker=dict(color=colors),
+                opacity=0.95,
+            ),
+            row=cur_row, col=1, secondary_y=True
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=np.zeros(len(df.index)),
+                mode="lines",
+                name="0",
+                showlegend=False,
+            ),
+            row=cur_row, col=1, secondary_y=True
+        )
+
+
+        # Zero line to make sign changes obvious
+        fig.add_hline(y=0.0, line_width=1, line_dash="solid", row=cur_row, col=1)
+
+        fig.update_yaxes(title_text="EMAs", row=cur_row, col=1, secondary_y=False)
+        fig.update_yaxes(title_text="Diff", row=cur_row, col=1, secondary_y=True)
+
+        cur_row += 1
+
+    # =========================
+    # Last Row: Volume + Gate/Cap
+    # =========================
+    vol_row = n_rows
+
     if port_cfg is not None:
         vcol = getattr(port_cfg, "volume_col", "Volume")
     else:
@@ -499,19 +768,16 @@ def plot_price_indicators_trades_line(
     if vcol in df.columns:
         vol = pd.to_numeric(df[vcol], errors="coerce").fillna(0.0).astype(float)
 
-        # volume bars
         fig.add_trace(
             go.Bar(x=df.index, y=vol.values, name="Volume"),
-            row=2, col=1
+            row=vol_row, col=1
         )
 
-        # --- compute ADV series only if needed ---
         def _adv(series: pd.Series, w: int) -> pd.Series:
             w = int(max(1, w))
             return series.rolling(w, min_periods=1).mean()
 
         if port_cfg is not None:
-            # Gate line (Layer 1)
             if bool(getattr(port_cfg, "use_volume_gate", False)):
                 kind = str(getattr(port_cfg, "volume_gate_kind", "min_abs"))
                 if kind == "min_abs":
@@ -530,11 +796,9 @@ def plot_price_indicators_trades_line(
                         line=dict(width=3),
                         showlegend=True,
                     ),
-                    row=2, col=1
+                    row=vol_row, col=1
                 )
 
-
-            # Cap line (Layer 3)
             if bool(getattr(port_cfg, "use_participation_cap", False)):
                 pr = float(getattr(port_cfg, "participation_rate", 0.05))
                 basis = str(getattr(port_cfg, "participation_basis", "bar"))
@@ -554,12 +818,12 @@ def plot_price_indicators_trades_line(
                         line=dict(width=3, dash="dash"),
                         showlegend=True,
                     ),
-                    row=2, col=1
+                    row=vol_row, col=1
                 )
 
-    fig.update_traces(selector=dict(type="scatter"), row=2, col=1)
-
-    # layout polish
+    # ----------------------------
+    # Layout polish
+    # ----------------------------
     fig.update_layout(
         xaxis_title="Date",
         yaxis_title="Price",
@@ -568,9 +832,10 @@ def plot_price_indicators_trades_line(
         bargap=0.0,
     )
     fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="Volume", row=2, col=1)
+    fig.update_yaxes(title_text="Volume", row=vol_row, col=1)
 
     return fig
+
 
 
 def plot_cum_vs_bench(cum: pd.Series, bench_cum: pd.Series | None) -> plt.Figure:
@@ -703,6 +968,7 @@ def render_bundle(bundle, *, port_cfg: PortfolioConfig | None = None):
 
     fig = plot_price_indicators_trades_line(
         bars=bars,
+        strategy_params=getattr(bundle, "spec", None).strategy.params if hasattr(bundle, "spec") else None,
         indicators=pp.get("indicators"),
         trades=pp.get("trades"),
         indicator_cols=pp.get("indicator_cols"),
@@ -792,6 +1058,8 @@ def make_base_spec(
 ) -> EngineSpec:
 
     if source_key == "bmce":
+        if not bmce_tmp_path:
+            raise ValueError("BMCE selected but bmce_tmp_path is None/empty.")
         data_cfg = DataConfig(
             source="bmce",
             symbols=[symbol],
@@ -801,8 +1069,9 @@ def make_base_spec(
             end=end,
             include_windows=include_windows,
             exclude_windows=exclude_windows,
-            bmce_paths=bmce_path,
+            bmce_paths=bmce_tmp_path,
         )
+
     else:
         data_cfg = DataConfig(
             source="yfinance",
@@ -942,7 +1211,7 @@ else:
     yf_auto_adjust = st.sidebar.checkbox("auto_adjust", value=False)
 
 st.sidebar.header("Strategy")
-strategy_kind = st.sidebar.selectbox("Strategy kind", ["ma_cross", "sma_price"], index=0)
+strategy_kind = st.sidebar.selectbox("Strategy kind", ["ma_cross", "sma_price", "rsi", "macd", "bollinger"], index=0)
 allow_short = st.sidebar.checkbox("Allow short", value=False)
 
 # Reset optimization UI on strategy change (prevents stale widget keys)
@@ -1143,11 +1412,49 @@ with tab_backtest:
             if fast >= slow:
                 st.warning("Fast must be < Slow. Auto-adjusting fast.")
                 fast = min(int(fast), int(slow) - 1)
-            strategy_params = {"fast_window": int(fast), "slow_window": int(slow), "allow_short": bool(allow_short), "nan_policy": nan_policy}
-        else:
+            strategy_params = {"sma_fast_window": int(fast), "sma_slow_window": int(slow), "allow_short": bool(allow_short), "nan_policy": nan_policy}
+        elif strategy_kind == "sma_price":
             window = st.number_input("SMA window", min_value=2, max_value=500, value=50, step=1)
-            strategy_params = {"window": int(window), "allow_short": bool(allow_short), "nan_policy": nan_policy}
+            strategy_params = {"sma_window": int(window), "allow_short": bool(allow_short), "nan_policy": nan_policy}
+        elif strategy_kind == "rsi":
+            window = st.number_input("RSI window", min_value=2, max_value=500, value=14, step=1)
+            oversold = st.number_input("Oversold threshold", min_value=1, max_value=49, value=30, step=1)
+            overbought = st.number_input("Overbought threshold", min_value=51, max_value=99, value=70, step=1)
+            if oversold >= overbought:
+                st.warning("Oversold must be < Overbought. Auto-adjusting oversold.")
+                oversold = min(int(oversold), int(overbought) - 1)
+            strategy_params = {
+                "rsi_window": int(window),
+                "rsi_oversold": int(oversold),
+                "rsi_overbought": int(overbought),
+                "allow_short": bool(allow_short),
+                "nan_policy": nan_policy,
+            }
+        elif strategy_kind == "macd":
+            fast = st.number_input("Fast EMA window", min_value=2, max_value=500, value=12, step=1)
+            slow = st.number_input("Slow EMA window", min_value=3, max_value=500, value=26, step=1)
+            signal = st.number_input("Signal EMA window", min_value=2, max_value=500, value=9, step=1)
+            if fast >= slow:
+                st.warning("Fast must be < Slow. Auto-adjusting fast.")
+                fast = min(int(fast), int(slow) - 1)
+            strategy_params = {
+                "macd_fast_window": int(fast),
+                "macd_slow_window": int(slow),
+                "macd_signal_window": int(signal),
+                "allow_short": bool(allow_short),
+                "nan_policy": nan_policy,
+            }
+        elif strategy_kind == "bollinger":
+            window = st.number_input("BB window", min_value=2, max_value=500, value=20, step=1)
+            k = st.number_input("BB k (std dev multiplier)", min_value=0.1, max_value=5.0, value=2.0, step=0.1)
+            strategy_params = {
+                "bb_window": int(window),
+                "bb_k": float(k),
+                "allow_short": bool(allow_short),
+                "nan_policy": nan_policy,
+            }
 
+        
         st.markdown("### Portfolio")
         initial_cash = st.number_input("Initial cash", min_value=1_000.0, value=100_000.0, step=10_000.0)
         rebalance_policy = st.selectbox("Rebalance policy", ["on_change", "every_bar"], index=0)
@@ -1289,11 +1596,30 @@ with tab_opt:
             if fast0 >= slow0:
                 st.warning("Baseline fast must be < slow. Auto-adjusting.")
                 fast0 = min(int(fast0), int(slow0) - 1)
-            strategy_params0 = {"fast_window": int(fast0), "slow_window": int(slow0), "allow_short": bool(allow_short), "nan_policy": nan_policy0}
-        else:
+            strategy_params0 = {"sma_fast_window": int(fast0), "sma_slow_window": int(slow0), "allow_short": bool(allow_short), "nan_policy": nan_policy0}
+        elif strategy_kind == "sma_price":
             w0 = st.number_input("window (baseline)", min_value=2, max_value=500, value=50, step=1, key="opt_w0")
-            strategy_params0 = {"window": int(w0), "allow_short": bool(allow_short), "nan_policy": nan_policy0}
+            strategy_params0 = {"sma_window": int(w0), "allow_short": bool(allow_short), "nan_policy": nan_policy0}
+        elif strategy_kind == "rsi":
+            period = st.number_input("RSI period", min_value=2, max_value=200, value=14, step=1)
+            low = st.number_input("RSI low", min_value=0.0, max_value=100.0, value=30.0, step=1.0)
+            high = st.number_input("RSI high", min_value=0.0, max_value=100.0, value=70.0, step=1.0)
+            mode = st.selectbox("RSI mode", ["reversal", "momentum"], index=0)
+            strategy_params0 = {"rsi_window": int(period), "rsi_oversold": float(low), "rsi_overbought": float(high), "mode": mode, "allow_short": bool(allow_short), "nan_policy": nan_policy0}
 
+        elif strategy_kind == "macd":
+            fast = st.number_input("MACD fast", min_value=2, max_value=200, value=12, step=1)
+            slow = st.number_input("MACD slow", min_value=3, max_value=400, value=26, step=1)
+            if fast >= slow:
+                st.warning("Fast must be < Slow. Auto-adjusting fast.")
+                fast = min(int(fast), int(slow) - 1)
+            sig = st.number_input("MACD signal", min_value=2, max_value=200, value=9, step=1)
+            trigger = st.selectbox("MACD trigger", ["cross", "zero"], index=0)
+            strategy_params0 = {"macd_fast_window": int(fast), "macd_slow_window": int(slow), "macd_signal_window": int(sig), "trigger": trigger, "allow_short": bool(allow_short), "nan_policy": nan_policy0}
+        elif strategy_kind == "bollinger":
+            window = st.number_input("BB window (baseline)", min_value=2, max_value=500, value=20, step=1, key="opt_bb_window0")
+            k = st.number_input("BB k (std dev multiplier) (baseline)", min_value=0.1, max_value=5.0, value=2.0, step=0.1, key="opt_bb_k0")
+            strategy_params0 = {"bb_window": int(window), "bb_k": float(k), "allow_short": bool(allow_short), "nan_policy": nan_policy0}
         st.markdown("### Liquidity / Volume (baseline)")
         use_volume_gate0 = st.checkbox("Enable volume gate (baseline)", value=False, key="opt_use_volume_gate")
         volume_gate_kind0 = st.selectbox(
@@ -1366,12 +1692,22 @@ with tab_opt:
     catalog = default_param_catalog(strategy_kind)
     selectable_keys = list(catalog.keys())
 
+    default_active = (
+        ["strategy.sma_fast_window", "strategy.sma_slow_window"] if strategy_kind == "ma_cross"
+        else ["strategy.sma_window"] if strategy_kind == "sma_price"
+        else ["strategy.rsi_window", "strategy.rsi_oversold", "strategy.rsi_overbought"] if strategy_kind == "rsi"
+        else ["strategy.macd_fast_window", "strategy.macd_slow_window", "strategy.macd_signal_window"] if strategy_kind == "macd"
+        else ["strategy.bb_window", "strategy.bb_k"] if strategy_kind == "bollinger"
+        else []
+    )
+
     active_keys = st.multiselect(
         "Select parameters to optimize",
         options=selectable_keys,
-        default=["strategy.fast_window", "strategy.slow_window"] if strategy_kind == "ma_cross" else ["strategy.window"],
+        default=default_active,
         key="active_keys",
     )
+
 
     # Interval editors (IMPORTANT: ParamDef is frozen -> use replace)
     st.markdown("### Intervals / choices for selected parameters")
@@ -1724,7 +2060,7 @@ with tab_opt:
                 show_cols = [c for c in ["timestamp","symbol","side","qty","price","notional","cost","net_invested","cash_after"] if c in fills_df.columns]
                 st.dataframe(fills_df[show_cols], use_container_width=True)
 
-            render_bundle(bundle, port_cfg=base_spec.portfolio)
+            render_bundle(bundle, port_cfg=best_spec.portfolio)
 
         finally:
             if bench_is_temp and bench_tmp_path and os.path.exists(bench_tmp_path):

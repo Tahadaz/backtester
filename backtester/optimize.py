@@ -1,7 +1,7 @@
 # optimize.py
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Callable
 import itertools
 import math
@@ -38,7 +38,7 @@ class OptimizeConfig:
 class ParamDef:
     """
     key:
-      - "strategy.fast_window", "strategy.slow_window", "strategy.window"
+      - "strategy.sma_fast_window", "strategy.sma_slow_window", "strategy.sma_window"
       - "portfolio.cooldown_bars", "portfolio.buy_pct_cash", "portfolio.sell_pct_shares"
       - "data.window" -> tuple(start,end) strings
 
@@ -68,7 +68,150 @@ class TrialResult:
     cagr: float 
     error: Optional[str] = None
     
+@dataclass
+class BankRequest:
+    sma: set[int] = field(default_factory=set)
+    rsi: set[int] = field(default_factory=set)
+    ema: set[int] = field(default_factory=set)
+    macd: set[tuple[int,int,int]] = field(default_factory=set)
+    std: set[int] = field(default_factory=set)   # NEW: rolling std windows
 
+
+    def merge(self, other: "BankRequest") -> "BankRequest":
+        self.sma |= other.sma
+        self.rsi |= other.rsi
+        self.ema |= other.ema
+        self.macd |= other.macd
+        self.std |= other.std
+        return self
+
+def rolling_std_cumsum(close: np.ndarray, w: int) -> np.ndarray:
+    x = np.asarray(close, np.float64)
+    n = x.size
+    out = np.full(n, np.nan, dtype=np.float64)
+    if w <= 0 or w > n:
+        return out
+
+    c1 = np.cumsum(np.insert(x, 0, 0.0))
+    c2 = np.cumsum(np.insert(x * x, 0, 0.0))
+
+    sum_x = c1[w:] - c1[:-w]
+    sum_x2 = c2[w:] - c2[:-w]
+
+    mean = sum_x / w
+    var = (sum_x2 / w) - mean * mean
+    var = np.maximum(var, 0.0)  # numerical guard
+    out[w-1:] = np.sqrt(var)
+    return out
+
+
+def sma_cumsum(close: np.ndarray, w: int) -> np.ndarray:
+    x = np.asarray(close, np.float64)
+    n = x.size
+    out = np.full(n, np.nan, dtype=np.float64)
+    if w <= 0 or w > n:
+        return out
+    c = np.cumsum(np.insert(x, 0, 0.0))
+    out[w-1:] = (c[w:] - c[:-w]) / w
+    return out
+
+def ema(x: np.ndarray, span: int) -> np.ndarray:
+    a = np.asarray(x, np.float64)
+    n = a.size
+    out = np.full(n, np.nan, dtype=np.float64)
+    if span <= 0 or n == 0:
+        return out
+    alpha = 2.0 / (span + 1.0)
+    # seed at first finite
+    i0 = np.argmax(np.isfinite(a))
+    if not np.isfinite(a[i0]):
+        return out
+    out[i0] = a[i0]
+    for i in range(i0 + 1, n):
+        if np.isfinite(a[i]):
+            out[i] = alpha * a[i] + (1 - alpha) * out[i-1]
+        else:
+            out[i] = out[i-1]
+    return out
+
+def rsi_wilder(close: np.ndarray, window: int) -> np.ndarray:
+    x = np.asarray(close, np.float64)
+    n = x.size
+    out = np.full(n, np.nan, dtype=np.float64)
+    if window <= 0 or n < window + 1:
+        return out
+
+    delta = np.diff(x)
+    up = np.maximum(delta, 0.0)
+    dn = np.maximum(-delta, 0.0)
+
+    avg_up = np.full(n-1, np.nan, dtype=np.float64)
+    avg_dn = np.full(n-1, np.nan, dtype=np.float64)
+
+    avg_up[window-1] = np.mean(up[:window])
+    avg_dn[window-1] = np.mean(dn[:window])
+
+    alpha = 1.0 / window
+    for i in range(window, n-1):
+        avg_up[i] = (1 - alpha) * avg_up[i-1] + alpha * up[i]
+        avg_dn[i] = (1 - alpha) * avg_dn[i-1] + alpha * dn[i]
+
+    rs = avg_up / np.where(avg_dn == 0.0, np.nan, avg_dn)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    out[1:] = rsi
+    return out
+
+def macd_pack(close: np.ndarray, fast: int, slow: int, signal: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ef = ema(close, fast)
+    es = ema(close, slow)
+    macd_line = ef - es
+    sig_line = ema(macd_line, signal)
+    hist = macd_line - sig_line
+    return macd_line, sig_line, hist
+
+
+def build_bank(close_by_sym: Dict[str, np.ndarray], req: BankRequest) -> Dict[str, Dict[str, np.ndarray]]:
+    bank: Dict[str, Dict[str, np.ndarray]] = {sym: {} for sym in close_by_sym}
+
+    # If MACD requested, we *implicitly* need EMA(close, fast/slow)
+    # We can expand req.ema here (optional, but clean).
+    if req.macd:
+        for (f, s, _g) in req.macd:
+            req.ema.add(int(f))
+            req.ema.add(int(s))
+
+    for sym, close in close_by_sym.items():
+        sym_bank: Dict[str, np.ndarray] = bank[sym]
+
+        # ---- SMA ----
+        for w in sorted(req.sma):
+            sym_bank[f"sma_{int(w)}"] = sma_cumsum(close, int(w))
+
+        # ---- RSI ----
+        for w in sorted(req.rsi):
+            sym_bank[f"rsi_{int(w)}"] = rsi_wilder(close, int(w))
+
+        # ---- EMA (explicit requests) ----
+        # keep an EMA cache so MACD can reuse it too
+        ema_close_cache: Dict[int, np.ndarray] = {}
+        for span in sorted(req.ema):
+            span = int(span)
+            ema_close_cache[span] = ema(close, span)
+            sym_bank[f"ema_{span}"] = ema_close_cache[span]  # optional: store
+
+        # ---- MACD (reuses EMA(close, span)) ----
+        for (f, s, g) in sorted(req.macd):
+            f, s, g = int(f), int(s), int(g)
+            m, ms, h = macd_pack_cached(close, f, s, g, ema_close_cache)
+            sym_bank[f"macd_{f}_{s}_{g}"] = m
+            sym_bank[f"macd_signal_{f}_{s}_{g}"] = ms
+            sym_bank[f"macd_hist_{f}_{s}_{g}"] = h
+        # ---- Rolling STD ----
+        for w in sorted(req.std):
+            sym_bank[f"std_{int(w)}"] = rolling_std_cumsum(close, int(w))
+
+
+    return bank
 
 
 # ============================================================
@@ -79,12 +222,8 @@ class TrialResult:
 class StrategyAdapter:
     kind: str
 
-    def required_sma_windows(
-        self,
-        base_spec: EngineSpec,
-        active_params: List[ParamDef],
-    ) -> List[int]:
-        raise NotImplementedError
+    def required_bank(self, base_spec: EngineSpec, active_params: list[ParamDef]) -> BankRequest:
+        return BankRequest()
 
     def make_signals_from_bank(
         self,
@@ -106,26 +245,24 @@ class MACrossAdapter(StrategyAdapter):
         super().__init__(kind="ma_cross")
 
     def validate_params(self, params: Dict[str, Any], base_spec: EngineSpec) -> Tuple[bool, Optional[str]]:
-        f = int(params.get("strategy.fast_window", base_spec.strategy.params.get("fast_window", 15)))
-        s = int(params.get("strategy.slow_window", base_spec.strategy.params.get("slow_window", 50)))
+        f = int(params.get("strategy.sma_fast_window", base_spec.strategy.params.get("sma_fast_window", 15)))
+        s = int(params.get("strategy.sma_slow_window", base_spec.strategy.params.get("sma_slow_window", 50)))
         if f >= s:
             return False, "fast_window must be < slow_window"
         if f <= 0 or s <= 0:
             return False, "windows must be positive"
         return True, None
 
-    def required_sma_windows(self, base_spec: EngineSpec, active_params: List[ParamDef]) -> List[int]:
-        # union of domains + base values (so we can evaluate even if a param isn't optimized)
+    def required_bank(self, base_spec, active_params):
+        req = BankRequest()
         f0 = int(base_spec.strategy.params.get("fast_window", 15))
         s0 = int(base_spec.strategy.params.get("slow_window", 50))
-        ws = {f0, s0}
+        req.sma.add(f0)
+        req.sma.add(s0)
+        req.sma |= set(_domain_values_int(active_params, "strategy.sma_fast_window"))
+        req.sma |= set(_domain_values_int(active_params, "strategy.sma_slow_window"))
+        return req
 
-        dom_fast = _domain_values_int(active_params, "strategy.fast_window")
-        dom_slow = _domain_values_int(active_params, "strategy.slow_window")
-        ws.update(dom_fast)
-        ws.update(dom_slow)
-
-        return sorted(w for w in ws if w is not None)
 
     def make_signals_from_bank(
         self,
@@ -136,8 +273,8 @@ class MACrossAdapter(StrategyAdapter):
         params: Dict[str, Any],
         base_spec: EngineSpec,
     ) -> SignalFrame:
-        f = int(params.get("strategy.fast_window", base_spec.strategy.params.get("fast_window", 15)))
-        s = int(params.get("strategy.slow_window", base_spec.strategy.params.get("slow_window", 50)))
+        f = int(params.get("strategy.sma_fast_window", base_spec.strategy.params.get("sma_fast_window", 15)))
+        s = int(params.get("strategy.sma_slow_window", base_spec.strategy.params.get("sma_slow_window", 50)))
 
         allow_short = bool(base_spec.strategy.params.get("allow_short", False))
         # allow overriding allow_short if the app exposes it as a choice param
@@ -188,15 +325,16 @@ class PriceAboveSMAAdapter(StrategyAdapter):
     def __init__(self):
         super().__init__(kind="sma_price")
 
-    def required_sma_windows(self, base_spec: EngineSpec, active_params: List[ParamDef]) -> List[int]:
+    def required_bank(self, base_spec: EngineSpec, active_params: List[ParamDef]) -> BankRequest:
+        req = BankRequest()
         w0 = int(base_spec.strategy.params.get("window", 50))
-        ws = {w0}
-        dom_w = _domain_values_int(active_params, "strategy.window")
-        ws.update(dom_w)
-        return sorted(w for w in ws if w is not None)
+        req.sma.add(w0)
+        req.sma |= set(_domain_values_int(active_params, "strategy.sma_window"))
+        return req
+
 
     def validate_params(self, params: Dict[str, Any], base_spec: EngineSpec) -> Tuple[bool, Optional[str]]:
-        w = int(params.get("strategy.window", base_spec.strategy.params.get("window", 50)))
+        w = int(params.get("strategy.sma_window", base_spec.strategy.params.get("sma_window", 50)))
         if w <= 0:
             return False, "window must be positive"
         return True, None
@@ -210,7 +348,7 @@ class PriceAboveSMAAdapter(StrategyAdapter):
         params: Dict[str, Any],
         base_spec: EngineSpec,
     ) -> SignalFrame:
-        w = int(params.get("strategy.window", base_spec.strategy.params.get("window", 50)))
+        w = int(params.get("strategy.sma_window", base_spec.strategy.params.get("sma_window", 50)))
 
         allow_short = bool(base_spec.strategy.params.get("allow_short", False))
         if "strategy.allow_short" in params:
@@ -253,10 +391,280 @@ class PriceAboveSMAAdapter(StrategyAdapter):
             meta={"adapter": "sma_price", "window": w, "allow_short": allow_short, "nan_policy": nan_policy},
         )
 
+class RSIStrategyAdapter(StrategyAdapter):
+    def __init__(self):
+        super().__init__(kind="rsi")
+
+    def validate_params(self, params: Dict[str, Any], base_spec: EngineSpec) -> Tuple[bool, Optional[str]]:
+        w = int(params.get("strategy.rsi_window", base_spec.strategy.params.get("rsi_window", 14)))
+        low = float(params.get("strategy.rsi_oversold", base_spec.strategy.params.get("rsi_oversold", 30.0)))
+        high = float(params.get("strategy.rsi_overbought", base_spec.strategy.params.get("rsi_overbought", 70.0)))
+
+        if w <= 0:
+            return False, "rsi_window must be positive"
+        if not (0.0 <= low <= 100.0 and 0.0 <= high <= 100.0):
+            return False, "rsi_oversold/rsi_overbought must be in [0, 100]"
+        if low >= high:
+            return False, "rsi_oversold must be < rsi_overbought"
+        return True, None
+
+    def required_bank(self, base_spec: EngineSpec, active_params: List[ParamDef]) -> BankRequest:
+        req = BankRequest()
+        w0 = int(base_spec.strategy.params.get("rsi_window", 14))
+        req.rsi.add(w0)
+        req.rsi |= set(_domain_values_int(active_params, "strategy.rsi_window"))
+        return req
+
+
+    def make_signals_from_bank(
+        self,
+        symbols: List[str],
+        index: pd.DatetimeIndex,
+        bank: Dict[str, Dict[str, np.ndarray]],
+        bars_close: Dict[str, np.ndarray],
+        params: Dict[str, Any],
+        base_spec: EngineSpec,
+    ) -> SignalFrame:
+        w = int(params.get("strategy.rsi_window", base_spec.strategy.params.get("rsi_window", 14)))
+        low = float(params.get("strategy.rsi_oversold", base_spec.strategy.params.get("rsi_oversold", 30.0)))
+        high = float(params.get("strategy.rsi_overbought", base_spec.strategy.params.get("rsi_overbought", 70.0)))
+
+        allow_short = bool(base_spec.strategy.params.get("allow_short", False))
+        if "strategy.allow_short" in params:
+            allow_short = bool(params["strategy.allow_short"])
+
+        nan_policy = str(base_spec.strategy.params.get("nan_policy", "flat"))
+        if "strategy.nan_policy" in params:
+            nan_policy = str(params["strategy.nan_policy"])
+
+        col = f"rsi_{w}"
+
+        sig = pd.DataFrame(index=index, columns=symbols, dtype="float64")
+        valid = pd.DataFrame(index=index, columns=symbols, dtype="bool")
+
+        for sym in symbols:
+            rsi = bank[sym][col]
+            v = ~np.isnan(rsi)
+
+            # Stateless mean-reversion:
+            long_mask = rsi < low
+
+            if allow_short:
+                short_mask = rsi > high
+                out = np.zeros(len(index), dtype=np.float64)
+                out[long_mask] = 1.0
+                out[short_mask] = -1.0
+            else:
+                out = long_mask.astype(np.float64)
+
+            if nan_policy == "flat":
+                out = np.where(v, out, 0.0)
+            else:
+                out = np.where(v, out, np.nan)
+
+            sig[sym] = out
+            valid[sym] = v
+
+        return SignalFrame(
+            signals=sig,
+            validity=valid,
+            meta={"adapter": "rsi", "rsi_window": w, "rsi_oversold": low, "rsi_overbought": high, "allow_short": allow_short, "nan_policy": nan_policy},
+        )
+
+class MACDStrategyAdapter(StrategyAdapter):
+    def __init__(self):
+        super().__init__(kind="macd")
+
+    def validate_params(self, params: Dict[str, Any], base_spec: EngineSpec) -> Tuple[bool, Optional[str]]:
+        f = int(params.get("strategy.macd_fast_window", base_spec.strategy.params.get("macd_fast_window", 12)))
+        s = int(params.get("strategy.macd_slow_window", base_spec.strategy.params.get("macd_slow_window", 26)))
+        sig = int(params.get("strategy.macd_signal_window", base_spec.strategy.params.get("macd_signal_window", 9)))
+
+        if f <= 0 or s <= 0 or sig <= 0:
+            return False, "macd_fast/slow/signal must be positive"
+        if f >= s:
+            return False, "macd_fast must be < macd_slow"
+        return True, None
+
+    def required_bank(self, base_spec: EngineSpec, active_params: List[ParamDef]) -> BankRequest:
+        req = BankRequest()
+
+        f0 = int(base_spec.strategy.params.get("macd_fast_window", 12))
+        s0 = int(base_spec.strategy.params.get("macd_slow_window", 26))
+        g0 = int(base_spec.strategy.params.get("macd_signal_window", 9))
+
+        fs = _domain_values_int(active_params, "strategy.macd_fast_window") or [f0]
+        ss = _domain_values_int(active_params, "strategy.macd_slow_window") or [s0]
+        gs = _domain_values_int(active_params, "strategy.macd_signal_window") or [g0]
+
+        for f in (fs + [f0]):
+            for s in (ss + [s0]):
+                for g in (gs + [g0]):
+                    f, s, g = int(f), int(s), int(g)
+                    if f > 0 and s > 0 and g > 0 and f < s:
+                        req.macd.add((f, s, g))
+
+        return req
+
+
+    def make_signals_from_bank(
+        self,
+        symbols: List[str],
+        index: pd.DatetimeIndex,
+        bank: Dict[str, Dict[str, np.ndarray]],
+        bars_close: Dict[str, np.ndarray],
+        params: Dict[str, Any],
+        base_spec: EngineSpec,
+    ) -> SignalFrame:
+        f = int(params.get("strategy.macd_fast_window", base_spec.strategy.params.get("macd_fast_window", 12)))
+        s = int(params.get("strategy.macd_slow_window", base_spec.strategy.params.get("macd_slow_window", 26)))
+        g = int(params.get("strategy.macd_signal_window", base_spec.strategy.params.get("macd_signal_window", 9)))
+
+        use_hist = bool(base_spec.strategy.params.get("macd_use_hist", False))
+        if "strategy.macd_use_hist" in params:
+            use_hist = bool(params["strategy.macd_use_hist"])
+
+        allow_short = bool(base_spec.strategy.params.get("allow_short", False))
+        if "strategy.allow_short" in params:
+            allow_short = bool(params["strategy.allow_short"])
+
+        nan_policy = str(base_spec.strategy.params.get("nan_policy", "flat"))
+        if "strategy.nan_policy" in params:
+            nan_policy = str(params["strategy.nan_policy"])
+
+        col_macd = f"macd_{f}_{s}_{g}"          # MACD line
+        col_sig  = f"macd_signal_{f}_{s}_{g}"   # signal line
+        col_hist = f"macd_hist_{f}_{s}_{g}"     # histogram
+
+        sig_df = pd.DataFrame(index=index, columns=symbols, dtype="float64")
+        valid_df = pd.DataFrame(index=index, columns=symbols, dtype="bool")
+
+        for sym in symbols:
+            if use_hist:
+                hist = bank[sym][col_hist]
+                v = ~np.isnan(hist)
+                long_mask = hist > 0
+                short_mask = hist < 0
+            else:
+                macd = bank[sym][col_macd]
+                msig = bank[sym][col_sig]
+                v = (~np.isnan(macd)) & (~np.isnan(msig))
+                long_mask = macd > msig
+                short_mask = macd < msig
+
+            if allow_short:
+                out = np.zeros(len(index), dtype=np.float64)
+                out[long_mask] = 1.0
+                out[short_mask] = -1.0
+            else:
+                out = long_mask.astype(np.float64)
+
+            if nan_policy == "flat":
+                out = np.where(v, out, 0.0)
+            else:
+                out = np.where(v, out, np.nan)
+
+            sig_df[sym] = out
+            valid_df[sym] = v
+
+        return SignalFrame(
+            signals=sig_df,
+            validity=valid_df,
+            meta={"adapter": "macd", "fast": f, "slow": s, "signal": g, "use_hist": use_hist, "allow_short": allow_short, "nan_policy": nan_policy},
+        )
+
+class BollingerAdapter(StrategyAdapter):
+    def __init__(self):
+        super().__init__(kind="bollinger")
+
+    def validate_params(self, params: Dict[str, Any], base_spec: EngineSpec) -> Tuple[bool, Optional[str]]:
+        w = int(params.get("strategy.bb_window", base_spec.strategy.params.get("bb_window", 20)))
+        k = float(params.get("strategy.bb_k", base_spec.strategy.params.get("bb_k", 2.0)))
+        if w <= 1:
+            return False, "bb_window must be > 1"
+        if k <= 0:
+            return False, "bb_k must be positive"
+        return True, None
+
+    def required_bank(self, base_spec: EngineSpec, active_params: List[ParamDef]) -> BankRequest:
+        req = BankRequest()
+        w0 = int(base_spec.strategy.params.get("bb_window", 20))
+        req.sma.add(w0)
+        req.std.add(w0)
+
+        ws = _domain_values_int(active_params, "strategy.bb_window")
+        for w in ws:
+            if w is not None and int(w) > 1:
+                req.sma.add(int(w))
+                req.std.add(int(w))
+        return req
+
+    def make_signals_from_bank(
+        self,
+        symbols: List[str],
+        index: pd.DatetimeIndex,
+        bank: Dict[str, Dict[str, np.ndarray]],
+        bars_close: Dict[str, np.ndarray],
+        params: Dict[str, Any],
+        base_spec: EngineSpec,
+    ) -> SignalFrame:
+        w = int(params.get("strategy.bb_window", base_spec.strategy.params.get("bb_window", 20)))
+        k = float(params.get("strategy.bb_k", base_spec.strategy.params.get("bb_k", 2.0)))
+
+        allow_short = bool(base_spec.strategy.params.get("allow_short", False))
+        if "strategy.allow_short" in params:
+            allow_short = bool(params["strategy.allow_short"])
+
+        nan_policy = str(base_spec.strategy.params.get("nan_policy", "flat"))
+        if "strategy.nan_policy" in params:
+            nan_policy = str(params["strategy.nan_policy"])
+
+        col_mid = f"sma_{w}"
+        col_std = f"std_{w}"
+
+        sig = pd.DataFrame(index=index, columns=symbols, dtype="float64")
+        valid = pd.DataFrame(index=index, columns=symbols, dtype="bool")
+
+        for sym in symbols:
+            close = bars_close[sym]
+            mid = bank[sym][col_mid]
+            std = bank[sym][col_std]
+
+            v = np.isfinite(close) & np.isfinite(mid) & np.isfinite(std)
+            upper = mid + k * std
+            lower = mid - k * std
+
+            long_mask = close < lower
+            if allow_short:
+                short_mask = close > upper
+                out = np.zeros(len(index), dtype=np.float64)
+                out[long_mask] = 1.0
+                out[short_mask] = -1.0
+            else:
+                out = long_mask.astype(np.float64)
+
+            if nan_policy == "flat":
+                out = np.where(v, out, 0.0)
+            else:
+                out = np.where(v, out, np.nan)
+
+            sig[sym] = out
+            valid[sym] = v
+
+        return SignalFrame(
+            signals=sig,
+            validity=valid,
+            meta={"adapter": "bollinger", "bb_window": w, "bb_k": k, "allow_short": allow_short, "nan_policy": nan_policy},
+        )
+
+
 
 STRATEGY_ADAPTERS: Dict[str, StrategyAdapter] = {
     "ma_cross": MACrossAdapter(),
     "sma_price": PriceAboveSMAAdapter(),
+    "rsi": RSIStrategyAdapter(),
+    "macd": MACDStrategyAdapter(),
+    "bollinger": BollingerAdapter(),
 }
 
 
@@ -268,12 +676,26 @@ def default_param_catalog(strategy_kind: str) -> Dict[str, ParamDef]:
     cat: Dict[str, ParamDef] = {}
 
     if strategy_kind == "ma_cross":
-        cat["strategy.fast_window"] = ParamDef("strategy.fast_window", "int", (5, 60, 1), int)
-        cat["strategy.slow_window"] = ParamDef("strategy.slow_window", "int", (20, 250, 1), int)
+        cat["strategy.sma_fast_window"] = ParamDef("strategy.sma_fast_window", "int", (5, 60, 1), int)
+        cat["strategy.sma_slow_window"] = ParamDef("strategy.sma_slow_window", "int", (20, 250, 1), int)
       
 
     elif strategy_kind == "sma_price":
-        cat["strategy.window"] = ParamDef("strategy.window", "int", (10, 250, 1), int)
+        cat["strategy.sma_window"] = ParamDef("strategy.sma_window", "int", (10, 250, 1), int)
+    
+    elif strategy_kind == "rsi":
+        cat["strategy.rsi_window"] = ParamDef("strategy.rsi_window", "int", (5, 100, 1), int)
+        cat["strategy.rsi_oversold"] = ParamDef("strategy.rsi_oversold", "float", (5.0, 45.0, 1.0), float)
+        cat["strategy.rsi_overbought"] = ParamDef("strategy.rsi_overbought", "float", (55.0, 95.0, 1.0), float)
+
+    elif strategy_kind == "macd":
+        cat["strategy.macd_fast_window"] = ParamDef("strategy.macd_fast_window", "int", (5, 50, 1), int)
+        cat["strategy.macd_slow_window"] = ParamDef("strategy.macd_slow_window", "int", (20, 200, 1), int)
+        cat["strategy.macd_signal_window"] = ParamDef("strategy.macd_signal_window", "int", (5, 50, 1), int)
+
+    elif strategy_kind == "bollinger":
+        cat["strategy.bb_window"] = ParamDef("strategy.bb_window", "int", (10, 100, 1), int)
+        cat["strategy.bb_k"] = ParamDef("strategy.bb_k", "float", (2.0, 5.0, 0.5), float)
        
     # portfolio knobs you mentioned
     cat["portfolio.cooldown_bars"] = ParamDef("portfolio.cooldown_bars", "int", (0, 30, 1), int)
@@ -281,6 +703,31 @@ def default_param_catalog(strategy_kind: str) -> Dict[str, ParamDef]:
     cat["portfolio.sell_pct_shares"] = ParamDef("portfolio.sell_pct_shares", "float", (0.05, 1.0, 0.05), float)
 
     return cat
+
+def macd_pack_cached(
+    close: np.ndarray,
+    fast: int,
+    slow: int,
+    signal: int,
+    ema_close_cache: Dict[int, np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    # cache EMA(close, span)
+    ef = ema_close_cache.get(fast)
+    if ef is None:
+        ef = ema(close, fast)
+        ema_close_cache[fast] = ef
+
+    es = ema_close_cache.get(slow)
+    if es is None:
+        es = ema(close, slow)
+        ema_close_cache[slow] = es
+
+    macd_line = ef - es
+
+    # cannot reuse across different (fast,slow), but cheap enough
+    sig_line = ema(macd_line, signal)
+    hist = macd_line - sig_line
+    return macd_line, sig_line, hist
 
 
 # ============================================================
@@ -325,20 +772,6 @@ def run_optimization(
     if len(common_index) < 2:
         raise ValueError("Not enough bars after alignment; need at least 2 timestamps.")
 
-    # 3) Precompute arrays once (ALWAYS) + SMA bank (IF NEEDED)
-    sma_windows = adapter.required_sma_windows(base_spec, active_params)
-
-    def _sma_bank_numpy(close: np.ndarray, windows: List[int]) -> Dict[str, np.ndarray]:
-        n = close.size
-        csum = np.cumsum(np.insert(close.astype(np.float64, copy=False), 0, 0.0))
-        out: Dict[str, np.ndarray] = {}
-        for w0 in windows:
-            w = int(w0)
-            sma = np.full(n, np.nan, dtype=np.float64)
-            if 0 < w <= n:
-                sma[w - 1 :] = (csum[w:] - csum[:-w]) / w
-            out[f"sma_{w}"] = sma
-        return out
 
     # --- aligned price arrays ONCE ---
     bars_open: Dict[str, np.ndarray] = {}
@@ -357,7 +790,9 @@ def run_optimization(
                 raise KeyError(f"Missing volume column '{vcol}' for {s}. Available: {list(b.columns)}")
             bars_vol[s] = b[vcol].to_numpy(dtype=np.float64, copy=False)
             
-
+    # 3) Precompute arrays once (ALWAYS) + SMA bank (IF NEEDED)
+    req = adapter.required_bank(base_spec, active_params)
+    bank = build_bank(bars_close, req)
         
     if need_volume:
         adv_windows: List[int] = []
@@ -383,11 +818,7 @@ def run_optimization(
 
     
 
-    # --- SMA bank (optional) ---
-    bank: Dict[str, Dict[str, np.ndarray]] = {s: {} for s in symbols}
-    if sma_windows:
-        uniq = sorted(set(int(w) for w in sma_windows))
-        bank = {s: _sma_bank_numpy(bars_close[s], uniq) for s in symbols}
+
 
 
     # 4) Candidate iterator
@@ -573,50 +1004,39 @@ def eval_stats_only_for_spec_arrays(
     if sk == "sma_price":
         w = int(spec.strategy.params.get("window", 50))
         req = [w]
-    else:  # ma_cross
+    elif sk == "ma_cross":
         f = int(spec.strategy.params.get("fast_window", 15))
         s = int(spec.strategy.params.get("slow_window", 50))
         req = [f, s]
+    elif sk == "rsi":
+        w = int(spec.strategy.params.get("rsi_window", 14))
+        os= int(spec.strategy.params.get("rsi_oversold", 30))
+        ob= int(spec.strategy.params.get("rsi_overbought", 70))
+        req = [w,ob,os]
+    elif sk == "macd":
+        f = int(spec.strategy.params.get("macd_fast_window", 12))
+        s = int(spec.strategy.params.get("macd_slow_window", 26))
+        sig = int(spec.strategy.params.get("macd_signal_window", 9))
+        req = [f, s, sig]
+    elif sk == "bollinger":
+        w = int(spec.strategy.params.get("bb_window", 20))
+        k = float(spec.strategy.params.get("bb_k", 2.0))
+        req = [w]
 
-    bank = {sym: _sma_bank_numpy(close_px, req)}
     bars_close = {sym: close_px}
+    req = adapter.required_bank(spec, active_params=[])  # spec-only: no domain
+    bank = build_bank(bars_close, req)
 
-    # Build params dict from spec (so adapter uses same codepath)
-    params = {}
-    # allow_short / nan_policy are stored in spec.strategy.params
-    params["strategy.allow_short"] = bool(spec.strategy.params.get("allow_short", False))
-    params["strategy.nan_policy"] = str(spec.strategy.params.get("nan_policy", "flat"))
-    # window params
-    if sk == "sma_price":
-        params["strategy.window"] = int(spec.strategy.params.get("window", 50))
-    else:
-        params["strategy.fast_window"] = int(spec.strategy.params.get("fast_window", 15))
-        params["strategy.slow_window"] = int(spec.strategy.params.get("slow_window", 50))
+    sf = adapter.make_signals_from_bank(
+        symbols=[sym],
+        index=b.index,   # already sliced window
+        bank=bank,
+        bars_close=bars_close,
+        params={},       # no overrides, spec.params only
+        base_spec=spec,
+    )
+    sig = sf.signals[sym].to_numpy(dtype=np.float64, copy=False)
 
-    # Signals (NumPy) — reuse your logic from _eval_one_trial for correctness
-    allow_short = bool(params.get("strategy.allow_short", False))
-    if sk == "sma_price":
-        w = int(params["strategy.window"])
-        sma = bank[sym][f"sma_{w}"]
-        valid = np.isfinite(close_px) & np.isfinite(sma)
-        if allow_short:
-            sig = np.zeros(close_px.size, dtype=np.float64)
-            sig[valid & (close_px > sma)] = 1.0
-            sig[valid & (close_px < sma)] = -1.0
-        else:
-            sig = np.where(valid & (close_px > sma), 1.0, 0.0).astype(np.float64)
-    else:
-        f = int(params["strategy.fast_window"])
-        s = int(params["strategy.slow_window"])
-        sma_f = bank[sym][f"sma_{f}"]
-        sma_s = bank[sym][f"sma_{s}"]
-        valid = np.isfinite(sma_f) & np.isfinite(sma_s)
-        if allow_short:
-            sig = np.zeros(sma_f.size, dtype=np.float64)
-            sig[valid & (sma_f > sma_s)] = 1.0
-            sig[valid & (sma_f < sma_s)] = -1.0
-        else:
-            sig = np.where(valid & (sma_f > sma_s), 1.0, 0.0).astype(np.float64)
     
     # Portfolio stats only
     port = PortfolioEngine(spec.portfolio)
@@ -802,53 +1222,25 @@ def _eval_one_trial(
 
 
         # ----------------------------
-        # B) Build numpy signals from SMA bank (no pandas)
+        # B) Build signals using adapter (single source of truth)
         # ----------------------------
-        sk = base_spec.strategy.kind.lower()
+        bars_close_trial = {sym: close_px}
 
-        # Pull allow_short / etc from params (or base_spec)
-        allow_short = bool(params.get("strategy.allow_short", base_spec.strategy.params.get("allow_short", False)))
+        # If you slice idx_pos, the precomputed bank arrays must also be sliced.
+        # Easiest: build a "view" bank for this sym using slicing.
+        sym_bank = bank[sym]
+        if idx_pos is not None:
+            sym_bank = {k: v[idx_pos] for k, v in sym_bank.items()}
 
-        if sk == "sma_price":
-            w = int(params.get("strategy.window", base_spec.strategy.params.get("window", 50)))
-            sma = bank[sym].get(f"sma_{w}")
-            if sma is None:
-                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0,cagr=float("-inf"), error=f"missing sma_{w} in bank")
-            if idx_pos is not None:
-                sma = sma[idx_pos]
-
-            valid = np.isfinite(close_px) & np.isfinite(sma)
-            if allow_short:
-                sig = np.zeros(close_px.size, dtype=np.float64)
-                sig[valid & (close_px > sma)] = 1.0
-                sig[valid & (close_px < sma)] = -1.0
-                sig[~valid] = 0.0
-            else:
-                # long/flat
-                sig = np.where(valid & (close_px > sma), 1.0, 0.0).astype(np.float64)
-
-        elif sk == "ma_cross":
-            f = int(params.get("strategy.fast_window", base_spec.strategy.params.get("fast_window", 15)))
-            s = int(params.get("strategy.slow_window", base_spec.strategy.params.get("slow_window", 50)))
-            sma_f = bank[sym].get(f"sma_{f}")
-            sma_s = bank[sym].get(f"sma_{s}")
-            if sma_f is None or sma_s is None:
-                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0,cagr=float("-inf"), error=f"missing sma_{f} or sma_{s} in bank")
-            if idx_pos is not None:
-                sma_f = sma_f[idx_pos]
-                sma_s = sma_s[idx_pos]
-
-            valid = np.isfinite(sma_f) & np.isfinite(sma_s)
-            if allow_short:
-                sig = np.zeros(sma_f.size, dtype=np.float64)
-                sig[valid & (sma_f > sma_s)] = 1.0
-                sig[valid & (sma_f < sma_s)] = -1.0
-                sig[~valid] = 0.0
-            else:
-                sig = np.where(valid & (sma_f > sma_s), 1.0, 0.0).astype(np.float64)
-
-        else:
-            return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, cagr=float("-inf"), error=f"unknown strategy kind {sk}")
+        sf = adapter.make_signals_from_bank(
+            symbols=[sym],
+            index=(common_index if idx_pos is None else common_index[idx_pos]),
+            bank={sym: sym_bank},
+            bars_close=bars_close_trial,
+            params=params,
+            base_spec=base_spec,
+        )
+        sig = sf.signals[sym].to_numpy(dtype=np.float64, copy=False)
 
         # ----------------------------
         # C) Build portfolio config for this trial (apply params)
@@ -990,12 +1382,28 @@ def _apply_params_to_spec(base_spec: EngineSpec, params: Dict[str, Any]) -> Engi
     # StrategyConfig: apply strategy params
     strat_cfg = base_spec.strategy
     sp = dict(strat_cfg.params or {})
-    if "strategy.fast_window" in params:
-        sp["fast_window"] = int(params["strategy.fast_window"])
-    if "strategy.slow_window" in params:
-        sp["slow_window"] = int(params["strategy.slow_window"])
-    if "strategy.window" in params:
-        sp["window"] = int(params["strategy.window"])
+    if "strategy.sma_fast_window" in params:
+        sp["fast_window"] = int(params["strategy.sma_fast_window"])
+    if "strategy.sma_slow_window" in params:
+        sp["slow_window"] = int(params["strategy.sma_slow_window"])
+    if "strategy.sma_window" in params:
+        sp["window"] = int(params["strategy.sma_window"])
+    if "strategy.bb_window" in params:
+        sp["bb_window"] = int(params["strategy.bb_window"])
+    if "strategy.bb_k" in params:
+        sp["bb_k"] = float(params["strategy.bb_k"])
+    if "strategy.rsi_window" in params:
+        sp["rsi_window"] = int(params["strategy.rsi_window"])
+    if "strategy.rsi_oversold" in params:
+        sp["rsi_oversold"] = float(params["strategy.rsi_oversold"])
+    if "strategy.rsi_overbought" in params:
+        sp["rsi_overbought"] = float(params["strategy.rsi_overbought"])
+    if "strategy.macd_fast_window" in params:
+        sp["macd_fast_window"] = int(params["strategy.macd_fast_window"])
+    if "strategy.macd_slow_window" in params:   
+        sp["macd_slow_window"] = int(params["strategy.macd_slow_window"])
+    if "strategy.macd_signal_window" in params:
+        sp["macd_signal_window"] = int(params["strategy.macd_signal_window"])
     if "strategy.allow_short" in params:
         sp["allow_short"] = bool(params["strategy.allow_short"])
     if "strategy.nan_policy" in params:
