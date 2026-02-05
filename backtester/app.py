@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-from optimize import build_spec_from_result_row
+from optimize import build_spec_from_result_row, batch_optimize_by_period
 
 import plotly.graph_objects as go
 
@@ -350,6 +350,45 @@ def load_benchmark_market_data_cached(
     )
     return md
 
+def make_spec_for_batch(params: dict, include_windows: list[tuple[str,str]]):
+    # Use your existing UI selections as defaults, override the optimized ones
+    # e.g., window/buy/sell/cooldown get overwritten from params if present.
+
+    window = int(params.get("window", window_ui))
+    buy_pct_cash = float(params.get("buy_pct_cash", buy_pct_cash_ui))
+    sell_pct_shares = float(params.get("sell_pct_shares", sell_pct_shares_ui))
+    cooldown_bars = int(params.get("cooldown_bars", cooldown_ui))
+
+    # build spec using your existing builder
+    return make_base_spec(
+        symbol=symbol,
+        timezone=timezone,
+        interval=interval,
+        bmce_path=bmce_path,
+        start=start_str,
+        end=end_str,
+        include_windows=include_windows,
+        exclude_windows=exclude_windows_ui,   # if you have global excludes; else None
+        strategy_kind=strategy_kind,
+        strategy_params={**strategy_params_ui, "window": window},
+        allow_short=allow_short,
+        initial_cash=initial_cash,
+        rebalance_policy=rebalance_policy,
+        sizing_mode=sizing_mode,
+        buy_pct_cash=buy_pct_cash,
+        sell_pct_shares=sell_pct_shares,
+        cooldown_bars=cooldown_bars,
+        cost_model=cost_model,
+        use_volume_gate=use_volume_gate,
+        volume_gate_kind=volume_gate_kind,
+        min_volume_abs=min_volume_abs,
+        min_volume_ratio_adv=min_volume_ratio_adv,
+        volume_gate_adv_window=volume_gate_adv_window,
+        use_participation_cap=use_participation_cap,
+        participation_rate=participation_rate,
+        participation_basis=participation_basis,
+        adv_window=adv_window,
+    )
 
 
 from plotly.subplots import make_subplots
@@ -1231,7 +1270,7 @@ with tab_backtest:
 # ============================================================
 
 with tab_opt:
-    st.subheader("Optimize (rank by pnl then efficiency)")
+    st.subheader("Optimize (rank by pnl then cagr)")
     # Baseline fixed values (used when NOT optimized)
     with st.expander("Fixed baseline (used when NOT optimized)", expanded=False):
         initial_cash0 = st.number_input("Initial cash (baseline)", min_value=1_000.0, value=1_000_000.0, step=10_000.0, key="opt_initial_cash")
@@ -1418,7 +1457,29 @@ with tab_opt:
     else:
         n_trials = 0
 
+    st.subheader("Batch tests")
+
+    do_batch = st.checkbox("Batch test by period", value=False)
+
+    selected_periods = []
+    if do_batch:
+        selected_periods = st.multiselect(
+            "Select periods to run",
+            options=list(MASI_PERIODS.keys()),
+            default=list(MASI_PERIODS.keys()),
+        )
+
+        batch_objective = st.selectbox(
+            "Objective for comparison",
+            ["pnl", "cagr"],  # match what stats dict returns
+            index=0
+        )
+
+        optimize_within_each = st.checkbox("Optimize within each period", value=True)
+
+
     run_opt = st.button("Run optimization", key="run_opt_btn")
+
 
     if run_opt:
         tmp_path = None
@@ -1518,6 +1579,17 @@ with tab_opt:
                 top_k=int(top_k),
                 # NOTE: no "objective" field in your OptimizeConfig
             )
+            if do_batch and selected_periods:
+                df_batch = batch_optimize_by_period(
+                    base_spec=base_spec,
+                    active_params=active_params,
+                    cfg=opt_cfg,
+                    periods=MASI_PERIODS,
+                    selected_period_labels=selected_periods,
+                    objective=batch_objective,
+                )
+
+                st.dataframe(df_batch.sort_values("objective_value", ascending=False), use_container_width=True)
 
             with st.spinner("Running optimization..."):
                 best, top_df, best_params, best_spec, ranked_df = run_optimization(
@@ -1541,17 +1613,22 @@ with tab_opt:
             })
 
             st.subheader("Top candidates")
-            # Ensure pnl + efficiency visible even if many params
-            show_cols = [c for c in ["pnl","efficiency","n_fills","error"] if c in top_df.columns] + \
-                        [c for c in top_df.columns if c not in ("pnl","efficiency","n_fills","error","traded_notional")]
-            # Hide traded_notional from UI if present
+
+            # Always hide traded_notional if present
             if "traded_notional" in top_df.columns:
                 top_df = top_df.drop(columns=["traded_notional"])
+
+            # Build show_cols AFTER dropping
+            core = [c for c in ["cagr", "pnl", "n_fills", "error"] if c in top_df.columns]
+            rest = [c for c in top_df.columns if c not in set(core + ["pnl"])]  # optionally hide pnl too
+            show_cols = core + rest
+
             st.dataframe(top_df[show_cols], use_container_width=True)
+
 
             if ranked_df is not None and isinstance(ranked_df, pd.DataFrame) and (not ranked_df.empty):
                 best5_df = ranked_df.head(5)
-                worst5_df = ranked_df.tail(5).sort_values(["pnl","efficiency"], ascending=[True, True]).reset_index(drop=True)
+                worst5_df = ranked_df.tail(5).sort_values(["pnl","cagr"], ascending=[True, True]).reset_index(drop=True)
                 mid_start = max(0, (len(ranked_df) // 2) - 2)
                 mid5_df = ranked_df.iloc[mid_start: mid_start + 5].reset_index(drop=True)
 
@@ -1683,8 +1760,8 @@ with tab_opt:
 
         if isinstance(top_df, pd.DataFrame):
             st.subheader("Top candidates")
-            show_cols = [c for c in ["pnl","efficiency","n_fills","error"] if c in top_df.columns] + \
-                        [c for c in top_df.columns if c not in ("pnl","efficiency","n_fills","error","traded_notional")]
+            show_cols = [c for c in ["pnl","cagr","n_fills","error"] if c in top_df.columns] + \
+                        [c for c in top_df.columns if c not in ("pnl","cagr","n_fills","error","traded_notional")]
             # Hide traded_notional from UI if present
             if "traded_notional" in top_df.columns:
                 top_df = top_df.drop(columns=["traded_notional"])

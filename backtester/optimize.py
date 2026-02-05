@@ -9,6 +9,7 @@ import random
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 from data import BMCEDataSource, YahooFinanceDataSource, MarketData
 from indicators import IndicatorEngine, FeatureSpec, FeaturesData
@@ -65,7 +66,10 @@ class TrialResult:
     traded_notional: float
     efficiency: float
     n_fills: int
+    cagr: float  
     error: Optional[str] = None
+    
+
 
 
 # ============================================================
@@ -410,6 +414,7 @@ def run_optimization(
                 traded_notional=0.0,
                 efficiency=float("-inf"),
                 n_fills=0,
+                cagr=float("-inf"),
                 error=err or "invalid params",
             ))
             continue
@@ -435,13 +440,14 @@ def run_optimization(
         "traded_notional": r.traded_notional,
         "efficiency": r.efficiency,
         "n_fills": r.n_fills,
+        "cagr": r.cagr,
         "error": r.error,
     } for r in results])
 
     # rank valid rows by (pnl desc, efficiency desc)
     df_valid = df[df["error"].isna()].copy()
     if df_valid.empty:
-        ranked_df = df.sort_values(["pnl", "efficiency"], ascending=[False, False]).reset_index(drop=True)
+        ranked_df = df.sort_values(["pnl", "cagr"], ascending=[False, False]).reset_index(drop=True)
         top_df = ranked_df.head(int(cfg.top_k)).reset_index(drop=True)
 
         best_row = top_df.iloc[0].to_dict()
@@ -452,28 +458,278 @@ def run_optimization(
             traded_notional=float(best_row.get("traded_notional", 0.0)),
             efficiency=float(best_row.get("efficiency", float("-inf"))),
             n_fills=int(best_row.get("n_fills", 0)),
+            cagr=float(best_row["cagr"]),
             error=str(best_row.get("error")) if best_row.get("error") is not None else None,
         )
         best_spec = _apply_params_to_spec(base_spec, best.params)
         return best, top_df, best_params, best_spec, ranked_df
 
-    ranked_df = df_valid.sort_values(["pnl", "efficiency"], ascending=[False, False]).reset_index(drop=True)
-    df_valid = df_valid.sort_values(["pnl", "efficiency"], ascending=[False, False])
+    ranked_df = df_valid.sort_values(["pnl", "cagr"], ascending=[False, False]).reset_index(drop=True)
+    df_valid = df_valid.sort_values(["pnl", "cagr"], ascending=[False, False])
     top_df = ranked_df.head(int(cfg.top_k)).reset_index(drop=True)
 
     best_row = top_df.iloc[0].to_dict()
-    best_params = {k: best_row[k] for k in best_row.keys() if k not in ("pnl", "traded_notional", "efficiency", "n_fills", "error")}
+    best_params = {k: best_row[k] for k in best_row.keys() if k not in ("pnl", "traded_notional", "cagr", "n_fills", "error")}
     best = TrialResult(
         params=best_params,
         pnl=float(best_row["pnl"]),
         traded_notional=float(best_row["traded_notional"]),
         efficiency=float(best_row["efficiency"]),
         n_fills=int(best_row["n_fills"]),
+        cagr=float(best_row["cagr"]),
         error=None,
     )
     best_spec = _apply_params_to_spec(base_spec, best.params)
     return best, top_df, best_params, best_spec, ranked_df
 
+from typing import Dict, List, Tuple, Optional, Any
+import pandas as pd
+def eval_stats_only_for_spec_arrays(
+    spec: EngineSpec,
+) -> Dict[str, Any]:
+    """
+    Runs one fast stats-only backtest for a spec and returns a flat dict.
+    Uses same alignment logic + PortfolioEngine.run_stats_only_arrays.
+    """
+    # Load + align
+    md_full = _load_market_data_from_spec(spec.data)
+    symbols = list(spec.data.symbols)
+    md = _align_marketdata_inner(md_full, symbols)
+
+    if len(symbols) != 1:
+        raise ValueError("stats_only eval currently supports single-symbol (same as optimize fast path).")
+
+    sym = symbols[0]
+    idx = md.bars[sym].index
+    if len(idx) < 2:
+        raise ValueError("Not enough bars after alignment.")
+    
+    # Apply data window from spec.data.start/end (the same semantics as optimization)
+    idx2 = _slice_index(idx, spec.data.start, spec.data.end)
+    if idx2 is None or len(idx2) < 2:
+        raise ValueError("Window too small after slicing.")
+    b = md.bars[sym].loc[idx2[0]:idx2[-1]]
+
+    open_px = b["Open"].to_numpy(dtype=np.float64, copy=False)
+    close_px = b["Close"].to_numpy(dtype=np.float64, copy=False)
+
+    # Build signals using strategy adapter + SMA bank (minimal compute: only needed windows)
+    sk = spec.strategy.kind.lower()
+    if sk not in STRATEGY_ADAPTERS:
+        raise ValueError(f"No adapter for strategy kind '{sk}'")
+
+    adapter = STRATEGY_ADAPTERS[sk]
+
+    # Build SMA bank only for required windows of THIS spec (not full domain)
+    # We can reuse your sma builder
+    def _sma_bank_numpy(close: np.ndarray, windows: List[int]) -> Dict[str, np.ndarray]:
+        n = close.size
+        csum = np.cumsum(np.insert(close.astype(np.float64, copy=False), 0, 0.0))
+        out: Dict[str, np.ndarray] = {}
+        for w0 in windows:
+            w = int(w0)
+            sma = np.full(n, np.nan, dtype=np.float64)
+            if 0 < w <= n:
+                sma[w - 1 :] = (csum[w:] - csum[:-w]) / w
+            out[f"sma_{w}"] = sma
+        return out
+
+    # Determine required SMA windows from current spec params only
+    if sk == "sma_price":
+        w = int(spec.strategy.params.get("window", 50))
+        req = [w]
+    else:  # ma_cross
+        f = int(spec.strategy.params.get("fast_window", 15))
+        s = int(spec.strategy.params.get("slow_window", 50))
+        req = [f, s]
+
+    bank = {sym: _sma_bank_numpy(close_px, req)}
+    bars_close = {sym: close_px}
+
+    # Build params dict from spec (so adapter uses same codepath)
+    params = {}
+    # allow_short / nan_policy are stored in spec.strategy.params
+    params["strategy.allow_short"] = bool(spec.strategy.params.get("allow_short", False))
+    params["strategy.nan_policy"] = str(spec.strategy.params.get("nan_policy", "flat"))
+    # window params
+    if sk == "sma_price":
+        params["strategy.window"] = int(spec.strategy.params.get("window", 50))
+    else:
+        params["strategy.fast_window"] = int(spec.strategy.params.get("fast_window", 15))
+        params["strategy.slow_window"] = int(spec.strategy.params.get("slow_window", 50))
+
+    # Signals (NumPy) — reuse your logic from _eval_one_trial for correctness
+    allow_short = bool(params.get("strategy.allow_short", False))
+    if sk == "sma_price":
+        w = int(params["strategy.window"])
+        sma = bank[sym][f"sma_{w}"]
+        valid = np.isfinite(close_px) & np.isfinite(sma)
+        if allow_short:
+            sig = np.zeros(close_px.size, dtype=np.float64)
+            sig[valid & (close_px > sma)] = 1.0
+            sig[valid & (close_px < sma)] = -1.0
+        else:
+            sig = np.where(valid & (close_px > sma), 1.0, 0.0).astype(np.float64)
+    else:
+        f = int(params["strategy.fast_window"])
+        s = int(params["strategy.slow_window"])
+        sma_f = bank[sym][f"sma_{f}"]
+        sma_s = bank[sym][f"sma_{s}"]
+        valid = np.isfinite(sma_f) & np.isfinite(sma_s)
+        if allow_short:
+            sig = np.zeros(sma_f.size, dtype=np.float64)
+            sig[valid & (sma_f > sma_s)] = 1.0
+            sig[valid & (sma_f < sma_s)] = -1.0
+        else:
+            sig = np.where(valid & (sma_f > sma_s), 1.0, 0.0).astype(np.float64)
+    
+    # Portfolio stats only
+    port = PortfolioEngine(spec.portfolio)
+    stats = port.run_stats_only_arrays(open_px=open_px, close_px=close_px, sig=sig, vol_px=None, adv_cap_px=None, adv_gate_px=None)
+    E0 = float(spec.portfolio.initial_cash)
+    pnl = float(stats.pnl)
+
+    # prefer final_equity if available, else infer
+    ET = float(getattr(stats, "final_equity", E0 + pnl))
+
+    n = int(close_px.size)
+    ppy = float(getattr(spec, "periods_per_year", 252))
+
+    if n <= 1 or E0 <= 0 or ET <= 0:
+        cagr = np.nan
+    else:
+        cagr = (ET / E0) ** (ppy / n) - 1.0
+
+    # Flatten into dict for UI table
+    return {
+        "pnl": float(stats.pnl),
+        "traded_notional": float(stats.traded_notional),
+        "n_fills": int(stats.n_fills),
+        "cagr": float(cagr) if np.isfinite(cagr) else np.nan,
+        # keep your efficiency logic if stats has volume_inv; else use traded_notional
+        "efficiency": 1.0 if float(getattr(stats, "volume_inv", stats.traded_notional)) <= 0 else float(stats.pnl) / float(getattr(stats, "volume_inv", stats.traded_notional)),
+        # optional extras if available
+        "final_equity": float(getattr(stats, "final_equity", np.nan)),
+        "max_drawdown": float(getattr(stats, "max_drawdown", np.nan)),
+    }
+
+def batch_optimize_by_period(
+    base_spec: EngineSpec,
+    active_params: List[ParamDef],
+    cfg: OptimizeConfig,
+    periods: Dict[str, Tuple[str, str]],
+    selected_period_labels: List[str],
+    objective: str = "pnl",   # or "efficiency"
+) -> pd.DataFrame:
+    """
+    For each period:
+      - run_optimization on that period
+      - evaluate stats_only for the best_spec
+    Returns a DataFrame with one row per period.
+    """
+    rows = []
+
+    for label in selected_period_labels:
+        p_start, p_end = periods[label]
+
+        # Create a per-period base spec by setting DataConfig start/end
+        per_spec = replace(base_spec, data=replace(base_spec.data, start=str(p_start), end=str(p_end)))
+
+        # Run optimization within the period (same active_params and cfg)
+        best, top_df, best_params, best_spec, ranked_df = run_optimization(
+            base_spec=per_spec,
+            active_params=active_params,
+            cfg=cfg,
+        )
+
+        # Compute stats-only for the best spec (fast)
+        stats = eval_stats_only_for_spec_arrays(best_spec)
+
+        # Score extraction (objective chosen in UI)
+        score = stats.get(objective, np.nan)
+
+        row = {
+            "period": label,
+            "start": p_start,
+            "end": p_end,
+            "objective": objective,
+            "objective_value": float(score) if score is not None else np.nan,
+        }
+
+        # record best params (flatten)
+        for k, v in best_params.items():
+            row[f"param.{k}"] = v
+
+        # record stats-only (flatten)
+        for k, v in stats.items():
+            row[f"stat.{k}"] = v
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+    rows = []
+
+    for label in selected_period_labels:
+        (p_start, p_end) = periods[label]
+        include_windows = [(p_start, p_end)]
+
+        if optimize:
+            # 1) run optimizer restricted to this period
+            # You likely already have something like optimize_grid(spec_base, grid, objective)
+            # Here we do the generic pattern: loop grid, run, keep best.
+            best_row = None
+            best_score = None
+            best_stats = None
+            best_params = None
+
+            # naive grid loop (replace with your existing optimizer if you have one)
+            import itertools
+            keys = list(param_grid.keys())
+            values = [param_grid[k] for k in keys]
+
+            for combo in itertools.product(*values):
+                params = dict(zip(keys, combo))
+                spec = make_spec_fn(params=params, include_windows=include_windows)
+                out = run_engine_fn(spec)
+                stats = out["stats_only"] if isinstance(out, dict) and "stats_only" in out else out.stats_only
+
+                score = stats.get(objective)
+                if score is None:
+                    continue
+
+                if (best_score is None) or (score > best_score):
+                    best_score = score
+                    best_stats = stats
+                    best_params = params
+
+            if best_stats is None:
+                rows.append({"period": label, "start": p_start, "end": p_end, "ok": False})
+                continue
+
+            row = {"period": label, "start": p_start, "end": p_end, "ok": True, "objective": objective, "objective_value": best_score}
+            # flatten params + stats
+            for k, v in best_params.items():
+                row[f"param.{k}"] = v
+            for k, v in best_stats.items():
+                row[f"stat.{k}"] = v
+            rows.append(row)
+
+        else:
+            # 2) evaluate fixed params in this period
+            spec = make_spec_fn(params=fixed_params, include_windows=include_windows)
+            out = run_engine_fn(spec)
+            stats = out["stats_only"] if isinstance(out, dict) and "stats_only" in out else out.stats_only
+
+            row = {"period": label, "start": p_start, "end": p_end, "ok": True}
+            for k, v in fixed_params.items():
+                row[f"param.{k}"] = v
+            for k, v in stats.items():
+                row[f"stat.{k}"] = v
+            rows.append(row)
+
+    return pd.DataFrame(rows)
 
 def build_spec_from_result_row(base_spec: EngineSpec, row: Any) -> EngineSpec:
     if isinstance(row, pd.Series):
@@ -492,7 +748,7 @@ def _eval_one_trial_slow_pandas(*args, **kwargs) -> TrialResult:
       - restrict optimization to a single symbol, or
       - implement a multi-symbol portfolio simulation + stats extraction.
     """
-    return TrialResult(params=kwargs.get("params", {}), pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, error="multi-symbol optimize not implemented")
+    return TrialResult(params=kwargs.get("params", {}), pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0,cagr=float("-inf"), error="multi-symbol optimize not implemented")
 
 # ============================================================
 # Trial evaluation
@@ -539,7 +795,7 @@ def _eval_one_trial(
             if end is not None:
                 idx_slice = idx_slice[idx_slice <= pd.to_datetime(end)]
             if len(idx_slice) < 2:
-                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, error="window too small")
+                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0,cagr=float("-inf"), error="window too small")
             idx_pos = common_index.get_indexer_for(idx_slice)
 
         open_px = bars_open[sym] if idx_pos is None else bars_open[sym][idx_pos]
@@ -555,7 +811,7 @@ def _eval_one_trial(
             w = int(port_base.adv_window)
             a = adv_by_window_np.get(w, {}).get(sym)
             if a is None:
-                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0,
+                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, cagr=float("-inf"),
                                 error=f"missing ADV cap series for window={w}")
             adv_cap_px = a if idx_pos is None else a[idx_pos]
 
@@ -563,7 +819,7 @@ def _eval_one_trial(
             w = int(port_base.volume_gate_adv_window)
             a = adv_by_window_np.get(w, {}).get(sym)
             if a is None:
-                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0,
+                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0,cagr=float("-inf"),
                                 error=f"missing ADV gate series for window={w}")
             adv_gate_px = a if idx_pos is None else a[idx_pos]
 
@@ -582,7 +838,7 @@ def _eval_one_trial(
             w = int(params.get("strategy.window", base_spec.strategy.params.get("window", 50)))
             sma = bank[sym].get(f"sma_{w}")
             if sma is None:
-                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, error=f"missing sma_{w} in bank")
+                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0,cagr=float("-inf"), error=f"missing sma_{w} in bank")
             if idx_pos is not None:
                 sma = sma[idx_pos]
 
@@ -602,7 +858,7 @@ def _eval_one_trial(
             sma_f = bank[sym].get(f"sma_{f}")
             sma_s = bank[sym].get(f"sma_{s}")
             if sma_f is None or sma_s is None:
-                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, error=f"missing sma_{f} or sma_{s} in bank")
+                return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0,cagr=float("-inf"), error=f"missing sma_{f} or sma_{s} in bank")
             if idx_pos is not None:
                 sma_f = sma_f[idx_pos]
                 sma_s = sma_s[idx_pos]
@@ -617,7 +873,7 @@ def _eval_one_trial(
                 sig = np.where(valid & (sma_f > sma_s), 1.0, 0.0).astype(np.float64)
 
         else:
-            return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, error=f"unknown strategy kind {sk}")
+            return TrialResult(params=params, pnl=float("-inf"), traded_notional=0.0, efficiency=float("-inf"), n_fills=0, cagr=float("-inf"), error=f"unknown strategy kind {sk}")
 
         # ----------------------------
         # C) Build portfolio config for this trial (apply params)
@@ -629,6 +885,22 @@ def _eval_one_trial(
         stats = port.run_stats_only_arrays(open_px=open_px, close_px=close_px, sig=sig, vol_px=vol_px, adv_cap_px=adv_cap_px, adv_gate_px=adv_gate_px)
 
         pnl = float(stats.pnl)
+
+        E0 = float(base_spec.portfolio.initial_cash)
+
+        # Prefer final_equity if PortfolioEngine exposes it; else infer from pnl
+        ET = float(getattr(stats, "final_equity", E0 + pnl))
+
+        n = int(close_px.size)
+        ppy = float(getattr(base_spec, "periods_per_year", 252))
+
+        # CAGR = (ET/E0)^(ppy/n) - 1
+        if n <= 1 or E0 <= 0 or ET <= 0:
+            cagr = float("-inf")
+        else:
+            cagr = (ET / E0) ** (ppy / n) - 1.0
+
+
         traded = float(stats.traded_notional)
         n_fills = int(stats.n_fills)
         # Efficiency (performance) requested:
@@ -654,6 +926,7 @@ def _eval_one_trial(
             efficiency=eff,
             n_fills=n_fills,
             error=None,
+            cagr=float(cagr),
         )
 
     except Exception as e:
@@ -663,6 +936,7 @@ def _eval_one_trial(
             traded_notional=0.0,
             efficiency=float("-inf"),
             n_fills=0,
+            cagr=float("-inf"),
             error=str(e),
         )
 
