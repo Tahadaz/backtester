@@ -249,7 +249,7 @@ INFO = {
         "This is currency PnL before attributing per-trade costs in a ledger sense."
     ),
     "metric.net_pnl": (
-        "Net PnL: Gross PnL minus transaction costs (commissions, VAT, slippage).\n"
+        "Net PnL: Gross PnL minus transaction costs (commissions, tva, slippage).\n"
         "Used to assess realism when costs are enabled."
     ),
     # trade ledger
@@ -1148,7 +1148,7 @@ with tab_backtest:
             strategy_params = {"window": int(window), "allow_short": bool(allow_short), "nan_policy": nan_policy}
 
         st.markdown("### Portfolio")
-        initial_cash = st.number_input("Initial cash", min_value=1_000.0, value=1_000_000.0, step=10_000.0)
+        initial_cash = st.number_input("Initial cash", min_value=1_000.0, value=100_000.0, step=10_000.0)
         rebalance_policy = st.selectbox("Rebalance policy", ["on_change", "every_bar"], index=0)
         sizing_mode = st.selectbox("Sizing mode", ["target_weight", "pct_cash_shares"], index=1)
         cooldown_bars = st.number_input("Min bars between trades (cooldown)", min_value=0, value=0, step=1)
@@ -1176,13 +1176,13 @@ with tab_backtest:
         apply_costs = st.checkbox("Apply costs", value=False)
         if apply_costs:
             brokerage_bps = st.number_input("Brokerage (bps)", value=60.0, step=1.0)
-            exchange_bps = st.number_input("Exchange (bps)", value=10.0, step=1.0)
-            settlement_bps = st.number_input("Settlement (bps)", value=20.0, step=1.0)
-            vat_rate = st.number_input("VAT rate", value=0.10, step=0.01)
+            comm_bourse_bps = st.number_input("Exchange (bps)", value=10.0, step=1.0)
+            reg_liv_bps = st.number_input("Settlement (bps)", value=20.0, step=1.0)
+            tva_rate = st.number_input("tva rate", value=0.10, step=0.01)
             slippage_bps = st.number_input("Slippage (bps)", value=0.0, step=1.0)
         else:
-            brokerage_bps = exchange_bps = settlement_bps = slippage_bps = 0.0
-            vat_rate = 0.0
+            brokerage_bps = comm_bourse_bps = reg_liv_bps = slippage_bps = 0.0
+            tva_rate = 0.0
 
         run_backtest = st.form_submit_button("Run backtest")
 
@@ -1202,10 +1202,10 @@ with tab_backtest:
 
             cost_model = CostModel(
                 brokerage_bps=float(brokerage_bps),
-                exchange_bps=float(exchange_bps),
-                settlement_bps=float(settlement_bps),
+                comm_bourse_bps=float(comm_bourse_bps),
+                reg_liv_bps=float(reg_liv_bps),
                 slippage_bps=float(slippage_bps),
-                vat_rate=float(vat_rate),
+                tva_rate=float(tva_rate),
             )
 
             base_spec = make_base_spec(
@@ -1273,7 +1273,7 @@ with tab_opt:
     st.subheader("Optimize (rank by pnl then cagr)")
     # Baseline fixed values (used when NOT optimized)
     with st.expander("Fixed baseline (used when NOT optimized)", expanded=False):
-        initial_cash0 = st.number_input("Initial cash (baseline)", min_value=1_000.0, value=1_000_000.0, step=10_000.0, key="opt_initial_cash")
+        initial_cash0 = st.number_input("Initial cash (baseline)", min_value=1_000.0, value=100_000.0, step=10_000.0, key="opt_initial_cash")
         rebalance_policy0 = st.selectbox("Rebalance policy (baseline)", ["on_change", "every_bar"], index=0, key="opt_reb_policy")
         sizing_mode0 = st.selectbox("Sizing mode (baseline)", ["target_weight", "pct_cash_shares"], index=1, key="opt_sizing_mode")
         cooldown0 = st.number_input("cooldown_bars (baseline)", min_value=0, value=0, step=1, key="opt_cd0")
@@ -1353,13 +1353,13 @@ with tab_opt:
         apply_costs0 = st.checkbox("Apply costs", value=False, key="opt_apply_costs")
         if apply_costs0:
             brokerage_bps0 = st.number_input("Brokerage (bps)", value=60.0, step=1.0, key="opt_brok")
-            exchange_bps0 = st.number_input("Exchange (bps)", value=10.0, step=1.0, key="opt_exch")
-            settlement_bps0 = st.number_input("Settlement (bps)", value=20.0, step=1.0, key="opt_settle")
-            vat_rate0 = st.number_input("VAT rate", value=0.10, step=0.01, key="opt_vat")
+            comm_bourse_bps0 = st.number_input("Exchange (bps)", value=10.0, step=1.0, key="opt_exch")
+            reg_liv_bps0 = st.number_input("Settlement (bps)", value=20.0, step=1.0, key="opt_settle")
+            tva_rate0 = st.number_input("tva rate", value=0.10, step=0.01, key="opt_tva")
             slippage_bps0 = st.number_input("Slippage (bps)", value=0.0, step=1.0, key="opt_slip")
         else:
-            brokerage_bps0 = exchange_bps0 = settlement_bps0 = slippage_bps0 = 0.0
-            vat_rate0 = 0.0
+            brokerage_bps0 = comm_bourse_bps0 = reg_liv_bps0 = slippage_bps0 = 0.0
+            tva_rate0 = 0.0
 
     # Build catalog for THIS strategy_kind
     catalog = default_param_catalog(strategy_kind)
@@ -1538,10 +1538,10 @@ with tab_opt:
 
             cost_model = CostModel(
                 brokerage_bps=float(brokerage_bps0),
-                exchange_bps=float(exchange_bps0),
-                settlement_bps=float(settlement_bps0),
+                comm_bourse_bps=float(comm_bourse_bps0),
+                reg_liv_bps=float(reg_liv_bps0),
                 slippage_bps=float(slippage_bps0),
-                vat_rate=float(vat_rate0),
+                tva_rate=float(tva_rate0),
             )
 
             base_spec = make_base_spec(
@@ -1613,6 +1613,7 @@ with tab_opt:
             st.subheader("Best result")
             st.json({
                 "pnl": best.pnl,
+                "cagr": best.cagr,
                 "efficiency": best.efficiency,
                 "n_fills": best.n_fills,
                 "params": best.params,

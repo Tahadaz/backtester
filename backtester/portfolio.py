@@ -48,16 +48,16 @@ class CostModel:
       - Brokerage (commission de courtage): 0.60% HT
       - Exchange fee (commission de bourse): 0.10% HT
       - Settlement/Livraison: 0.20% HT
-      - VAT (TVA): 10% applied on commissions (practice varies; keep configurable)
+      - tva (TVA): 10% applied on commissions (practice varies; keep configurable)
 
     You can set any component to 0.0 if not applicable to your context.
     """
     brokerage_bps: float = 60.0     # 0.60% = 60 bps (HT)
-    exchange_bps: float = 10.0      # 0.10% = 10 bps (HT)
-    settlement_bps: float = 20.0    # 0.20% = 20 bps (HT)
+    comm_bourse_bps: float = 10.0      # 0.10% = 10 bps (HT)
+    reg_liv_bps: float = 20.0    # 0.20% = 20 bps (HT)
     slippage_bps: float = 0.0       # model impact/spread; keep 0 for now
 
-    vat_rate: float = 0.10          # 10% TVA on commissions; set 0.0 if you don't want this
+    tva_rate: float = 0.10          # 10% TVA on commissions; set 0.0 if you don't want this
     # If you want: fixed minimum commission, per-order ticket fees, etc. add later.
 
     def estimate_cost(self, notional: float) -> Tuple[float, Dict[str, float]]:
@@ -65,15 +65,15 @@ class CostModel:
         Returns (total_cost, breakdown). notional is absolute traded value (>=0).
         """
         notional = float(abs(notional))
-        commission_ht = notional * (self.brokerage_bps + self.exchange_bps + self.settlement_bps) / 10000.0
+        commission_ht = notional * (self.brokerage_bps + self.comm_bourse_bps + self.reg_liv_bps) / 10000.0
         slippage = notional * (self.slippage_bps / 10000.0)
 
-        vat = commission_ht * float(self.vat_rate)
-        total = commission_ht + vat + slippage
+        tva = commission_ht * float(self.tva_rate)
+        total = commission_ht + tva + slippage
 
         breakdown = {
             "commission_ht": commission_ht,
-            "vat": vat,
+            "tva": tva,
             "slippage": slippage,
             "total": total,
         }
@@ -104,7 +104,7 @@ class PortfolioConfig:
     # Layer 3: execution cap (participation)
     use_participation_cap: bool = False
     participation_rate: float = 0.05   # 5% of volume (typical research default)
-    participation_basis: str = "bar"    # "bar" or "adv"
+    participation_basis: str = "adv"    # "bar" or "adv"
     adv_window: int = 20               # used if participation_basis == "adv"
 
     # What to do with unfilled remainder:
@@ -114,9 +114,9 @@ class PortfolioConfig:
 
     # Layer 1: optional gate (see section B)
     use_volume_gate: bool = False
-    volume_gate_kind: str = "min_abs"  # "min_abs" or "min_ratio_adv"
+    volume_gate_kind: str = "min_ratio_adv"  # "min_abs" or "min_ratio_adv"
     min_volume_abs: float = 0.0        # e.g., 50_000 shares
-    min_volume_ratio_adv: float = 0.3  # e.g., Volume >= 0.3 * ADV
+    min_volume_ratio_adv: float = 0.1  # e.g., Volume >= 0.3 * ADV
     volume_gate_adv_window: int = 20
 
 
@@ -609,7 +609,7 @@ class PortfolioEngine:
 
         cm = self.cfg.cost_model
         k = (
-            ((cm.brokerage_bps + cm.exchange_bps + cm.settlement_bps) / 10000.0) * (1.0 + cm.vat_rate)
+            ((cm.brokerage_bps + cm.comm_bourse_bps + cm.reg_liv_bps) / 10000.0) * (1.0 + cm.tva_rate)
             + (cm.slippage_bps / 10000.0)
         )
 
@@ -912,7 +912,7 @@ class PortfolioEngine:
     @staticmethod
     def _fills_to_df(fills: List[Fill]) -> pd.DataFrame:
         if not fills:
-            return pd.DataFrame(columns=["timestamp", "symbol", "qty", "price", "notional", "cost", "commission_ht", "vat", "slippage"])
+            return pd.DataFrame(columns=["timestamp", "symbol", "qty", "price", "notional", "cost", "commission_ht", "tva", "slippage"])
         rows = []
         for f in fills:
             rows.append({
@@ -923,7 +923,7 @@ class PortfolioEngine:
                 "notional": f.notional,
                 "cost": f.cost,
                 "commission_ht": f.cost_breakdown.get("commission_ht", np.nan),
-                "vat": f.cost_breakdown.get("vat", np.nan),
+                "tva": f.cost_breakdown.get("tva", np.nan),
                 "slippage": f.cost_breakdown.get("slippage", np.nan),
             })
         df = pd.DataFrame(rows)

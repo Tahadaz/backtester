@@ -65,7 +65,7 @@ class TrialResult:
     traded_notional: float
     efficiency: float
     n_fills: int
-    cagr: float  
+    cagr: float 
     error: Optional[str] = None
     
 
@@ -506,8 +506,47 @@ def eval_stats_only_for_spec_arrays(
         raise ValueError("Window too small after slicing.")
     b = md.bars[sym].loc[idx2[0]:idx2[-1]]
 
-    open_px = b["Open"].to_numpy(dtype=np.float64, copy=False)
+    open_px  = b["Open"].to_numpy(dtype=np.float64, copy=False)
     close_px = b["Close"].to_numpy(dtype=np.float64, copy=False)
+
+    # NEW: volume/ADV support (so volume gate & participation cap work)
+    need_volume = bool(spec.portfolio.use_participation_cap or spec.portfolio.use_volume_gate)
+
+    vol_px = None
+    adv_cap_px = None
+    adv_gate_px = None
+
+    if need_volume:
+        vcol = spec.portfolio.volume_col
+        if vcol not in b.columns:
+            raise KeyError(f"Missing volume column '{vcol}' in bars for {sym}. Available: {list(b.columns)}")
+        vol_px = b[vcol].to_numpy(dtype=np.float64, copy=False)
+
+        # Build ADV arrays only for the windows actually needed
+        adv_windows = []
+        if spec.portfolio.use_participation_cap and str(spec.portfolio.participation_basis) == "adv":
+            adv_windows.append(int(spec.portfolio.adv_window))
+        if spec.portfolio.use_volume_gate and str(spec.portfolio.volume_gate_kind) == "min_ratio_adv":
+            adv_windows.append(int(spec.portfolio.volume_gate_adv_window))
+        adv_windows = sorted(set(w for w in adv_windows if w >= 1))
+
+        adv_by_w = {}
+        for w in adv_windows:
+            v = vol_px
+            c = np.cumsum(np.insert(v, 0, 0.0))
+            adv = np.empty_like(v)
+            idx = np.arange(v.size)
+            lo = np.maximum(0, idx - (w - 1))
+            den = (idx - lo + 1).astype(np.float64)
+            adv[:] = (c[idx + 1] - c[lo]) / den
+            adv_by_w[w] = adv
+
+        if spec.portfolio.use_participation_cap and str(spec.portfolio.participation_basis) == "adv":
+            adv_cap_px = adv_by_w[int(spec.portfolio.adv_window)]
+
+        if spec.portfolio.use_volume_gate and str(spec.portfolio.volume_gate_kind) == "min_ratio_adv":
+            adv_gate_px = adv_by_w[int(spec.portfolio.volume_gate_adv_window)]
+
 
     # Build signals using strategy adapter + SMA bank (minimal compute: only needed windows)
     sk = spec.strategy.kind.lower()
@@ -581,7 +620,7 @@ def eval_stats_only_for_spec_arrays(
     
     # Portfolio stats only
     port = PortfolioEngine(spec.portfolio)
-    stats = port.run_stats_only_arrays(open_px=open_px, close_px=close_px, sig=sig, vol_px=None, adv_cap_px=None, adv_gate_px=None)
+    stats = port.run_stats_only_arrays(open_px=open_px, close_px=close_px, sig=sig, vol_px=vol_px, adv_cap_px=adv_cap_px, adv_gate_px=adv_gate_px)
     E0 = float(spec.portfolio.initial_cash)
     pnl = float(stats.pnl)
 
