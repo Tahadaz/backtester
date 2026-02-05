@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from optimize import build_spec_from_result_row, batch_optimize_by_period
 
+
 import plotly.graph_objects as go
 
 # ---- Project imports ----
