@@ -9,12 +9,11 @@ import random
 
 import numpy as np
 import pandas as pd
-from scipy import stats
 
 from data import BMCEDataSource, YahooFinanceDataSource, MarketData
-from indicators import IndicatorEngine, FeatureSpec, FeaturesData
 from strategy import SignalFrame
-from engine import EngineSpec, DataConfig, StrategyConfig
+from indicators import IndicatorEngine, FeatureSpec, FeaturesData
+from engine import EngineSpec, DataConfig, StrategyConfig, PortfolioConfig
 from portfolio import PortfolioEngine, PortfolioConfig
 
 
@@ -372,9 +371,6 @@ def run_optimization(
             adv_by_window_np[w] = {}
             for s in symbols:
                 v = bars_vol[s]
-                # fast rolling mean via cumsum
-                c = np.cumsum(np.insert(v, 0, 0.0))
-                adv = np.empty_like(v)
                 # min_periods=1 behavior
                 c = np.cumsum(np.insert(v, 0, 0.0))
                 adv = np.empty_like(v)
@@ -451,7 +447,7 @@ def run_optimization(
         top_df = ranked_df.head(int(cfg.top_k)).reset_index(drop=True)
 
         best_row = top_df.iloc[0].to_dict()
-        best_params = {k: best_row[k] for k in best_row.keys() if k not in ("pnl", "traded_notional", "efficiency", "n_fills", "error")}
+        best_params = {k: best_row[k] for k in best_row.keys() if k not in ("pnl", "traded_notional", "cagr", "n_fills", "error")}
         best = TrialResult(
             params=best_params,
             pnl=float(best_row["pnl"]),
@@ -669,67 +665,7 @@ def batch_optimize_by_period(
     return pd.DataFrame(rows)
 
 
-    rows = []
-
-    for label in selected_period_labels:
-        (p_start, p_end) = periods[label]
-        include_windows = [(p_start, p_end)]
-
-        if optimize:
-            # 1) run optimizer restricted to this period
-            # You likely already have something like optimize_grid(spec_base, grid, objective)
-            # Here we do the generic pattern: loop grid, run, keep best.
-            best_row = None
-            best_score = None
-            best_stats = None
-            best_params = None
-
-            # naive grid loop (replace with your existing optimizer if you have one)
-            import itertools
-            keys = list(param_grid.keys())
-            values = [param_grid[k] for k in keys]
-
-            for combo in itertools.product(*values):
-                params = dict(zip(keys, combo))
-                spec = make_spec_fn(params=params, include_windows=include_windows)
-                out = run_engine_fn(spec)
-                stats = out["stats_only"] if isinstance(out, dict) and "stats_only" in out else out.stats_only
-
-                score = stats.get(objective)
-                if score is None:
-                    continue
-
-                if (best_score is None) or (score > best_score):
-                    best_score = score
-                    best_stats = stats
-                    best_params = params
-
-            if best_stats is None:
-                rows.append({"period": label, "start": p_start, "end": p_end, "ok": False})
-                continue
-
-            row = {"period": label, "start": p_start, "end": p_end, "ok": True, "objective": objective, "objective_value": best_score}
-            # flatten params + stats
-            for k, v in best_params.items():
-                row[f"param.{k}"] = v
-            for k, v in best_stats.items():
-                row[f"stat.{k}"] = v
-            rows.append(row)
-
-        else:
-            # 2) evaluate fixed params in this period
-            spec = make_spec_fn(params=fixed_params, include_windows=include_windows)
-            out = run_engine_fn(spec)
-            stats = out["stats_only"] if isinstance(out, dict) and "stats_only" in out else out.stats_only
-
-            row = {"period": label, "start": p_start, "end": p_end, "ok": True}
-            for k, v in fixed_params.items():
-                row[f"param.{k}"] = v
-            for k, v in stats.items():
-                row[f"stat.{k}"] = v
-            rows.append(row)
-
-    return pd.DataFrame(rows)
+    
 
 def build_spec_from_result_row(base_spec: EngineSpec, row: Any) -> EngineSpec:
     if isinstance(row, pd.Series):
@@ -737,7 +673,7 @@ def build_spec_from_result_row(base_spec: EngineSpec, row: Any) -> EngineSpec:
     else:
         d = dict(row)
 
-    metric_cols = {"pnl", "traded_notional", "efficiency", "n_fills", "error"}
+    metric_cols = {"pnl", "traded_notional", "cagr", "n_fills", "error"}
     params = {k: v for k, v in d.items() if k not in metric_cols}
     return _apply_params_to_spec(base_spec, params)
 
@@ -985,9 +921,20 @@ def _domain_values_int(active: List[ParamDef], key: str) -> List[int]:
     p = next((x for x in active if x.key == key and x.enabled), None)
     if p is None:
         return []
-    if p.kind != "int":
+
+    # Accept manual-list domains too (UI converts int->choice)
+    if p.kind not in ("int", "choice"):
         return []
-    return [int(v) for v in _expand_domain(p)]
+
+    vals = _expand_domain(p)
+    out = []
+    for v in vals:
+        try:
+            out.append(int(v))
+        except Exception:
+            pass
+    return sorted(set(out))
+
 
 
 # ============================================================

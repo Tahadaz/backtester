@@ -1457,16 +1457,23 @@ with tab_opt:
     else:
         n_trials = 0
 
+    BATCH_PERIODS = dict(MASI_PERIODS)  # start with MASI
+    if symbol.upper() == "IAM":
+        # namespace IAM keys to prevent accidental collisions
+        BATCH_PERIODS.update({f"IAM — {k}": v for k, v in IAM_PERIODS.items()})
+
+
     st.subheader("Batch tests")
 
     do_batch = st.checkbox("Batch test by period", value=False)
 
     selected_periods = []
     if do_batch:
+        period_options = list(BATCH_PERIODS.keys())
         selected_periods = st.multiselect(
             "Select periods to run",
-            options=list(MASI_PERIODS.keys()),
-            default=list(MASI_PERIODS.keys()),
+            options=period_options,
+            default=period_options,
         )
 
         batch_objective = st.selectbox(
@@ -1584,7 +1591,7 @@ with tab_opt:
                     base_spec=base_spec,
                     active_params=active_params,
                     cfg=opt_cfg,
-                    periods=MASI_PERIODS,
+                    periods=BATCH_PERIODS,
                     selected_period_labels=selected_periods,
                     objective=batch_objective,
                 )
@@ -1601,7 +1608,7 @@ with tab_opt:
             st.session_state["opt_top_df"] = top_df
             st.session_state["opt_best_params"] = best_params
             st.session_state["opt_best_spec"] = best_spec
-            st.success("Optimization finished (ranked by pnl then efficiency).")
+            st.success("Optimization finished")
 
             st.subheader("Best result")
             st.json({
