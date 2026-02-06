@@ -299,6 +299,69 @@ class ResultsAnalyzer:
             )
             raise
 
+    def compare(
+    self,
+    report_a: BacktestReport,
+    report_b: BacktestReport,
+    label_a: str = "Strategy",
+    label_b: str = "Benchmark",
+) -> Dict[str, Any]:
+        """
+        Build comparison artifacts (cum returns plot payload + curve-vs table)
+        from two BacktestReports.
+        """
+
+        ts_a = report_a.tables["timeseries"].copy()
+        ts_b = report_b.tables["timeseries"].copy()
+
+        # Align on common dates (intersection = robust)
+        idx = ts_a.index.intersection(ts_b.index).sort_values()
+        ts_a = ts_a.reindex(idx)
+        ts_b = ts_b.reindex(idx)
+
+        # Robust numeric returns
+        rets_a = pd.to_numeric(ts_a["returns"], errors="coerce").fillna(0.0).astype(float)
+        rets_b = pd.to_numeric(ts_b["returns"], errors="coerce").fillna(0.0).astype(float)
+
+        eq_a = (1.0 + rets_a).cumprod()
+        eq_b = (1.0 + rets_b).cumprod()
+
+        dd_a = self._drawdown_from_equity(eq_a)
+        dd_b = self._drawdown_from_equity(eq_b)
+
+        cum_a = eq_a - 1.0
+        cum_b = eq_b - 1.0
+
+        # Round trips from fills (if any)
+        rt_a = self._round_trips_from_fills(report_a.tables.get("trades", pd.DataFrame()))
+        rt_b = self._round_trips_from_fills(report_b.tables.get("trades", pd.DataFrame()))
+
+        # Build curve-vs table using existing machinery
+        table = self._curve_vs_benchmark_table(
+            strat_rets=rets_a,
+            strat_equity=eq_a,
+            strat_dd=dd_a,
+            round_trips=rt_a,
+            bench_rets=rets_b,
+            bench_equity=eq_b,
+            bench_dd=dd_b,
+        )
+
+        # Rename columns from Strategy/Benchmark -> actual labels
+        cols = [str(c) for c in table.columns]
+        if len(cols) == 1 and cols[0].strip().lower() == "strategy":
+            table.columns = [label_a]
+        elif len(cols) >= 2 and cols[0].strip().lower() == "strategy" and cols[1].strip().lower() == "benchmark":
+            table.columns = [label_a, label_b] + cols[2:]  # keep any extra cols if you add later
+
+        return {
+            "cum_plot": {"strategy": cum_a, "benchmark": cum_b},
+            "curve_table": table,
+            "cum_df": pd.DataFrame({label_a: cum_a, label_b: cum_b}, index=idx),
+        }
+
+
+
     # =============================
     # Styling hints for the UI
     # =============================
@@ -672,7 +735,7 @@ class ResultsAnalyzer:
     def _yearly_returns(self, rets: pd.Series) -> pd.Series:
         r = rets.copy()
         r.index = pd.to_datetime(r.index)
-        y = r.resample("Y").apply(lambda x: (1.0 + x).prod() - 1.0)
+        y = r.resample("YE").apply(lambda x: (1.0 + x).prod() - 1.0)
         if y.empty:
             return pd.Series(dtype=float)
         y.index = y.index.year
@@ -809,7 +872,7 @@ class ResultsAnalyzer:
         r.index = pd.to_datetime(r.index)
 
         m = r.resample("M").apply(lambda x: (1.0 + x).prod() - 1.0)
-        y = r.resample("Y").apply(lambda x: (1.0 + x).prod() - 1.0)
+        y = r.resample("YE").apply(lambda x: (1.0 + x).prod() - 1.0)
 
         def stats(x: pd.Series) -> Tuple[float, float, float, float, float]:
             x = x.dropna()

@@ -13,7 +13,7 @@ import pandas as pd
 from data import BMCEDataSource, YahooFinanceDataSource, MarketData
 from strategy import SignalFrame
 from indicators import IndicatorEngine, FeatureSpec, FeaturesData
-from engine import EngineSpec, DataConfig, StrategyConfig, PortfolioConfig
+from engine import EngineSpec, DataConfig, StrategyConfig, estimate_warmup_bars_from_params, BacktestEngine
 from portfolio import PortfolioEngine, PortfolioConfig
 
 
@@ -1068,41 +1068,38 @@ def eval_stats_only_for_spec_arrays(
         "max_drawdown": float(getattr(stats, "max_drawdown", np.nan)),
     }
 
+from datetime import timedelta
+
 def batch_optimize_by_period(
     base_spec: EngineSpec,
     active_params: List[ParamDef],
     cfg: OptimizeConfig,
     periods: Dict[str, Tuple[str, str]],
     selected_period_labels: List[str],
-    objective: str = "pnl",   # or "efficiency"
+    objective: str = "pnl",
 ) -> pd.DataFrame:
-    """
-    For each period:
-      - run_optimization on that period
-      - evaluate stats_only for the best_spec
-    Returns a DataFrame with one row per period.
-    """
+
     rows = []
 
     for label in selected_period_labels:
         p_start, p_end = periods[label]
 
-        # Create a per-period base spec by setting DataConfig start/end
-        per_spec = replace(base_spec, data=replace(base_spec.data, start=str(p_start), end=str(p_end)))
+        per_spec = replace(
+            base_spec,
+            data=replace(base_spec.data, start=str(p_start), end=str(p_end)),
+        )
 
-        # Run optimization within the period (same active_params and cfg)
         best, top_df, best_params, best_spec, ranked_df = run_optimization(
             base_spec=per_spec,
             active_params=active_params,
             cfg=cfg,
         )
 
-        # Compute stats-only for the best spec (fast)
+        # ---- stats-only evaluation (fast) ----
         stats = eval_stats_only_for_spec_arrays(best_spec)
-
-        # Score extraction (objective chosen in UI)
         score = stats.get(objective, np.nan)
 
+        # ✅ CREATE row FIRST
         row = {
             "period": label,
             "start": p_start,
@@ -1119,21 +1116,74 @@ def batch_optimize_by_period(
         for k, v in stats.items():
             row[f"stat.{k}"] = v
 
+        # ---- FULL run ONLY for best spec (fills -> trade ledger/perf) ----
+        try:
+            best_bundle = BacktestEngine(best_spec).run()
+
+            trades_df = best_bundle.report.tables.get("trades", pd.DataFrame())
+            ledger = best_bundle.report.tables.get("trade_ledger", pd.DataFrame())
+            tperf  = best_bundle.report.tables.get("trade_performance", pd.DataFrame())
+
+            row["best.trades"] = int(len(trades_df))
+            row["best.ledger_trades"] = int(len(ledger))
+
+            if (tperf is not None) and (not tperf.empty) and ("Value" in tperf.columns) and ("Win Rate" in tperf.index):
+                row["best.win_rate"] = float(tperf.loc["Win Rate", "Value"])
+            else:
+                row["best.win_rate"] = np.nan
+
+        except Exception as e:
+            # Don't kill the batch if full run fails; keep audit trail
+            row["best.trades"] = np.nan
+            row["best.ledger_trades"] = np.nan
+            row["best.win_rate"] = np.nan
+            row["best.full_run_error"] = f"{type(e).__name__}: {e}"
+
         rows.append(row)
 
     return pd.DataFrame(rows)
 
 
+
     
 
 def build_spec_from_result_row(base_spec: EngineSpec, row: Any) -> EngineSpec:
+    """
+    Accepts either:
+      - optimizer-ranked rows with raw keys: "strategy.sma_window", "portfolio.cooldown_bars", ...
+      - batch rows with prefixed keys: "param.strategy.sma_window", "param.portfolio.cooldown_bars", ...
+
+    Ignores:
+      - metrics: pnl, cagr, n_fills, traded_notional, efficiency, error
+      - batch/meta columns: period, start, end, objective, objective_value
+      - stat.* columns
+    """
     if isinstance(row, pd.Series):
         d = row.to_dict()
     else:
         d = dict(row)
 
-    metric_cols = {"pnl", "traded_notional", "cagr", "n_fills", "error"}
-    params = {k: v for k, v in d.items() if k not in metric_cols}
+    metric_cols = {"pnl", "traded_notional", "cagr", "n_fills", "efficiency", "error"}
+    meta_cols = {"period", "start", "end", "objective", "objective_value"}
+
+    params: Dict[str, Any] = {}
+
+    for k, v in d.items():
+        if k in metric_cols or k in meta_cols:
+            continue
+        if isinstance(k, str) and k.startswith("stat."):
+            continue
+
+        # batch format: param.<real_key>
+        if isinstance(k, str) and k.startswith("param."):
+            real_k = k[len("param."):]
+            params[real_k] = v
+            continue
+
+        # normal optimization format: real key already
+        if isinstance(k, str) and (k.startswith("strategy.") or k.startswith("portfolio.") or k == "data.window"):
+            params[k] = v
+
     return _apply_params_to_spec(base_spec, params)
 
 def _eval_one_trial_slow_pandas(*args, **kwargs) -> TrialResult:
@@ -1533,47 +1583,3 @@ def _slice_index(index: pd.DatetimeIndex, start: Optional[str], end: Optional[st
     return out if len(out) > 0 else None
 
 
-# ============================================================
-# TEXT EXPLANATION (for Cursor review)
-# ============================================================
-"""
-What this optimize.py does (fast + robust):
-
-1) Strategy-agnostic optimization via StrategyAdapters:
-   - Each strategy kind has an adapter that:
-     (a) declares which SMA windows must be precomputed (union over parameter ranges)
-     (b) validates parameters (e.g., fast_window < slow_window)
-     (c) generates signals from precomputed arrays (no indicator recompute per trial)
-
-2) Compute-once:
-   - Load MarketData once using the correct instance method:
-       BMCEDataSource(...).load(...)
-       YahooFinanceDataSource(...).load(...)
-   - Align all symbols to a common index via inner intersection (robust multi-asset)
-   - Precompute required SMA features once with IndicatorEngine.compute(...)
-   - Convert features to NumPy arrays in a FeatureBank dict: bank[symbol]["sma_50"] -> np.ndarray
-
-3) Evaluate candidates:
-   - Candidate params come from ParamDef domains (grid or random)
-   - Optional date window optimization: "data.window" provides (start,end) strings.
-     We slice the common index and reindex MarketData to that slice (no mutation).
-   - Signals are generated by adapter.make_signals_from_bank(...) into a minimal SignalFrame.
-
-4) Portfolio speed:
-   - If you implemented PortfolioEngine.run_stats_only(), optimizer uses it (fastest).
-   - Otherwise it falls back to PortfolioEngine.run() and computes traded_notional from pres.trades["notional"].
-
-5) Objective:
-   - Primary: pnl = final_equity - initial_cash
-   - Secondary: efficiency = pnl / net_inv (if net_inv>0 else -inf)
-   - Ranking: sort by pnl desc, efficiency desc.
-
-Return values:
-   best_result (TrialResult), top_df (DataFrame), best_params (dict), best_spec (EngineSpec)
-   best_spec is base_spec with best params applied (DataConfig start/end, StrategyConfig params, PortfolioConfig knobs).
-
-How to integrate with Streamlit:
-   - Build active_params from user-selected keys and ranges.
-   - Call run_optimization(base_spec, active_params, cfg).
-   - Use best_spec to run a full BacktestEngine for plots in "Optimize mode".
-"""

@@ -4,6 +4,7 @@ import streamlit as st
 st.set_page_config(page_title="Backtester", layout="wide")
 
 from plotly.subplots import make_subplots
+import copy
 
 import os
 import tempfile
@@ -21,7 +22,7 @@ from optimize import build_spec_from_result_row, batch_optimize_by_period
 import plotly.graph_objects as go
 
 # ---- Project imports ----
-from engine import BacktestEngine, EngineSpec, DataConfig, IndicatorsConfig, StrategyConfig
+from engine import BacktestEngine, BenchmarkConfig, EngineSpec, DataConfig, IndicatorsConfig, StrategyConfig
 from portfolio import PortfolioConfig, CostModel
 from optimize import (
     OptimizeConfig,
@@ -65,6 +66,89 @@ st.sidebar.caption(f"run_optimization: {_opt_mod.run_optimization.__module__}.{_
 #     which breaks caching keys and forces full recompute.
 #   - We persist uploads to a deterministic path based on file content hash.
 # ============================================================
+
+from dataclasses import replace
+def render_strategy_params_ui(kind: str, *, prefix: str, allow_short: bool, nan_policy: str = "flat") -> dict:
+    k = (kind or "").lower()
+    p = {}
+
+    if k == "buy_hold":
+        p["buy_pct_cash"] = st.slider(f"{prefix} buy_pct_cash", 0.01, 1.00, 1.0, 0.01, key=f"{prefix}_bh_buy")
+        p["nan_policy"] = nan_policy
+        return p
+
+    if k == "ma_cross":
+        fast = st.number_input(f"{prefix} fast_window", 2, 500, 20, 1, key=f"{prefix}_fast")
+        slow = st.number_input(f"{prefix} slow_window", 3, 500, 50, 1, key=f"{prefix}_slow")
+        if fast >= slow:
+            st.warning("fast must be < slow; auto-adjusting")
+            fast = min(int(fast), int(slow) - 1)
+        p.update({"sma_fast_window": int(fast), "sma_slow_window": int(slow)})
+
+    elif k == "sma_price":
+        w = st.number_input(f"{prefix} sma_window", 2, 500, 50, 1, key=f"{prefix}_w")
+        p["sma_window"] = int(w)
+
+    elif k == "rsi":
+        w = st.number_input(f"{prefix} rsi_window", 2, 500, 14, 1, key=f"{prefix}_rsiw")
+        lo = st.number_input(f"{prefix} oversold", 1, 49, 30, 1, key=f"{prefix}_rsilo")
+        hi = st.number_input(f"{prefix} overbought", 51, 99, 70, 1, key=f"{prefix}_rsihi")
+        if lo >= hi:
+            st.warning("oversold must be < overbought; auto-adjusting")
+            lo = min(int(lo), int(hi) - 1)
+        p.update({"rsi_window": int(w), "rsi_oversold": float(lo), "rsi_overbought": float(hi)})
+
+    elif k == "macd":
+        fast = st.number_input(f"{prefix} macd_fast", 2, 500, 12, 1, key=f"{prefix}_macdf")
+        slow = st.number_input(f"{prefix} macd_slow", 3, 500, 26, 1, key=f"{prefix}_macds")
+        sig  = st.number_input(f"{prefix} macd_signal", 2, 500, 9, 1, key=f"{prefix}_macdsg")
+        if fast >= slow:
+            st.warning("fast must be < slow; auto-adjusting")
+            fast = min(int(fast), int(slow) - 1)
+        p.update({"macd_fast_window": int(fast), "macd_slow_window": int(slow), "macd_signal_window": int(sig)})
+
+    elif k == "bollinger":
+        w = st.number_input(f"{prefix} bb_window", 2, 500, 20, 1, key=f"{prefix}_bbw")
+        kk = st.number_input(f"{prefix} bb_k", 0.1, 5.0, 2.0, 0.1, key=f"{prefix}_bbk")
+        p.update({"bb_window": int(w), "bb_k": float(kk)})
+
+    # common
+    p["allow_short"] = bool(allow_short)
+    p["nan_policy"] = nan_policy
+    return p
+
+def attach_comparator_to_bundle(
+    bundle_a,
+    bundle_b,
+    *,
+    label_a: str,
+    label_b: str,
+    periods_per_year: int,
+    rf_annual: float,
+):
+    analyzer = ResultsAnalyzer(periods_per_year=periods_per_year, rf_annual=rf_annual)
+    comp = analyzer.compare(
+        report_a=bundle_a.report,
+        report_b=bundle_b.report,
+        label_a=label_a,
+        label_b=label_b,
+    )
+
+    rep0 = bundle_a.report
+
+    new_meta = dict(getattr(rep0, "meta", None) or {})
+    new_meta["cum_compare_labels"] = {"a": label_a, "b": label_b}
+
+    new_plots = dict(getattr(rep0, "plots", None) or {})
+    new_plots["cum_vs_bench"] = comp["cum_plot"]
+
+    new_tables = dict(getattr(rep0, "tables", None) or {})
+    new_tables["curve_vs_comparator"] = comp["curve_table"]
+
+    rep1 = replace(rep0, meta=new_meta, plots=new_plots, tables=new_tables)
+    return replace(bundle_a, report=rep1)
+
+
 import hashlib
 import json, hashlib
 def _spec_key(spec: EngineSpec) -> str:
@@ -163,152 +247,6 @@ def _persist_upload_to_cache(uploaded_file, tag: str, symbol: str) -> tuple[str,
 
 
 
-# ============================================================
-# Metric explanations (only what you asked for)
-# ============================================================
-
-EXPLAIN = {
-    # --- Plots ---
-    "plot.cum_returns": {
-        "title": "Cumulative Returns",
-        "why": "Shows the compounded performance over time. Easier to compare strategy vs benchmark.",
-        "latex": r"CR_t=\prod_{i=1}^{t}(1+r_i)-1",
-        "notes": "Uses per-bar equity returns r_i.",
-    },
-    "plot.drawdown": {
-        "title": "Drawdown",
-        "why": "Measures peak-to-trough decline. Captures risk / pain / tail behavior.",
-        "latex": r"DD_t=\frac{E_t}{\max_{u\le t}E_u}-1,\quad \max DD=\min_t DD_t",
-        "notes": "E_t is equity at time t.",
-    },
-
-    # --- Trade ledger columns ---
-    "ledger.pnl": {
-        "title": "Gross PnL / Net PnL / Return %",
-        "why": "Gross PnL is price PnL. Net PnL subtracts costs. Return% normalizes net PnL by entry notional.",
-        "latex": (
-            r"\mathrm{GrossPnL}=\begin{cases}"
-            r"q(\,P_{exit}-P_{entry}\,),& \text{LONG}\\"
-            r"q(\,P_{entry}-P_{exit}\,),& \text{SHORT}"
-            r"\end{cases}"
-            "\n"
-            r"\mathrm{NetPnL}=\mathrm{GrossPnL}-Cost_{entry}-Cost_{exit}"
-            "\n"
-            r"\mathrm{Return\%}=\frac{\mathrm{NetPnL}}{q\cdot P_{entry}}"
-        ),
-        "notes": "q is the closed quantity for that round-trip/lot.",
-    },
-
-    # --- Trade performance ---
-    "trade.profit_factor": {
-        "title": "Profit Factor",
-        "why": "Quality of the payoff distribution: how much profit you make per unit of loss (higher is better).",
-        "latex": r"\mathrm{PF}=\frac{\sum \mathrm{Wins}}{|\sum \mathrm{Losses}|}",
-        "notes": "Computed on net PnL of closed trades.",
-    },
-
-    # --- Optimization top candidates ---
-    "opt.top": {
-        "title": "Optimization metrics (ranking)",
-        "why": "You rank candidates by PnL first, then Efficiency. Turnover proxy is traded notional. n_fills is trade count.",
-        "latex": (
-            r"\mathrm{PnL}=E_T-E_0"
-r"\mathrm{VolumeInv}=\sum_m \left(\sum_{k\in m}^{\le \mathrm{lastSELL}(m)} \mathrm{signed\_notional}_k\right)"
-r"\mathrm{Efficiency}=\begin{cases}1,&\mathrm{VolumeInv}\le 0\\ \frac{\mathrm{PnL}}{\mathrm{VolumeInv}},&\mathrm{VolumeInv}>0\end{cases}"),
-        "notes": "Ranking rule: sort by (PnL desc, Efficiency desc). VolumeInv is computed from fills (BUY:+notional, SELL:-notional) with a reset after the last SELL of each month.",
-    },
-}
-
-def info_popover(explain_key: str):
-    e = EXPLAIN.get(explain_key)
-    if not e:
-        return
-    with st.popover("ℹ️"):
-        st.markdown(f"**{e['title']}**")
-        st.write(e.get("why", ""))
-        if e.get("latex"):
-            st.latex(e["latex"])
-        if e.get("notes"):
-            st.caption(e["notes"])
-
-import plotly.graph_objects as go
-
-INFO = {
-    # plots
-    "plot.cum_returns": (
-        "Cumulative return:  (Π_t (1+r_t)) - 1.\n"
-        "Shows compounded growth of equity. Compare to benchmark to judge added value.\n"
-        "Benchmark series is aligned by date and forward-filled."
-    ),
-    "plot.drawdown": (
-        "Drawdown: DD_t = Equity_t / max_{u≤t}(Equity_u) - 1.\n"
-        "Measures peak-to-trough decline (risk / pain). More negative = worse."
-    ),
-    # pnl
-    "metric.gross_pnl": (
-        "Gross PnL (per bar): ΔEquity_t = Equity_t - Equity_{t-1}.\n"
-        "This is currency PnL before attributing per-trade costs in a ledger sense."
-    ),
-    "metric.net_pnl": (
-        "Net PnL: Gross PnL minus transaction costs (commissions, tva, slippage).\n"
-        "Used to assess realism when costs are enabled."
-    ),
-    # trade ledger
-    "ledger.return_pct": (
-        "Trade return %: net_pnl / entry_notional.\n"
-        "Normalizes PnL by capital deployed to compare trades across sizes."
-    ),
-    "trade.profit_factor": (
-        "Profit Factor = (sum of winning trade net PnL) / |sum of losing trade net PnL|.\n"
-        ">1 means wins outweigh losses; higher is better."
-    ),
-    # optimization
-    "opt.pnl": "Optimization PnL: final_equity - initial_cash.",
-    "opt.efficiency": (
-        "Efficiency (performance) is defined as:\n"
-        "If VolumeInv <= 0: Efficiency = 100%\n"
-        "Else: Efficiency = PnL / VolumeInv\n\n"
-        "VolumeInv = (cash bought) - (cash sold) = Σ signed_notional, where BUY:+notional and SELL:-notional.\n"
-        "Reset rule: VolumeInv is reset right after the last SELL fill of each calendar month (so months are treated independently)."
-    ),
-    "opt.n_fills": "Number of fills executed (proxy for trade frequency).",
-}
-
-def plot_with_info(title: str, info_key: str, fig, *, key: str, use_container_width: bool = True) -> None:
-    """
-    Render a plot with a small hover tooltip (ⓘ).
-    Works for matplotlib Figure and plotly Figure.
-    """
-    help_txt = INFO.get(info_key, "No explanation available.")
-
-    h1, h2 = st.columns([0.92, 0.08])
-    with h1:
-        st.subheader(title)
-    with h2:
-        # hover tooltip:
-        st.button("ⓘ", key=f"help_{key}", help=help_txt)
-
-    if fig is None:
-        st.info("No data to plot.")
-        return
-
-    # Plotly
-    if isinstance(fig, go.Figure):
-        st.plotly_chart(fig, use_container_width=use_container_width)
-        return
-
-    # Matplotlib fallback
-    st.pyplot(fig, use_container_width=use_container_width, clear_figure=False)
-
-
-def table_with_info(title: str, explain_key: str, df: pd.DataFrame):
-    c1, c2 = st.columns([10, 1], vertical_alignment="center")
-    with c1:
-        st.subheader(title)
-    with c2:
-        info_popover(explain_key)
-    st.dataframe(df, use_container_width=True)
-
 
 # ============================================================
 # Plotting helpers (NORMAL price line + indicators + buy/sell)
@@ -398,8 +336,22 @@ def plot_price_indicators_trades_line(
 
         cols = list(ind.columns)
 
-        # Try to infer bb_window from indicator_cols first (more deterministic)
+        # --- HARD GATE: only plot BB if explicitly requested ---
+        is_bollinger_strategy = bool(strategy_params) and (
+            ("bb_k" in strategy_params) or ("bb_window" in strategy_params)
+        )
+
+        has_std_col = any(c.startswith("std_") for c in cols)
+        has_std_requested = bool(indicator_cols) and any(c.startswith("std_") for c in indicator_cols)
+
+        # If it's not a bollinger strategy and no std column is present/requested, do nothing
+        if not (is_bollinger_strategy or has_std_col or has_std_requested):
+            return
+
+        # From here on, infer w ONLY from std_ first (preferred), then sma_ if needed
         w = None
+
+        # Prefer explicit requested std_
         if indicator_cols:
             for c in indicator_cols:
                 if c.startswith("std_"):
@@ -408,13 +360,8 @@ def plot_price_indicators_trades_line(
                         break
                     except Exception:
                         pass
-                if c.startswith("sma_") and w is None:
-                    try:
-                        w = int(c.split("_", 1)[1])
-                    except Exception:
-                        pass
 
-        # Fallback: infer from available columns
+        # Else infer from actual std_ columns present
         if w is None:
             for c in cols:
                 if c.startswith("std_"):
@@ -422,24 +369,22 @@ def plot_price_indicators_trades_line(
                         w = int(c.split("_", 1)[1])
                         break
                     except Exception:
-                        continue
-            if w is None:
-                for c in cols:
-                    if c.startswith("sma_"):
-                        try:
-                            w = int(c.split("_", 1)[1])
-                            break
-                        except Exception:
-                            continue
+                        pass
+
+        # If still none, fall back to SMA window (only if bollinger strategy)
+        if w is None and is_bollinger_strategy:
+            for c in cols:
+                if c.startswith("sma_"):
+                    try:
+                        w = int(c.split("_", 1)[1])
+                        break
+                    except Exception:
+                        pass
 
         if w is None:
-            return  # nothing to plot
+            return
 
-        # k: try to read from strategy meta if present, else default
         k = float((strategy_params or {}).get("bb_k", 2.0))
-        # If your pipeline includes a constant column or meta, adapt here.
-        # For now we keep k=2.0 (you can pass it in later if you want).
-
         col_mid = f"sma_{w}"
         col_std = f"std_{w}"
 
@@ -451,7 +396,9 @@ def plot_price_indicators_trades_line(
         if col_std in ind.columns:
             std = pd.to_numeric(ind[col_std], errors="coerce")
         else:
-            # fallback: compute rolling std from close if not provided
+            # Only allow computing std fallback if this is explicitly bollinger strategy
+            if not is_bollinger_strategy:
+                return
             std = pd.to_numeric(df["Close"], errors="coerce").rolling(int(w), min_periods=int(w)).std()
 
         upper = mid + k * std
@@ -575,7 +522,23 @@ def plot_price_indicators_trades_line(
         row=1, col=1
     )
     _maybe_add_bollinger_overlay()
+    if ind is not None and not ind.empty:
+        # Keep it conservative: only draw moving averages on the price panel
+        price_level_cols = [c for c in ind.columns if c.startswith(("sma_", "ema_"))]
 
+        for c in price_level_cols:
+            y = pd.to_numeric(ind[c], errors="coerce")
+            if y.notna().any():  # avoid adding empty traces
+                fig.add_trace(
+                    go.Scatter(
+                        x=df.index,
+                        y=y,
+                        mode="lines",
+                        name=c,
+                        line=dict(width=1),
+                    ),
+                    row=1, col=1
+                )
 
     # Trades markers on row 1
     if trades is not None and not trades.empty:
@@ -838,13 +801,22 @@ def plot_price_indicators_trades_line(
 
 
 
-def plot_cum_vs_bench(cum: pd.Series, bench_cum: pd.Series | None) -> plt.Figure:
+def plot_cum_vs_bench(
+    cum: pd.Series,
+    bench_cum: pd.Series | None,
+    *,
+    label_a: str = "Strategy",
+    label_b: str = "Comparator",
+    title: str = "Cumulative Returns",
+) -> plt.Figure:
     fig = plt.figure(figsize=(14, 4))
     ax = plt.gca()
-    ax.plot(cum.index, cum.values, label="Strategy")
+
+    ax.plot(cum.index, cum.values, label=label_a)
     if bench_cum is not None:
-        ax.plot(bench_cum.index, bench_cum.values, label="Benchmark")
-    ax.set_title("Cumulative Returns vs Benchmark")
+        ax.plot(bench_cum.index, bench_cum.values, label=label_b)
+
+    ax.set_title(title)
     ax.grid(True)
     ax.legend()
     return fig
@@ -913,54 +885,45 @@ def plot_yearly_returns_bar(yearly: pd.Series) -> plt.Figure:
     ax.grid(True, axis="y")
     return fig
 
-def render_explain(report, key: str):
-    e = report.explain.get(key)
-    if not e:
-        return
-    with st.popover("ℹ️"):
-        st.markdown(f"**{e.title}**")
-        st.write(e.why)
-        if e.latex:
-            st.latex(e.latex)
-        if e.notes:
-            st.caption(e.notes)
-        if e.columns:
-            st.markdown("**Columns**")
-            for c, desc in e.columns.items():
-                st.markdown(f"- `{c}`: {desc}")
 
-def metric_card(label: str, value, report, explain_key: str):
-    c1, c2 = st.columns([8, 1], vertical_alignment="center")
-    with c1:
-        st.metric(label, value)
-    with c2:
-        render_explain(report, explain_key)
 
-def table_with_info(title: str, df: pd.DataFrame, report, explain_key: str):
-    c1, c2 = st.columns([8, 1], vertical_alignment="center")
-    with c1:
-        st.subheader(title)
-    with c2:
-        render_explain(report, explain_key)
-    st.dataframe(df, use_container_width=True)
 
-def plot_with_info(title: str, fig, report, explain_key: str):
-    c1, c2 = st.columns([8, 1], vertical_alignment="center")
-    with c1:
-        st.subheader(title)
-    with c2:
-        render_explain(report, explain_key)
-    st.plotly_chart(fig, use_container_width=True)
+
+def render_comparison(
+    bundle_a,
+    bundle_b,
+    *,
+    label_a: str = "Strategy",
+    label_b: str = "Benchmark",
+    periods_per_year: int = 252,
+    rf_annual: float = 0.0,
+):
+    analyzer = ResultsAnalyzer(periods_per_year=periods_per_year, rf_annual=rf_annual)
+
+    # You will implement analyzer.compare(...) in results.py
+    comp = analyzer.compare(
+        report_a=bundle_a.report,
+        report_b=bundle_b.report,
+        label_a=label_a,
+        label_b=label_b,
+    )
+
+    st.subheader("Cumulative Returns vs Comparator")
+    cvb = comp["cum_plot"]
+    st.pyplot(plot_cum_vs_bench(cvb["strategy"], cvb["benchmark"]))
+
+    st.subheader("Curve vs Comparator")
+    st.dataframe(comp["curve_table"], use_container_width=True)
+
 
 # ============================================================
 # Render bundle
 # ============================================================
 
-def render_bundle(bundle, *, port_cfg: PortfolioConfig | None = None):
+def render_bundle(bundle, *, port_cfg: PortfolioConfig | None = None, label : str| None = None):
     rep = bundle.report
     plots = rep.plots
     tables = rep.tables
-
     st.subheader("Price + Indicators + Trades")
     pp = plots["price_panel"]
     sym0 = bundle.md.symbols()[0]
@@ -976,14 +939,29 @@ def render_bundle(bundle, *, port_cfg: PortfolioConfig | None = None):
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Cumulative Returns vs Benchmark")
+    st.subheader("Cumulative Returns vs Comparator")
     cvb = plots["cum_vs_bench"]
-    st.pyplot(plot_cum_vs_bench(cvb["strategy"], cvb.get("benchmark")))
+
+    sym0 = bundle.md.symbols()[0] if hasattr(bundle, "md") and bundle.md.symbols() else ""
+    kind = getattr(getattr(bundle, "spec", None), "strategy", None)
+    kind = getattr(kind, "kind", "strategy")
+
+    labels = rep.meta.get("cum_compare_labels", {}) if hasattr(rep, "meta") else {}
+    label_a = labels.get("a", f"{kind} | {sym0}")
+    label_b = labels.get("b", "Comparator")
+
+    st.pyplot(
+        plot_cum_vs_bench(
+            cvb["strategy"],
+            cvb.get("benchmark"),
+            label_a=label_a,
+            label_b=label_b,
+        )
+    )
 
 
     st.subheader("Drawdown")
     st.pyplot(plot_drawdown_red(plots["drawdown"]))
-
 
 
     st.subheader("Monthly Returns Heatmap")
@@ -1016,6 +994,10 @@ def render_bundle(bundle, *, port_cfg: PortfolioConfig | None = None):
     st.subheader("Trade Performance (summary)")
     if "trade_performance" in tables:
         st.dataframe(tables["trade_performance"], use_container_width=True)
+    if "curve_vs_comparator" in tables:
+        st.subheader("Curve vs Comparator")
+        st.dataframe(tables["curve_vs_comparator"], use_container_width=True)
+
 
 
 
@@ -1221,6 +1203,27 @@ if prev_kind != strategy_kind:
         if k.endswith("_min") or k.endswith("_max") or k.endswith("_step") or k.endswith("_choices"):
             del st.session_state[k]
     st.session_state["prev_strategy_kind"] = strategy_kind
+
+st.sidebar.header("Comparison")
+
+compare_mode = st.sidebar.selectbox(
+    "Compare against",
+    ["None", "Buy & Hold (same data)", "Another strategy (same data)"],
+    index=0,
+)
+
+compare_strategy_kind = None
+compare_params = {}
+
+if compare_mode == "Another strategy (same data)":
+    compare_strategy_kind = st.sidebar.selectbox(
+        "Comparator strategy kind",
+        ["buy_hold", "ma_cross", "sma_price", "rsi", "macd", "bollinger"],
+        index=0,
+        key="cmp_kind",
+    )
+    with st.expander("Comparator parameters", expanded=True):
+        compare_params = render_strategy_params_ui(compare_strategy_kind, prefix="cmp", allow_short=allow_short)
 
 
 
@@ -1484,9 +1487,9 @@ with tab_backtest:
         apply_costs = st.checkbox("Apply costs", value=False)
         if apply_costs:
             brokerage_bps = st.number_input("Brokerage (bps)", value=60.0, step=1.0)
-            comm_bourse_bps = st.number_input("Exchange (bps)", value=10.0, step=1.0)
-            reg_liv_bps = st.number_input("Settlement (bps)", value=20.0, step=1.0)
-            tva_rate = st.number_input("tva rate", value=0.10, step=0.01)
+            comm_bourse_bps = st.number_input("Commission de la BdC (bps)", value=10.0, step=1.0)
+            reg_liv_bps = st.number_input("Frais Règlement-Livraison (bps)", value=20.0, step=1.0)
+            tva_rate = st.number_input("tva", value=0.10, step=0.01)
             slippage_bps = st.number_input("Slippage (bps)", value=0.0, step=1.0)
         else:
             brokerage_bps = comm_bourse_bps = reg_liv_bps = slippage_bps = 0.0
@@ -1550,15 +1553,108 @@ with tab_backtest:
                 adv_window=adv_window,
             )
 
-            # Cache bundle by spec signature (simple)
-            key = ("bundle",  _spec_key(base_spec))
-            cached = st.session_state.get(key)
-            if cached is None:
-                with st.spinner("Running backtest..."):
-                    cached = BacktestEngine(base_spec).run()
-                st.session_state[key] = cached
+            cmp_spec = None
+            if compare_mode == "Buy & Hold (same data)":
+                label_b = f"buy_hold | {symbol}"
 
-            render_bundle(cached, port_cfg=base_spec.portfolio)
+                cmp_spec = EngineSpec(
+                    data=base_spec.data,
+                    indicators=base_spec.indicators,
+                    strategy=StrategyConfig(kind="buy_hold", params={"buy_pct_cash": 1.0}),
+                    portfolio=base_spec.portfolio,
+                    benchmark=BenchmarkConfig(enabled=False),  # keep off
+                    plot_indicators=[],
+                    periods_per_year=base_spec.periods_per_year,
+                    rf_annual=base_spec.rf_annual,
+                )
+
+            elif compare_mode == "Another strategy (same data)":
+                cmp_spec = EngineSpec(
+                    data=base_spec.data,
+                    indicators=base_spec.indicators,
+                    strategy=StrategyConfig(kind=compare_strategy_kind, params=compare_params),
+                    portfolio=base_spec.portfolio,
+                    benchmark=BenchmarkConfig(enabled=False),
+                    plot_indicators=[],
+                    periods_per_year=base_spec.periods_per_year,
+                    rf_annual=base_spec.rf_annual,
+                )
+
+            # --- Run A (main strategy) once ---
+            key_a = ("bundle", _spec_key(base_spec))
+            bundle_a = st.session_state.get(key_a)
+            if bundle_a is None:
+                with st.spinner("Running backtest..."):
+                    bundle_a = BacktestEngine(base_spec).run()
+                st.session_state[key_a] = bundle_a
+
+            # --- Run B (comparator) if enabled ---
+            bundle_b = None
+            if cmp_spec is not None:
+                key_b = ("bundle", _spec_key(cmp_spec))
+                bundle_b = st.session_state.get(key_b)
+                if bundle_b is None:
+                    with st.spinner("Running comparator..."):
+                        bundle_b = BacktestEngine(cmp_spec).run()
+                    st.session_state[key_b] = bundle_b
+
+            # --- Attach comparator artifacts for display WITHOUT mutating cached bundle_a ---
+            display_bundle_a = bundle_a  # default
+
+            if bundle_b is not None:
+                sym = symbol  # same data in your compare mode
+                label_a = f"{base_spec.strategy.kind} | {sym}"
+                label_b = f"{cmp_spec.strategy.kind} | {sym}"
+
+                analyzer = ResultsAnalyzer(periods_per_year=base_spec.periods_per_year, rf_annual=base_spec.rf_annual)
+                comp = analyzer.compare(
+                    report_a=bundle_a.report,
+                    report_b=bundle_b.report,
+                    label_a=label_a,
+                    label_b=label_b,
+                )
+
+                # Make a deep copy of the WHOLE bundle for display
+                # (so we can mutate nested dicts safely)
+                display_key = ("bundle_display", _spec_key(base_spec), _spec_key(cmp_spec))
+                display_bundle_a = bundle_a
+                st.session_state[display_key] = display_bundle_a
+
+                # Now mutate the COPY's nested objects (allowed)
+                rep0 = display_bundle_a.report
+
+                # build new dicts without mutating frozen fields
+                new_meta = dict(getattr(rep0, "meta", None) or {})
+                new_meta["cum_compare_labels"] = {"a": label_a, "b": label_b}
+
+                new_plots = dict(getattr(rep0, "plots", None) or {})
+                new_plots["cum_vs_bench"] = comp["cum_plot"]
+
+                new_tables = dict(getattr(rep0, "tables", None) or {})
+                new_tables["curve_vs_comparator"] = comp["curve_table"]
+
+                # create a NEW report object (works even if frozen)
+                rep1 = replace(rep0, meta=new_meta, plots=new_plots, tables=new_tables)
+
+                # now update the BUNDLE with the new report (bundle may be frozen too)
+                try:
+                    display_bundle_a = replace(display_bundle_a, report=rep1)
+                except Exception:
+                    # if bundle is not a dataclass but a namedtuple or custom object:
+                    if hasattr(display_bundle_a, "_replace"):
+                        display_bundle_a = display_bundle_a._replace(report=rep1)
+                    else:
+                        # last resort: keep it in session and render using rep1 directly
+                        # (but your render_bundle expects bundle.report, so this is rarely needed)
+                        raise
+
+                st.session_state[display_key] = display_bundle_a
+
+
+            # --- Render ONLY ONCE: render the display bundle (copy if comparator on) ---
+            render_bundle(display_bundle_a, port_cfg=base_spec.portfolio, label="")
+
+
 
         finally:
             if tmp_is_temp and tmp_path and os.path.exists(tmp_path):
@@ -1680,9 +1776,9 @@ with tab_opt:
         apply_costs0 = st.checkbox("Apply costs", value=False, key="opt_apply_costs")
         if apply_costs0:
             brokerage_bps0 = st.number_input("Brokerage (bps)", value=60.0, step=1.0, key="opt_brok")
-            comm_bourse_bps0 = st.number_input("Exchange (bps)", value=10.0, step=1.0, key="opt_exch")
-            reg_liv_bps0 = st.number_input("Settlement (bps)", value=20.0, step=1.0, key="opt_settle")
-            tva_rate0 = st.number_input("tva rate", value=0.10, step=0.01, key="opt_tva")
+            comm_bourse_bps0 = st.number_input("Commission de la BdC (bps)", value=10.0, step=1.0, key="opt_exch")
+            reg_liv_bps0 = st.number_input("Frais Règlement-Livraison (bps)", value=20.0, step=1.0, key="opt_settle")
+            tva_rate0 = st.number_input("tva", value=0.10, step=0.01, key="opt_tva")
             slippage_bps0 = st.number_input("Slippage (bps)", value=0.0, step=1.0, key="opt_slip")
         else:
             brokerage_bps0 = comm_bourse_bps0 = reg_liv_bps0 = slippage_bps0 = 0.0
@@ -1933,7 +2029,55 @@ with tab_opt:
                     objective=batch_objective,
                 )
 
-                st.dataframe(df_batch.sort_values("objective_value", ascending=False), use_container_width=True)
+                df_batch_sorted = df_batch.sort_values("objective_value", ascending=False).reset_index(drop=True)
+                st.dataframe(df_batch_sorted, use_container_width=True)
+
+                if df_batch_sorted.empty:
+                    st.error("Batch optimization returned no results.")
+                    st.stop()
+
+                # ---- winner row ----
+                winner = df_batch_sorted.iloc[0]
+                st.subheader("Batch winner (best period + best params)")
+                st.json({
+                    "period": winner.get("period"),
+                    "start": winner.get("start"),
+                    "end": winner.get("end"),
+                    "objective": winner.get("objective"),
+                    "objective_value": float(winner.get("objective_value", np.nan)),
+                })
+
+                # ---- build winner spec (params + forced period) ----
+                # 1) apply params from row
+                winner_spec = build_spec_from_result_row(base_spec, winner)
+
+                # 2) FORCE the period start/end from the batch row (don’t rely on params)
+                winner_spec = replace(
+                    winner_spec,
+                    data=replace(
+                        winner_spec.data,
+                        start=str(winner.get("start")),
+                        end=str(winner.get("end")),
+                        include_windows=None,
+                        exclude_windows=None,
+                    )
+                )
+
+                # ---- backtest winner spec ----
+                st.divider()
+                with st.spinner("Backtesting batch winner..."):
+                    winner_bundle = BacktestEngine(winner_spec).run()
+
+                # Persist so the “loaded from session cache” section works
+                st.session_state["opt_best_spec"] = winner_spec
+                st.session_state["opt_best_bundle"] = winner_bundle
+                st.session_state["opt_top_df"] = df_batch_sorted
+                st.session_state["opt_best"] = None
+
+                render_bundle(winner_bundle, port_cfg=winner_spec.portfolio)
+
+                # CRITICAL: stop so the global run_optimization below doesn't overwrite the batch winner
+                st.stop()
 
             with st.spinner("Running optimization..."):
                 best, top_df, best_params, best_spec, ranked_df = run_optimization(
@@ -1941,11 +2085,108 @@ with tab_opt:
                     active_params=active_params,
                     cfg=opt_cfg,
                 )
-            st.session_state["opt_best"] = best
-            st.session_state["opt_top_df"] = top_df
-            st.session_state["opt_best_params"] = best_params
-            st.session_state["opt_best_spec"] = best_spec
-            st.success("Optimization finished")
+
+            # ✅ Run best main backtest NOW so we have `best_bundle` available for comparison
+            with st.spinner("Backtesting best main strategy..."):
+                best_bundle = BacktestEngine(best_spec).run()
+
+            st.session_state["opt_best_bundle"] = best_bundle  # keep your persistence
+            # =============================
+            # Best-vs-best comparator in OPTIMIZE
+            # =============================
+            cmp_best_spec = None
+            cmp_bundle = None
+
+            if compare_mode == "Another strategy (same data)" and compare_strategy_kind:
+                # 1) build comparator base spec (same data/portfolio, comparator strategy)
+                # You need baseline params for comparator; simplest: empty dict -> strategy defaults inside engine
+                cmp_strategy_params0 = {}  # TODO optionally build baseline UI per strategy kind
+
+                cmp_base_spec = make_base_spec(
+                    source_key=source_key,
+                    symbol=symbol,
+                    timezone=timezone,
+                    interval=interval,
+                    bmce_tmp_path=tmp_path,
+                    start=start_str,
+                    end=end_str,
+                    include_windows=include_windows,
+                    exclude_windows=exclude_windows,
+                    yf_period=yf_period,
+                    yf_interval=yf_interval,
+                    yf_auto_adjust=yf_auto_adjust,
+                    strategy_kind=str(compare_strategy_kind),
+                    strategy_params=cmp_strategy_params0,
+                    allow_short=bool(allow_short),
+                    initial_cash=float(initial_cash0),
+                    rebalance_policy=str(rebalance_policy0),
+                    sizing_mode=str(sizing_mode0),
+                    buy_pct_cash=float(buy0),
+                    sell_pct_shares=float(sell0),
+                    cooldown_bars=int(cooldown0),
+                    use_volume_gate=bool(use_volume_gate0),
+                    volume_gate_kind=str(volume_gate_kind0),
+                    min_volume_abs=float(min_volume_abs0),
+                    min_volume_ratio_adv=float(min_volume_ratio_adv0),
+                    volume_gate_adv_window=int(volume_gate_adv_window0),
+                    use_participation_cap=bool(use_participation_cap0),
+                    participation_rate=float(participation_rate0),
+                    participation_basis=str(participation_basis0),
+                    adv_window=int(adv_window0),
+                    cost_model=cost_model,
+                )
+
+                # 2) define which parameters to optimize for comparator strategy
+                cmp_catalog = default_param_catalog(str(compare_strategy_kind))
+
+                # simplest: optimize comparator "default_active" like you did for main
+                cmp_default_active = (
+                    ["strategy.sma_fast_window", "strategy.sma_slow_window"] if compare_strategy_kind == "ma_cross"
+                    else ["strategy.sma_window"] if compare_strategy_kind == "sma_price"
+                    else ["strategy.rsi_window", "strategy.rsi_oversold", "strategy.rsi_overbought"] if compare_strategy_kind == "rsi"
+                    else ["strategy.macd_fast_window", "strategy.macd_slow_window", "strategy.macd_signal_window"] if compare_strategy_kind == "macd"
+                    else ["strategy.bb_window", "strategy.bb_k"] if compare_strategy_kind == "bollinger"
+                    else []
+                )
+
+                cmp_active_params = []
+                for k in cmp_default_active:
+                    if k in cmp_catalog:
+                        p = cmp_catalog[k]
+                        if p.enabled and p.domain is not None and (p.kind != "date_window" or len(p.domain) > 0):
+                            cmp_active_params.append(p)
+
+                # 3) optimize comparator
+                with st.spinner("Optimizing comparator strategy (best-vs-best)..."):
+                    cmp_best, cmp_top_df, cmp_best_params, cmp_best_spec, cmp_ranked_df = run_optimization(
+                        base_spec=cmp_base_spec,
+                        active_params=cmp_active_params,
+                        cfg=opt_cfg,
+                    )
+
+                # 4) run backtest on BOTH best specs
+                with st.spinner("Backtesting best comparator..."):
+                    cmp_bundle = BacktestEngine(cmp_best_spec).run()
+
+                # 5) compare best-vs-best (same analyzer.compare you already wrote)
+                analyzer = ResultsAnalyzer(periods_per_year=base_spec.periods_per_year, rf_annual=base_spec.rf_annual)
+                comp = analyzer.compare(
+                    report_a=best_bundle.report,  # ✅ now defined
+                    report_b=cmp_bundle.report,
+                    label_a=f"{best_spec.strategy.kind} | {symbol}",
+                    label_b=f"{cmp_best_spec.strategy.kind} | {symbol}",
+                )
+
+                # inject into display bundle using replace() (frozen-safe)
+                rep0 = best_bundle.report
+                new_meta = dict(getattr(rep0, "meta", None) or {})
+                new_meta["cum_compare_labels"] = {"a": f"{best_spec.strategy.kind} | {symbol}", "b": f"{cmp_best_spec.strategy.kind} | {symbol}"}
+                new_plots = dict(getattr(rep0, "plots", None) or {})
+                new_plots["cum_vs_bench"] = comp["cum_plot"]
+                new_tables = dict(getattr(rep0, "tables", None) or {})
+                new_tables["curve_vs_comparator"] = comp["curve_table"]
+                best_bundle = replace(best_bundle, report=replace(rep0, meta=new_meta, plots=new_plots, tables=new_tables))
+
 
             st.subheader("Best result")
             st.json({
@@ -1991,10 +2232,20 @@ with tab_opt:
                     spec_i = build_spec_from_result_row(base_spec, row)
 
                     if st.button(f"Run backtest + ledger for {label} #{int(picked)+1}", key=f"{key_prefix}_run"):
-                        bndl = BacktestEngine(spec_i).run()
-                        st.dataframe(bndl.report.tables.get("trade_ledger", pd.DataFrame()), use_container_width=True)
-                        st.dataframe(bndl.report.tables.get("trades", pd.DataFrame()), use_container_width=True)
-                        st.dataframe(bndl.report.tables.get("trade_performance", pd.DataFrame()), use_container_width=True)
+                        bundle_a = BacktestEngine(spec_i).run()
+                        bundle_b = None
+                        if cmp_spec is not None:
+                            bundle_b = BacktestEngine(cmp_spec).run()
+
+                        st.dataframe(bundle_a.report.tables.get("trade_ledger", pd.DataFrame()), use_container_width=True)
+                        st.dataframe(bundle_a.report.tables.get("trades", pd.DataFrame()), use_container_width=True)
+                        st.dataframe(bundle_a.report.tables.get("trade_performance", pd.DataFrame()), use_container_width=True)
+
+                        if bundle_b is not None:
+                            st.subheader(f"Compare with {cmp_spec.strategy.kind}")
+                            st.dataframe(bundle_b.report.tables.get("trade_ledger", pd.DataFrame()), use_container_width=True)
+                            st.dataframe(bundle_b.report.tables.get("trades", pd.DataFrame()), use_container_width=True)
+                            st.dataframe(bundle_b.report.tables.get("trade_performance", pd.DataFrame()), use_container_width=True)
 
                 with tab_best:
                     _candidate_selector(ranked_df.head(1).reset_index(drop=True), "Best", "opt_best")
@@ -2010,6 +2261,44 @@ with tab_opt:
             # Auto-run the best configuration backtest (no extra button)
             with st.spinner("Running best backtest..."):
                 bundle = BacktestEngine(best_spec).run()
+                # ------------------------------------------------------------
+                # Attach comparator (Optimize tab)
+                # ------------------------------------------------------------
+                if compare_mode != "None":
+                    label_a = f"{best_spec.strategy.kind} | {symbol}"
+
+                    if compare_mode == "Buy & Hold (same data)":
+                        cmp_spec = EngineSpec(
+                            data=best_spec.data,
+                            indicators=best_spec.indicators,
+                            strategy=StrategyConfig(kind="buy_hold", params={"buy_pct_cash": 1.0}),
+                            portfolio=best_spec.portfolio,
+                            benchmark=BenchmarkConfig(enabled=False),
+                            plot_indicators=[],
+                            periods_per_year=best_spec.periods_per_year,
+                            rf_annual=best_spec.rf_annual,
+                        )
+                        with st.spinner("Backtesting buy&hold comparator..."):
+                            cmp_bundle = BacktestEngine(cmp_spec).run()
+
+                        bundle = attach_comparator_to_bundle(
+                            bundle, cmp_bundle,
+                            label_a=label_a,
+                            label_b=f"buy_hold | {symbol}",
+                            periods_per_year=best_spec.periods_per_year,
+                            rf_annual=best_spec.rf_annual,
+                        )
+
+                    elif compare_mode == "Another strategy (same data)":
+                        if (cmp_bundle is not None) and (cmp_best_spec is not None):
+                            bundle = attach_comparator_to_bundle(
+                                bundle, cmp_bundle,
+                                label_a=label_a,
+                                label_b=f"{cmp_best_spec.strategy.kind} | {symbol}",
+                                periods_per_year=best_spec.periods_per_year,
+                                rf_annual=best_spec.rf_annual,
+                            )
+
                 # ============================================================
                 # Optional: rebuild report with benchmark (no engine changes)
                 # ============================================================
@@ -2045,7 +2334,8 @@ with tab_opt:
                         )
 
                         # overwrite bundle.report so render_bundle() stays unchanged
-                        bundle.report = report
+                        bundle = replace(bundle, report=report)
+
 
                     except Exception as e:
                         st.warning(f"Benchmark could not be applied: {e}")
@@ -2060,7 +2350,7 @@ with tab_opt:
                 show_cols = [c for c in ["timestamp","symbol","side","qty","price","notional","cost","net_invested","cash_after"] if c in fills_df.columns]
                 st.dataframe(fills_df[show_cols], use_container_width=True)
 
-            render_bundle(bundle, port_cfg=best_spec.portfolio)
+            render_bundle(best_bundle, port_cfg=best_spec.portfolio)
 
         finally:
             if bench_is_temp and bench_tmp_path and os.path.exists(bench_tmp_path):

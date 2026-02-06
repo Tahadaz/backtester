@@ -157,6 +157,77 @@ class BaseStrategy(ABC):
         """
         raise NotImplementedError("on_bar not implemented for this strategy.")
 
+# --- Buy & Hold -------------------------------------------------
+
+@dataclass(frozen=True)
+class BuyHoldParams:
+    buy_pct_cash: float = 1.0
+    nan_policy: str = "flat"  # "flat" or "nan"
+
+
+class BuyHoldStrategy(BaseStrategy):
+    def __init__(self, params: BuyHoldParams) -> None:
+        self.params = params
+
+    @property
+    def spec(self) -> StrategySpec:
+        return StrategySpec(name="BuyHoldStrategy", params=asdict(self.params))
+
+    def required_features(self) -> List[FeatureSpec]:
+        # no indicators needed
+        return []
+
+    def generate_signals(
+        self,
+        market_data: MarketDataLike,
+        features_data: FeaturesDataLike,
+        symbols: Optional[Sequence[str]] = None,
+    ) -> SignalFrame:
+
+        symbols = list(symbols) if symbols is not None else list(market_data.bars.keys())
+
+        # build a common index (union) consistent with your other strategies
+        all_indexes = [market_data.bars[s].index for s in symbols]
+        common_index = all_indexes[0]
+        for idx in all_indexes[1:]:
+            common_index = common_index.union(idx)
+        common_index = common_index.sort_values()
+
+        sig_df = pd.DataFrame(index=common_index, columns=symbols, dtype="float64")
+        valid_df = pd.DataFrame(index=common_index, columns=symbols, dtype="bool")
+
+        buy_pct = float(self.params.buy_pct_cash)
+
+        for s in symbols:
+            bars = market_data.bars[s].reindex(common_index)
+            close = pd.to_numeric(bars["Close"], errors="coerce")
+
+            valid = close.notna()
+            out = pd.Series(0.0, index=common_index, dtype=float)
+
+            # buy once on first valid bar and hold
+            if valid.any():
+                first_idx = valid.idxmax()  # first True
+                out.loc[first_idx:] = 1.0 * buy_pct
+
+            if self.params.nan_policy == "flat":
+                out = out.where(valid, 0.0)
+            else:
+                out = out.where(valid, np.nan)
+
+            sig_df[s] = out
+            valid_df[s] = valid
+
+        meta = {
+            "strategy_signature": self.spec.signature(),
+            "strategy_name": self.spec.name,
+            "strategy_params": self.spec.params,
+            "required_features": [],
+        }
+
+        sf = SignalFrame(signals=sig_df, validity=valid_df, meta=meta)
+        sf.assert_well_formed(symbols)
+        return sf
 
 # =============================================================================
 # Concrete strategy: Moving Average Crossover (MA crossover)

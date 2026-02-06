@@ -1,14 +1,18 @@
-# engine.py
 from __future__ import annotations
 
 from data import YahooFinanceDataSource   # your class
 from data import MarketData
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Callable, Literal, Union
-
+import numpy as np
+import pandas as pd
 from pathlib import Path
-
-
+from dataclasses import replace
+import pandas as pd
+import copy
+from dataclasses import replace
+from typing import Any, Dict, List, Optional, Tuple
+import pandas as pd
 # ---- Project modules (adapt import paths if you have a package folder) ----
 from data import MarketData
 from data import BMCEDataSource
@@ -26,6 +30,9 @@ from strategy import (
     MACDParams,
     BollingerBandsStrategy,
     BollingerParams,
+    BuyHoldStrategy,
+    BuyHoldParams,
+
 )
 from portfolio import PortfolioEngine, PortfolioConfig, PortfolioResult
 from results import ResultsAnalyzer, BacktestReport
@@ -33,7 +40,35 @@ from strategy import default_plot_indicators  # add import
 
 
 DataSourceKind = Literal["bmce", "yfinance"]
-StrategyKind = Literal["ma_cross","sma_price", "rsi","macd","bollinger"]  # add more as you implement them'"]
+StrategyKind = Literal["ma_cross","sma_price", "rsi","macd","bollinger", "buy_hold"]  # add more as you implement them'"]
+def slice_df_by_start_end(df: pd.DataFrame, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if not isinstance(out.index, pd.DatetimeIndex):
+        out.index = pd.to_datetime(out.index, errors="coerce")
+    out = out.sort_index()
+    if start:
+        out = out.loc[pd.to_datetime(start):]
+    if end:
+        out = out.loc[:pd.to_datetime(end)]
+    return out
+
+
+def slice_marketdata(md: MarketData, start: Optional[str], end: Optional[str]) -> MarketData:
+    if md is None:
+        return md
+    new_bars = {sym: slice_df_by_start_end(df, start, end) for sym, df in md.bars.items()}
+    return MarketData(bars=new_bars, source=md.source, timezone=md.timezone, interval=md.interval)
+
+
+def slice_features(feats: FeaturesData, md: MarketData) -> FeaturesData:
+    # align feats strictly to md index per symbol
+    new = {}
+    for sym, bars in md.bars.items():
+        f = feats.features.get(sym, pd.DataFrame(index=bars.index))
+        new[sym] = f.reindex(bars.index)
+    return FeaturesData(features=new, source=feats.source, timezone=feats.timezone, interval=feats.interval, meta=feats.meta)
 
 # -----------------------------
 # Engine Spec Objects
@@ -246,9 +281,7 @@ def resolve_specs(ind_cfg: IndicatorsConfig, strat_cfg: StrategyConfig) -> List[
     # Generic: build the strategy and ask it
     strat = build_strategy(strat_cfg.kind, strat_cfg.params)
     specs = strat.required_features()
-    if not specs:
-        raise ValueError("Strategy.required_features returned empty list.")
-    return specs
+    return list(specs) if specs is not None else []
 
 
 # -----------------------------
@@ -304,6 +337,14 @@ def build_strategy(kind: str, params: Dict[str, Any]):
             nan_policy=str(params.get("nan_policy", "flat")),
         )
         return BollingerBandsStrategy(p)
+    
+    if k == "buy_hold":
+        p = BuyHoldParams(
+            buy_pct_cash=float(params.get("buy_pct_cash", 1.0)),
+            nan_policy=str(params.get("nan_policy", "flat")),
+        )
+        return BuyHoldStrategy(p)
+
 
     raise ValueError(f"Unknown strategy kind: {kind}")
 
@@ -386,62 +427,267 @@ def load_marketdata(cfg: DataConfig) -> MarketData:
     raise ValueError(f"Unknown data source: {cfg.source}")
 
 
+
+
+
+def _coerce_boundary_to_index_tz(idx: pd.DatetimeIndex, ts: pd.Timestamp) -> pd.Timestamp:
+    """Make boundary timestamp compatible with index timezone (tz-aware or tz-naive)."""
+    idx_tz = getattr(idx, "tz", None)
+
+    if idx_tz is None:
+        # index tz-naive
+        if getattr(ts, "tzinfo", None) is not None:
+            return ts.tz_convert(None)
+        return ts
+    else:
+        # index tz-aware
+        if getattr(ts, "tzinfo", None) is None:
+            return ts.tz_localize(idx_tz)
+        return ts.tz_convert(idx_tz)
+
+
+def _clean_dt_index(df: Any) -> Any:
+    """Ensure df is sorted by a DatetimeIndex and has no NaT index."""
+    if df is None or len(df) == 0:
+        return df
+
+    out = df.copy()
+    if not isinstance(out.index, pd.DatetimeIndex):
+        out.index = pd.to_datetime(out.index, errors="coerce")
+    out = out.sort_index()
+    out = out[~out.index.isna()]
+    return out
+
+
+def _apply_windows_mask(
+    df: Any,
+    include_windows: Optional[List[Tuple[str, str]]] = None,
+    exclude_windows: Optional[List[Tuple[str, str]]] = None,
+) -> Any:
+    """Apply include/exclude windows on a DatetimeIndex df."""
+    if df is None or len(df) == 0:
+        return df
+
+    out = _clean_dt_index(df)
+    idx = out.index
+
+    # Include mask
+    if include_windows:
+        m_inc = pd.Series(False, index=idx)
+        for s, e in include_windows:
+            s_dt = _coerce_boundary_to_index_tz(idx, pd.to_datetime(s))
+            e_dt = _coerce_boundary_to_index_tz(idx, pd.to_datetime(e))
+            m_inc |= (idx >= s_dt) & (idx <= e_dt)
+    else:
+        m_inc = pd.Series(True, index=idx)
+
+    # Exclude mask
+    if exclude_windows:
+        m_exc = pd.Series(False, index=idx)
+        for s, e in exclude_windows:
+            s_dt = _coerce_boundary_to_index_tz(idx, pd.to_datetime(s))
+            e_dt = _coerce_boundary_to_index_tz(idx, pd.to_datetime(e))
+            m_exc |= (idx >= s_dt) & (idx <= e_dt)
+    else:
+        m_exc = pd.Series(False, index=idx)
+
+    return out.loc[(m_inc & (~m_exc)).values]
+
+
+def slice_df_period(
+    df: Any,
+    start: Optional[str],
+    end: Optional[str],
+    include_windows: Optional[List[Tuple[str, str]]] = None,
+    exclude_windows: Optional[List[Tuple[str, str]]] = None,
+) -> Any:
+    """
+    Unified slicing:
+    - first clean/sort index
+    - then apply start/end slice (if provided)
+    - then apply include/exclude windows (if provided)
+    """
+    if df is None or len(df) == 0:
+        return df
+
+    out = _clean_dt_index(df)
+    idx = out.index
+
+    if start:
+        s = _coerce_boundary_to_index_tz(idx, pd.to_datetime(start))
+        out = out.loc[out.index >= s]
+        idx = out.index
+
+    if end:
+        e = _coerce_boundary_to_index_tz(idx, pd.to_datetime(end))
+        out = out.loc[out.index <= e]
+
+    out = _apply_windows_mask(out, include_windows=include_windows, exclude_windows=exclude_windows)
+    return out
+
+
+def slice_marketdata(
+    md,
+    start: Optional[str],
+    end: Optional[str],
+    include_windows: Optional[List[Tuple[str, str]]] = None,
+    exclude_windows: Optional[List[Tuple[str, str]]] = None,
+):
+    """Slice MarketData.bars per symbol with start/end and include/exclude windows."""
+    if md is None:
+        return md
+
+    new_bars: Dict[str, pd.DataFrame] = {}
+    for sym, bars in md.bars.items():
+        new_bars[sym] = slice_df_period(
+            bars,
+            start=start,
+            end=end,
+            include_windows=include_windows,
+            exclude_windows=exclude_windows,
+        )
+
+    # Preserve the same MarketData type you already use
+    return type(md)(
+        bars=new_bars,
+        source=getattr(md, "source", "unknown"),
+        timezone=getattr(md, "timezone", "unknown"),
+        interval=getattr(md, "interval", "unknown"),
+        meta=getattr(md, "meta", {}),
+    )
+
+
+def slice_features(feats_full, md_sliced):
+    """
+    Align features index to exactly the sliced md bars index per symbol.
+    This preserves indicator lookback effects because feats_full was computed on padded history,
+    but you only *expose* the test window downstream.
+    """
+    if feats_full is None:
+        return feats_full
+
+    new_feats: Dict[str, pd.DataFrame] = {}
+    for sym, bars in md_sliced.bars.items():
+        f = feats_full.features.get(sym)
+        if f is None:
+            new_feats[sym] = pd.DataFrame(index=bars.index)
+        else:
+            f = _clean_dt_index(f)
+            new_feats[sym] = f.reindex(bars.index)
+
+    return type(feats_full)(
+        features=new_feats,
+        source=getattr(feats_full, "source", "unknown"),
+        timezone=getattr(feats_full, "timezone", "unknown"),
+        interval=getattr(feats_full, "interval", "unknown"),
+        meta=getattr(feats_full, "meta", {}),
+    )
+
 # -----------------------------
 # Engine
 # -----------------------------
 class BacktestEngine:
-    """
-    Final orchestration layer:
-      MarketData -> FeaturesData -> SignalFrame -> PortfolioResult -> BacktestReport
-    """
-
     def __init__(self, spec: EngineSpec) -> None:
         self.spec = spec
 
     def run(self) -> BacktestBundle:
-        # 1) Data
-        md = load_marketdata(self.spec.data)
-        md = apply_period_filters(md, self.spec.data)
-        symbols = self.spec.data.symbols
-        # 2) Indicators
-        specs = resolve_specs(self.spec.indicators, self.spec.strategy)
-        ind = IndicatorEngine(
-            cache_dir=self.spec.indicators.cache_dir,
-            enable_disk_cache=self.spec.indicators.enable_disk_cache,
-            enable_memory_cache=self.spec.indicators.enable_memory_cache,
-            engine_version=self.spec.indicators.engine_version,
-        )
-        feats = ind.compute(md, specs=specs, symbols=symbols)
+        base_cfg = self.spec.data
+        symbols = base_cfg.symbols
 
-        # 3) Strategy
+        specs = resolve_specs(self.spec.indicators, self.spec.strategy)
+        max_warmup = int(max([getattr(s, "warmup", 0) or 0 for s in specs] + [0]))
+        pad_bars = max_warmup * 2
+
+        # ------------------------------------------------------------
+        # 0) Compute "effective" trade window start/end
+        #    If user did not specify start/end but did specify include_windows,
+        #    infer them so padding works.
+        # ------------------------------------------------------------
+        eff_start = base_cfg.start
+        eff_end = base_cfg.end
+
+        inc = getattr(base_cfg, "include_windows", None) or []
+        if (eff_start is None or eff_end is None) and inc:
+            starts = [pd.to_datetime(s) for s, _ in inc]
+            ends   = [pd.to_datetime(e) for _, e in inc]
+            if eff_start is None:
+                eff_start = min(starts).date().isoformat()
+            if eff_end is None:
+                eff_end = max(ends).date().isoformat()
+
+        # ------------------------------------------------------------
+        # 1) Build padded load config (based on effective start)
+        # ------------------------------------------------------------
+        load_cfg = base_cfg
+        if eff_start and pad_bars > 0:
+            start_dt = pd.to_datetime(eff_start)
+            load_start_dt = start_dt - pd.tseries.offsets.BDay(pad_bars)
+            load_cfg = replace(load_cfg, start=load_start_dt.date().isoformat())
+
+        # Ensure we load enough to cover effective end too
+        if eff_end:
+            load_cfg = replace(load_cfg, end=eff_end)
+
+        # 2) Load padded history
+        md_loaded = load_marketdata(load_cfg)
+
+        # ------------------------------------------------------------
+        # 3) Slice ONLY by padded start/end for indicator computation
+        #    IMPORTANT: do NOT apply include/exclude windows here.
+        # ------------------------------------------------------------
+        md_for_ind = slice_marketdata(
+            md_loaded,
+            start=load_cfg.start,
+            end=load_cfg.end,
+            include_windows=None,
+            exclude_windows=None,
+        )
+
+
+        # 4) Compute indicators on continuous padded history
+        if not specs:
+            feats_full = FeaturesData(
+                features={sym: pd.DataFrame(index=md_for_ind.bars[sym].index) for sym in symbols},
+                source=getattr(md_for_ind, "source", "unknown"),
+                timezone=getattr(md_for_ind, "timezone", "unknown"),
+                interval=getattr(md_for_ind, "interval", "unknown"),
+                meta={"specs": [], "engine_version": getattr(self.spec.indicators, "engine_version", "v1")},
+            )
+        else:
+            ind = IndicatorEngine(
+                cache_dir=self.spec.indicators.cache_dir,
+                enable_disk_cache=self.spec.indicators.enable_disk_cache,
+                enable_memory_cache=self.spec.indicators.enable_memory_cache,
+                engine_version=self.spec.indicators.engine_version,
+            )
+            feats_full = ind.compute(md_for_ind, specs=specs, symbols=symbols)
+
+        # ------------------------------------------------------------
+        # 5) Slice TRUE backtest window (effective start/end + include/exclude)
+        # ------------------------------------------------------------
+        md = slice_marketdata(
+            md_loaded,
+            start=eff_start,
+            end=eff_end,
+            include_windows=getattr(base_cfg, "include_windows", None),
+            exclude_windows=getattr(base_cfg, "exclude_windows", None),
+        )
+
+
+        # 5) Slice features to match md (so indicators keep lookback effects)
+        feats = slice_features(feats_full, md)
+
+        # 6) Strategy + Portfolio + Results
         strat = build_strategy(self.spec.strategy.kind, self.spec.strategy.params)
         sf = strat.generate_signals(md, feats, symbols=symbols)
 
-        # 4) Portfolio
         port = PortfolioEngine(self.spec.portfolio)
         pres = port.run(md, sf, symbols=symbols)
 
-        # inside BacktestEngine.run(), before calling ResultsAnalyzer.analyze(...)
-        bmd = None
-        bsym = None
-        if getattr(self.spec, "benchmark", None) and self.spec.benchmark.enabled:
-            bcfg = self.spec.benchmark
-            yds = YahooFinanceDataSource(timezone=self.spec.data.timezone)
-            bmd = yds.load(
-                symbols=[bcfg.symbol],
-                start=bcfg.start,
-                end=bcfg.end,
-                interval=bcfg.interval,
-                auto_adjust=bcfg.auto_adjust,
-                progress=False,
-            )
-            bsym = bcfg.symbol
+        plot_inds = self.spec.plot_indicators or default_plot_indicators(
+            self.spec.strategy.kind, self.spec.strategy.params
+        )
 
-        plot_inds = self.spec.plot_indicators
-        if not plot_inds:
-            plot_inds = default_plot_indicators(self.spec.strategy.kind, self.spec.strategy.params)
-
-        # 5) Results
         analyzer = ResultsAnalyzer(periods_per_year=self.spec.periods_per_year, rf_annual=self.spec.rf_annual)
         report = analyzer.analyze(
             pres,
@@ -449,55 +695,74 @@ class BacktestEngine:
             symbols=symbols,
             features_data=feats,
             plot_indicators=plot_inds,
-            benchmark_market_data=bmd,
-            benchmark_symbol=bsym,
+            benchmark_market_data=None,
+            benchmark_symbol=None,
         )
 
-        
-        meta = {
-            "symbols": symbols,
-            "data_source": self.spec.data.source,
-            "strategy_kind": self.spec.strategy.kind,
-            "indicator_names": [s.name or s.indicator for s in specs],
-            "portfolio": {k: v for k, v in self.spec.portfolio.__dict__.items() if k != "cost_model"},
-        }
-
-        return BacktestBundle(
-            md=md,
-            feats=feats,
-            signals=sf,
-            portfolio_result=pres,
-            report=report,
-            meta=meta,
-        )
+        return BacktestBundle(md=md, feats=feats, signals=sf, portfolio_result=pres, report=report, meta={})
 
 
+def estimate_warmup_bars_from_params(spec: EngineSpec, active_params: list) -> int:
+    """
+    Conservative warmup bars needed BEFORE the trade_start so indicators are valid on day 1.
+    Uses:
+      - strategy kind + params (current)
+      - optimizer search ranges if present in active_params
+      - portfolio windows (ADV, volume gate) if enabled
+    """
+    k = (spec.strategy.kind or "").lower()
+    p = spec.strategy.params or {}
 
+    # --- strategy warmup ---
+    warm = 0
 
+    def _max_in_paramdef(name: str, default: int) -> int:
+        # Try to find a ParamDef that matches this key and return its max candidate value.
+        # You may need to adapt depending on your ParamDef schema.
+        for pd_ in active_params:
+            if getattr(pd_, "key", None) == name:
+                # common patterns: pd_.values or (min,max,step)
+                if hasattr(pd_, "values") and pd_.values:
+                    return int(max(pd_.values))
+                if hasattr(pd_, "max"):
+                    return int(pd_.max)
+        return int(default)
 
-"""
-TEXT EXPLANATION (for Cursor review)
+    if k == "ma_cross":
+        # warmup is slow SMA window
+        slow = int(p.get("sma_slow_window", p.get("slow_window", 50)))
+        slow = _max_in_paramdef("strategy.sma_slow_window", slow)
+        warm = max(warm, slow)
 
-What this engine layer does:
-- It is the final orchestration layer after data.py, indicators.py, strategy.py, portfolio.py, results.py.
-- You provide an EngineSpec that includes:
-  - DataConfig: symbol(s), and whether data comes from BMCE (file paths) or yfinance
-  - IndicatorsConfig: FeatureSpec list (or builder), otherwise inferred from strategy kind
-  - StrategyConfig: which strategy to use (currently MA cross) and its parameters
-  - PortfolioConfig: execution/accounting configuration (already implemented in portfolio.py)
-- The engine then runs:
-  MarketData -> IndicatorEngine.compute -> Strategy.generate_signals -> PortfolioEngine.run -> ResultsAnalyzer.analyze
-- It returns a BacktestBundle containing intermediate artifacts (MarketData, FeaturesData, SignalFrame)
-  plus final outputs (PortfolioResult and BacktestReport).
+    elif k in ("sma_price", "price_sma", "price_above_sma"):
+        w = int(p.get("sma_window", p.get("window", 50)))
+        w = _max_in_paramdef("strategy.sma_window", w)
+        warm = max(warm, w)
 
-BMCE integration:
-- Your BMCEDataSource provides _load_impl(...) and _read_one_file(...).
-- This engine assumes BaseDataSource exposes a public `load(...)` that calls _load_impl internally.
-- If BaseDataSource uses another public method name, you only change the one line:
-    bars = ds.load(...)
-  to bars = ds.<actual_method>(...).
+    elif k == "rsi":
+        n = int(p.get("rsi_window", p.get("period", 14)))
+        n = _max_in_paramdef("strategy.rsi_window", n)
+        warm = max(warm, n)
 
-Indicator inference:
-- For strategy 'ma_cross', the engine auto-builds two FeatureSpec objects with indicator='sma'
-  and name='sma_{window}' to match MovingAverageCrossStrategy.
-"""
+    elif k == "macd":
+        slow = int(p.get("macd_slow_window", p.get("slow", 26)))
+        sig  = int(p.get("macd_signal_window", p.get("signal", 9)))
+        slow = _max_in_paramdef("strategy.macd_slow_window", slow)
+        sig  = _max_in_paramdef("strategy.macd_signal_window", sig)
+        warm = max(warm, slow + sig)  # matches your MACDStrategy conservative warmup
+
+    elif k == "bollinger":
+        w = int(p.get("bb_window", 20))
+        w = _max_in_paramdef("strategy.bb_window", w)
+        warm = max(warm, w)
+
+    # --- portfolio warmup (ADV windows) ---
+    port = spec.portfolio
+    if getattr(port, "use_participation_cap", False) and str(getattr(port, "participation_basis", "")) == "adv":
+        warm = max(warm, int(getattr(port, "adv_window", 1) or 1))
+    if getattr(port, "use_volume_gate", False) and str(getattr(port, "volume_gate_kind", "")) == "min_ratio_adv":
+        warm = max(warm, int(getattr(port, "volume_gate_adv_window", 1) or 1))
+
+    # give a small cushion
+    return int(warm + 5)
+
