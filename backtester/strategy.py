@@ -489,7 +489,7 @@ class PriceAboveSMAStrategy(BaseStrategy):
 
 @dataclass(frozen=True)
 class RSIParams:
-    period: int = 14
+    period: int = 12
     low: float = 30.0
     high: float = 70.0
     mode: str = "reversal"   # "reversal" or "momentum"
@@ -582,7 +582,7 @@ class MACDParams:
     fast: int = 12
     slow: int = 26
     signal: int = 9
-    trigger: str = "cross"   # "cross" or "zero"
+    trigger: str = "zero"   # "cross" or "zero"
     allow_short: bool = False
     nan_policy: str = "flat"
 
@@ -645,11 +645,28 @@ class MACDStrategy(BaseStrategy):
             out = pd.Series(0.0, index=common_index, dtype=float)
 
             if self.params.trigger == "cross":
-                out[line > sigl] = 1.0
-                out[line < sigl] = -1.0
+                prev_line = line.shift(1)
+                prev_sigl = sigl.shift(1)
+
+                buy = (line > sigl) & (prev_line <= prev_sigl)   # cross up
+                sell = (line < sigl) & (prev_line >= prev_sigl)  # cross down
+
+                out[:] = 0.0
+                out[buy] = 1.0
+                out[sell] = -1.0
+
             else:  # "zero"
                 out[line > 0.0] = 1.0
                 out[line < 0.0] = -1.0
+                prev_line = line.shift(1)
+                prev_sigl = sigl.shift(1)
+
+                buy = (line > 0.0) & (prev_line <= 0)   # cross up
+                sell = (line < 0.0) & (prev_line >= 0)  # cross down
+
+                out[:] = 0.0
+                out[buy] = 1.0
+                out[sell] = -1.0
 
             if self.params.nan_policy == "flat":
                 out = out.where(valid, 0.0)

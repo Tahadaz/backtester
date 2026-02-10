@@ -621,102 +621,59 @@ def plot_price_indicators_trades_line(
 
     # ---- MACD panel ----
     if has_macd and macd_base is not None:
-        # parse fast/slow/signal from base: macd_{fast}_{slow}_{sig}
-        # defensive parsing (if naming deviates, we still try to plot using available cols)
-        fast = slow = sig = None
-        try:
-            parts = macd_base.split("_")
-            # ["macd", fast, slow, sig]
-            if len(parts) >= 4:
-                fast = int(parts[1])
-                slow = int(parts[2])
-                sig = int(parts[3])
-        except Exception:
-            fast = slow = sig = None
+        line_col = f"{macd_base}__line"
+        sig_col  = f"{macd_base}__signal"
+        hist_col = f"{macd_base}__hist"
 
-        close = df["Close"].astype(float)
+        line = pd.to_numeric(ind.get(line_col), errors="coerce")
+        sigl = pd.to_numeric(ind.get(sig_col), errors="coerce")
 
-        # compute EMA fast/slow so you can see both EMAs (as requested)
-        if fast is not None and slow is not None and fast > 0 and slow > 0:
-            ema_fast = close.ewm(span=fast, adjust=False, min_periods=fast).mean()
-            ema_slow = close.ewm(span=slow, adjust=False, min_periods=slow).mean()
-            diff = ema_fast - ema_slow
+        # histogram: prefer __hist if you have it, else line - signal
+        if hist_col in ind.columns:
+            hist = pd.to_numeric(ind[hist_col], errors="coerce")
         else:
-            # fallback: use MACD line as "diff" and plot only what we can
-            ema_fast = ema_slow = None
-            line_col = f"{macd_base}__line"
-            diff = pd.to_numeric(ind[line_col], errors="coerce") if (ind is not None and line_col in ind.columns) else close * np.nan
+            hist = line - sigl
 
-        # EMA lines (if available)
-        if ema_fast is not None and ema_slow is not None:
-            fig.add_trace(
-                go.Scatter(x=df.index, y=ema_fast, mode="lines", name=f"EMA{fast}"),
-                row=cur_row, col=1, secondary_y=False
-            )
-            fig.add_trace(
-                go.Scatter(x=df.index, y=ema_slow, mode="lines", name=f"EMA{slow}"),
-                row=cur_row, col=1, secondary_y=False
-)
+        # MACD line + signal line (PRIMARY y)
+        fig.add_trace(
+            go.Scatter(x=df.index, y=line, mode="lines", name=f"{macd_base} line"),
+            row=cur_row, col=1, secondary_y=False
+        )
+        fig.add_trace(
+            go.Scatter(x=df.index, y=sigl, mode="lines", name=f"{macd_base} signal"),
+            row=cur_row, col=1, secondary_y=False
+        )
 
-        # Histogram colors with intensity
-        hist = pd.to_numeric(diff, errors="coerce").fillna(0.0).astype(float)
-        max_abs = float(np.nanmax(np.abs(hist.values))) if np.isfinite(hist.values).any() else 1.0
-        if max_abs <= 0:
-            max_abs = 1.0
-
-        def _bar_color(v: float) -> str:
-            """
-            Greenish when positive (more intense for larger positives),
-            red when negative (more intense for larger negatives).
-            Output is rgba string.
-            """
-            a = min(1.0, abs(v) / max_abs)  # 0..1
-            # intensity factor: start light and get darker/stronger
-            # positive -> greener; negative -> redder
-            if v >= 0:
-                # light green -> strong green
-                r = int(220 - 140 * a)
-                g = int(230 - 20 * a)
-                b = int(220 - 160 * a)
-            else:
-                # light red -> strong red
-                r = int(230 - 20 * a)
-                g = int(220 - 150 * a)
-                b = int(220 - 150 * a)
-            return f"rgba({r},{g},{b},0.95)"
-
-        colors = [_bar_color(v) for v in hist.values]
+        # Histogram bars (SECONDARY y)
+        h = hist.fillna(0.0).astype(float)
+        bar_colors = np.where(h >= 0, "rgba(0,180,0,0.6)", "rgba(200,0,0,0.6)")
 
         fig.add_trace(
             go.Bar(
                 x=df.index,
-                y=hist.values,
-                name=f"{macd_base} hist (EMAfast-EMAslow)",
-                marker=dict(color=colors),
-                opacity=0.95,
+                y=h.values,
+                name=f"{macd_base} hist",
+                marker=dict(color=bar_colors),
             ),
             row=cur_row, col=1, secondary_y=True
         )
 
+        # Zero line on histogram axis (SECONDARY y)
         fig.add_trace(
             go.Scatter(
                 x=df.index,
                 y=np.zeros(len(df.index)),
                 mode="lines",
-                name="0",
                 showlegend=False,
             ),
             row=cur_row, col=1, secondary_y=True
         )
 
-
-        # Zero line to make sign changes obvious
-        fig.add_hline(y=0.0, line_width=1, line_dash="solid", row=cur_row, col=1)
-
-        fig.update_yaxes(title_text="EMAs", row=cur_row, col=1, secondary_y=False)
-        fig.update_yaxes(title_text="Diff", row=cur_row, col=1, secondary_y=True)
+        fig.update_yaxes(title_text="MACD", row=cur_row, col=1, secondary_y=False)
+        fig.update_yaxes(title_text="Hist", row=cur_row, col=1, secondary_y=True)
 
         cur_row += 1
+
 
     # =========================
     # Last Row: Volume + Gate/Cap
@@ -1080,6 +1037,7 @@ def make_base_spec(
         sizing_mode=str(sizing_mode),
         buy_pct_cash=float(buy_pct_cash),
         sell_pct_shares=float(sell_pct_shares),
+        min_return_before_sell=float(min_return_before_sell),
         cooldown_bars=int(cooldown_bars),
         use_volume_gate=bool(use_volume_gate),
         volume_gate_kind=str(volume_gate_kind),
@@ -1467,6 +1425,11 @@ with tab_backtest:
         st.markdown("### Sizing (percentages)")
         buy_pct_cash = st.slider("Buy % of cash per entry", 0.01, 1.00, 0.25, 0.01)
         sell_pct_shares = st.slider("Sell % of shares per exit", 0.01, 1.00, 1.00, 0.01)
+        min_return_before_sell = st.slider(
+            "Min return before selling (take-profit, %)",
+            0.0, 50.0, 0.0, 0.1
+        ) / 100.0
+
 
         st.markdown("### Liquidity / Volume")
 

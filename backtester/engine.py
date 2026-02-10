@@ -680,6 +680,32 @@ class BacktestEngine:
         # 6) Strategy + Portfolio + Results
         strat = build_strategy(self.spec.strategy.kind, self.spec.strategy.params)
         sf = strat.generate_signals(md, feats, symbols=symbols)
+        
+        # --- MACD-only debug (guarded) ---
+        if str(self.spec.strategy.kind).lower() == "macd":
+            sym = symbols[0]
+            sp = (self.spec.strategy.params or {})
+            fast = int(sp.get("fast", sp.get("macd_fast_window", 12)))
+            slow = int(sp.get("slow", sp.get("macd_slow_window", 26)))
+            sig_win = int(sp.get("signal", sp.get("macd_signal_window", 9)))
+
+            base = f"macd_{fast}_{slow}_{sig_win}"
+
+            # safer access + better error message
+            cols = feats.features[sym].columns
+            if f"{base}__line" not in cols or f"{base}__signal" not in cols:
+                raise KeyError(
+                    f"Expected MACD columns not found: {base}__line / {base}__signal. "
+                    f"Available macd cols: {[c for c in cols if c.startswith('macd_')][:30]}"
+                )
+
+            line = feats.features[sym][f"{base}__line"]
+            sigl = feats.features[sym][f"{base}__signal"]
+            hist = line - sigl
+
+
+
+
 
         port = PortfolioEngine(self.spec.portfolio)
         pres = port.run(md, sf, symbols=symbols)

@@ -136,6 +136,7 @@ class PortfolioConfig:
 
     cooldown_bars: int = 0
 
+    min_return_before_sell: float = 0.0
 
 
     def __post_init__(self) -> None:
@@ -162,6 +163,10 @@ class PortfolioConfig:
 
         if float(self.min_volume_ratio_adv) < 0.0:
             raise ValueError("min_volume_ratio_adv must be >= 0.")
+        
+        if float(self.min_return_before_sell) < 0.0:
+            raise ValueError("min_return_before_sell must be >= 0.0 (decimal).")
+
 
 
 
@@ -184,6 +189,10 @@ class PortfolioState:
     cash: float
     positions: Dict[str, int] = field(default_factory=dict)
 
+    # NEW: average entry cost per share for the current LONG position
+    # (includes buy-side transaction costs allocated per share)
+    avg_costs: Dict[str, float] = field(default_factory=dict)
+
     def position(self, symbol: str) -> int:
         return int(self.positions.get(symbol, 0))
 
@@ -192,25 +201,48 @@ class PortfolioState:
 
     def apply_fill(self, fill: Fill) -> None:
         """
-        Update cash and position for a fill.
-        Convention:
+        Update cash, position, and avg_cost for long positions.
+        Convention (same as your current code):
           - Buy qty>0: cash decreases by qty*price + cost
           - Sell qty<0: cash increases by |qty|*price - cost
         """
-        signed_cash_flow = -fill.qty * float(fill.price)  # buy -> negative cash flow
+        sym = fill.symbol
+        qty = int(fill.qty)
+        price = float(fill.price)
+        cost = float(fill.cost)
+
+        # ---- cash update (keep your convention) ----
+        signed_cash_flow = -qty * price
         self.cash += signed_cash_flow
-        self.cash -= float(fill.cost)
-        self.positions[fill.symbol] = self.position(fill.symbol) + int(fill.qty)
+        self.cash -= cost
+
+        # ---- position update ----
+        old_pos = self.position(sym)
+        new_pos = old_pos + qty
+        self.positions[sym] = int(new_pos)
+
+        # ---- avg_cost update (LONG-only) ----
+        old_avg = float(self.avg_costs.get(sym, 0.0))
+
+        if qty > 0:
+            # Buying more: update weighted average cost, include buy-side cost
+            old_total_cost = old_avg * max(old_pos, 0)
+            buy_total_cost = qty * price + cost
+            denom = max(old_pos, 0) + qty
+            self.avg_costs[sym] = (old_total_cost + buy_total_cost) / float(denom) if denom > 0 else 0.0
+
+        elif qty < 0:
+            # Selling: keep avg_cost for remaining shares; reset when flat or short
+            if new_pos <= 0:
+                self.avg_costs[sym] = 0.0
 
     def mark_to_market(self, close_prices: Dict[str, float]) -> float:
-        """
-        Compute equity = cash + sum(qty * close).
-        """
         equity = float(self.cash)
         for sym, qty in self.positions.items():
             if sym in close_prices:
                 equity += int(qty) * float(close_prices[sym])
         return equity
+
 
 
 @dataclass
@@ -241,162 +273,167 @@ class PortfolioEngine:
         signal_frame: Any,  # SignalFrame
         symbols: Optional[Sequence[str]] = None,
     ) -> PortfolioResult:
+        """
+        Execution semantics:
+        - decide at t using SignalFrame
+        - execute fills at open(t+1)
+        - mark-to-market at close(t+1)
+
+        Notes:
+        - This implementation assumes "pct_cash_shares" / discrete intent signals (+1 buy, -1 sell, 0 hold).
+        - target_weight mode is intentionally not used here.
+        """
+        prev_sig: Dict[str, float] = {s: 0.0 for s in symbols}
+
+
         symbols = list(symbols) if symbols is not None else list(signal_frame.signals.columns)
 
-        # Validate data availability
+        # -----------------------------
+        # 0) Validate market_data
+        # -----------------------------
         for s in symbols:
             if s not in market_data.bars:
-                raise KeyError(f"MarketData missing symbol '{s}'. Available: {list(market_data.bars.keys())}")
+                raise KeyError(
+                    f"MarketData missing symbol '{s}'. Available: {list(market_data.bars.keys())}"
+                )
             bars = market_data.bars[s]
             for col in (self.cfg.open_col, self.cfg.close_col):
                 if col not in bars.columns:
-                    raise KeyError(f"Bars for '{s}' missing required column '{col}'. Columns: {list(bars.columns)}")
+                    raise KeyError(
+                        f"Bars for '{s}' missing required column '{col}'. Columns: {list(bars.columns)}"
+                    )
 
-        # Align index: we drive by signals index, but require bars contain t+1 open/close for fills/mtm
+        # -----------------------------
+        # 1) Drive index by signals; require t+1 exists
+        # -----------------------------
         idx = pd.Index(signal_frame.signals.index).sort_values()
         if len(idx) < 2:
             raise ValueError("Need at least 2 timestamps to apply t+1 fill semantics.")
 
+        # Align each symbol's bars to signals index once (robust against missing days / tz issues)
+        bars_aligned: Dict[str, pd.DataFrame] = {}
+        for s in symbols:
+            bars_aligned[s] = market_data.bars[s].reindex(idx)
+
+        # -----------------------------
+        # 2) Initialize state & outputs
+        # -----------------------------
         state = PortfolioState(cash=float(self.cfg.initial_cash), positions={s: 0 for s in symbols})
 
         fills: List[Fill] = []
         equity_points: List[Tuple[pd.Timestamp, float]] = []
         pos_hist: List[Tuple[pd.Timestamp, Dict[str, int]]] = []
 
-        prev_target_weights: Optional[Dict[str, float]] = None
-
-        last_trade_i: Dict[str, int] = {s: -10**9 for s in symbols}  # bar index of last executed trade per symbol
+        last_trade_i: Dict[str, int] = {s: -10**9 for s in symbols}
         cooldown = int(getattr(self.cfg, "cooldown_bars", 0) or 0)
 
         # -----------------------------
-        # Precompute volume and any ADV series we need
+        # 3) Precompute volume + ADV if needed
         # -----------------------------
-        need_volume = bool(self.cfg.use_participation_cap or self.cfg.use_volume_gate)
+        need_volume = bool(getattr(self.cfg, "use_participation_cap", False) or getattr(self.cfg, "use_volume_gate", False))
 
         vol_series: Dict[str, pd.Series] = {}
-        adv_by_window: Dict[int, Dict[str, pd.Series]] = {}  # window -> (symbol -> ADV series)
+        adv_by_window: Dict[int, Dict[str, pd.Series]] = {}
 
         if need_volume:
-            # Determine which ADV windows are required
             adv_windows: List[int] = []
 
-            if self.cfg.use_participation_cap and str(self.cfg.participation_basis) == "adv":
+            if getattr(self.cfg, "use_participation_cap", False) and str(getattr(self.cfg, "participation_basis", "")) == "adv":
                 adv_windows.append(int(self.cfg.adv_window))
 
-            if self.cfg.use_volume_gate and str(self.cfg.volume_gate_kind) == "min_ratio_adv":
+            if getattr(self.cfg, "use_volume_gate", False) and str(getattr(self.cfg, "volume_gate_kind", "")) == "min_ratio_adv":
                 adv_windows.append(int(self.cfg.volume_gate_adv_window))
 
-            # Unique + sorted windows
             adv_windows = sorted(set(w for w in adv_windows if w >= 1))
 
             for s in symbols:
-                bars = market_data.bars[s]
+                bars = bars_aligned[s]
                 if self.cfg.volume_col not in bars.columns:
                     raise KeyError(
                         f"Bars for '{s}' missing required volume column '{self.cfg.volume_col}'. "
                         f"Columns: {list(bars.columns)}"
                     )
-
-                v = pd.to_numeric(bars[self.cfg.volume_col], errors="coerce").astype("float64")
-                v = v.reindex(idx).fillna(0.0)
+                v = pd.to_numeric(bars[self.cfg.volume_col], errors="coerce").astype("float64").fillna(0.0)
                 vol_series[s] = v
 
-            # Precompute all ADV series needed (per window, per symbol)
             for w in adv_windows:
                 adv_by_window[w] = {}
                 for s in symbols:
                     adv_by_window[w][s] = vol_series[s].rolling(w, min_periods=1).mean()
 
-
-
-        # iterate up to second last timestamp because we fill at t+1
+        # -----------------------------
+        # 4) Main loop (fill at t+1)
+        # -----------------------------
         for i in range(len(idx) - 1):
             t = pd.Timestamp(idx[i])
             t1 = pd.Timestamp(idx[i + 1])
 
-            # 1) Extract signals at time t
+            # 4.1) Signals at time t (discrete intent: +1 buy, -1 sell, 0 hold)
             sig_row = signal_frame.signals.loc[t, symbols]
+            # gate to only act on change
+            sig_row = sig_row.copy()
+            for s in symbols:
+                if float(sig_row[s]) == float(prev_sig[s]):
+                    sig_row[s] = 0.0  # ignore repeated regime signal
+                prev_sig[s] = float(signal_frame.signals.loc[t, s])  # update with raw
+
             if hasattr(signal_frame, "validity") and signal_frame.validity is not None:
                 valid_row = signal_frame.validity.loc[t, symbols]
             else:
                 valid_row = pd.Series(True, index=symbols)
 
-            # Replace invalid with 0 intent (flat) to preserve safety
+            # Invalid -> flat (0)
             sig_row = sig_row.where(valid_row.astype(bool), 0.0).astype(float)
 
-            # 2) Compute prices at t+1 open/close (fill at open(t+1), mtm at close(t+1))
-            open_t1 = {s: float(market_data.bars[s].loc[t1, self.cfg.open_col]) for s in symbols}
-            close_t1 = {s: float(market_data.bars[s].loc[t1, self.cfg.close_col]) for s in symbols}
+            # 4.2) Prices at t+1 (strict: must exist)
+            open_t1: Dict[str, float] = {}
+            close_t1: Dict[str, float] = {}
 
-            # 3) Compute equity BEFORE trading at t+1 (marking prior holdings at close(t))
-            # For simplicity in daily bars, we size using equity marked at close(t) approximated by close(t1)?.
-            # We avoid lookahead by sizing using equity based on latest known state cash + positions marked at close(t).
-            # If you want exact, pass close(t) prices from bars; for now we use close(t) if available else close(t1) fallback.
+            for s in symbols:
+                b = bars_aligned[s]
+                o = b.at[t1, self.cfg.open_col] if t1 in b.index else np.nan
+                c = b.at[t1, self.cfg.close_col] if t1 in b.index else np.nan
+                if not (pd.notna(o) and pd.notna(c)):
+                    raise KeyError(f"Missing {s} open/close at {t1} after aligning bars to signals index.")
+                open_t1[s] = float(o)
+                close_t1[s] = float(c)
+
+            # 4.3) Equity at close(t) for sizing (no lookahead)
             close_t = self._get_close_t(market_data, symbols, t, fallback=close_t1)
             equity_t = state.mark_to_market(close_t)
 
-            # 4) Target generation: signals -> target weights
-            target_weights = self._signals_to_target_weights(sig_row, symbols)
+            # 4.4) Generate desired deltas from discrete signals (+1 buy, -1 sell)
+            # (This is your app's convention; target_weight mode is not used.)
+            orders = self._deltas_pct_cash_shares(sig_row, state, open_t1, equity_t, symbols)
 
-            # 5) Rebalance policy
-            if self.cfg.rebalance_policy == "on_change" and prev_target_weights is not None:
-                if self._weights_equal(prev_target_weights, target_weights):
-                    # no rebalance; still mark-to-market at t+1
-                    equity_t1 = state.mark_to_market(close_t1)
-                    equity_points.append((t1, equity_t1))
-                    pos_hist.append((t1, dict(state.positions)))
-                    continue
-
-            if self.cfg.sizing_mode == "target_weight":
-                # --- existing behavior ---
-                target_weights = self._apply_constraints(target_weights)
-                investable_equity = equity_t * (1.0 - float(self.cfg.cash_buffer))
-                target_shares = self._weights_to_shares(target_weights, open_t1, investable_equity)
-
-                orders = []
-                for s in symbols:
-                    current = state.position(s)
-                    desired = int(target_shares.get(s, 0))
-                    delta = desired - current
-                    if delta != 0:
-                        orders.append((s, int(delta)))
-
-            else:
-                # --- new per-trade sizing behavior ---
-                orders = self._deltas_pct_cash_shares(sig_row, state, open_t1, equity_t, symbols)
-            # --- cooldown filter: block trades if too soon since last trade ---
+            # 4.5) Cooldown filter
             if cooldown > 0 and orders:
                 filtered = []
                 for s, delta in orders:
                     if delta == 0:
                         continue
-                    # trade executes at t1 which corresponds to loop index i+1
+                    # trade executes at t1 -> loop index i+1
                     if (i + 1) - last_trade_i.get(s, -10**9) < cooldown:
-                        continue  # skip trade for this symbol due to cooldown
-                    filtered.append((s, delta))
+                        continue
+                    filtered.append((s, int(delta)))
                 orders = filtered
-            # -----------------------------
-            # Layer 1: volume gate (option)
-            # -----------------------------
-            if self.cfg.use_volume_gate and orders:
+
+            # 4.6) Volume gate (entry-only; for long-only treat delta>0 as entry)
+            if getattr(self.cfg, "use_volume_gate", False) and orders:
                 gated = []
                 for s, delta in orders:
                     if delta == 0:
                         continue
 
-                    # ENTRY-ONLY gating:
-                    # - If delta increases exposure in the direction of the signal, treat as entry.
-                    # - Simpler proxy: gate buys only (delta > 0) for long-only.
-                    is_entry = (delta > 0)  # adjust if you allow short entries too
-
+                    is_entry = (delta > 0)
                     if not is_entry:
                         gated.append((s, delta))
                         continue
 
-                    v_t1 = float(vol_series[s].loc[t1])
+                    v_t1 = float(vol_series[s].loc[t1]) if need_volume else 0.0
 
                     ok = True
-                    if self.cfg.volume_gate_kind == "min_abs":
+                    if str(getattr(self.cfg, "volume_gate_kind", "")) == "min_abs":
                         ok = v_t1 >= float(self.cfg.min_volume_abs)
                     else:
                         w = int(self.cfg.volume_gate_adv_window)
@@ -405,37 +442,28 @@ class PortfolioEngine:
 
                     if ok:
                         gated.append((s, delta))
-                    # else: skip this order entirely
-
                 orders = gated
 
-
-            # Execute orders at open(t+1)
+            # 4.7) Execute orders at open(t+1), with optional participation cap
             for s, delta in orders:
+                delta = int(delta)
                 if delta == 0:
                     continue
-                # -----------------------------
-                # Layer 3: participation cap (volume-constrained fills)
-                # -----------------------------
-                if self.cfg.use_participation_cap:
-                    # determine liquidity basis at t1
-                    if self.cfg.participation_basis == "bar":
+
+                # Participation cap (volume-constrained fills)
+                if getattr(self.cfg, "use_participation_cap", False):
+                    if str(getattr(self.cfg, "participation_basis", "")) == "bar":
                         liq_vol = float(vol_series[s].loc[t1])
                     else:
                         w = int(self.cfg.adv_window)
                         liq_vol = float(adv_by_window[w][s].loc[t1])
 
                     max_fill = int(max(0.0, float(self.cfg.participation_rate) * liq_vol))
-
-                    # If max_fill is 0, you cannot trade this bar
                     if max_fill <= 0:
                         continue
 
-                    # Cap absolute shares
-                    abs_delta = abs(int(delta))
+                    abs_delta = abs(delta)
                     if abs_delta > max_fill:
-                        # Simple mode: cancel remainder
-                        # (carry_unfilled will be handled later if you choose)
                         delta = int(np.sign(delta) * max_fill)
                         if delta == 0:
                             continue
@@ -443,7 +471,9 @@ class PortfolioEngine:
                 fill_price = float(open_t1[s])
                 notional = abs(delta) * fill_price
                 cost, breakdown = self.cfg.cost_model.estimate_cost(notional)
+
                 last_trade_i[s] = i + 1
+
                 f = Fill(
                     timestamp=t1,
                     symbol=s,
@@ -456,15 +486,14 @@ class PortfolioEngine:
                 state.apply_fill(f)
                 fills.append(f)
 
-
-            # 9) Mark-to-market at close(t+1) (your requested convention)
+            # 4.8) MTM at close(t+1)
             equity_t1 = state.mark_to_market(close_t1)
             equity_points.append((t1, equity_t1))
             pos_hist.append((t1, dict(state.positions)))
-
-            prev_target_weights = dict(target_weights)
-
-        # Build outputs
+        
+        # -----------------------------
+        # 5) Build outputs
+        # -----------------------------
         equity_curve = pd.Series(
             [v for _, v in equity_points],
             index=pd.Index([ts for ts, _ in equity_points], name="timestamp"),
@@ -484,6 +513,7 @@ class PortfolioEngine:
                 "constraints": "max_gross always applied; per-asset cap and cash_buffer optional",
             },
         }
+
         return PortfolioResult(
             equity_curve=equity_curve,
             returns=returns,
@@ -491,7 +521,7 @@ class PortfolioEngine:
             trades=trades,
             meta=meta,
         )
-    # portfolio.py  (inside class PortfolioEngine)
+
 
     def run_stats_only_arrays(
         self,
@@ -988,6 +1018,17 @@ class PortfolioEngine:
             if sig == -1.0:
                 if pos <= 0:
                     continue
+
+                min_ret = float(getattr(self.cfg, "min_return_before_sell", 0.0) or 0.0)
+                if min_ret > 0.0:
+                    avg_cost = float(state.avg_costs.get(s, 0.0))
+                    if avg_cost > 0.0:
+                        # SELL ONLY IF open(t+1) >= avg_cost * (1 + min_ret)
+                        if px < avg_cost * (1.0 + min_ret):
+                            continue
+                    # if avg_cost is 0 (unknown), don't block the sell
+
+
                 q = int(np.ceil(self.cfg.sell_pct_shares * abs(pos)))
                 q = min(q, abs(pos))
                 delta = -q
